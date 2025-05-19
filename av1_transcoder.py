@@ -84,7 +84,7 @@ class VideoInfo:
         This method extracts 20 random frames from the video, analyzes
         their noise patterns, and calculates a confidence score for
         film grain presence. Film grain is reported if confidence
-        exceeds 60%.
+        exceeds 40%.
         """
         try:
             if self.duration <= 0:
@@ -142,16 +142,35 @@ class VideoInfo:
                             astd_str = astd_parts[0].split("astd:")[1].strip()
                             astd_value = float(astd_str)
                             
-                            # Higher ASTD values typically indicate more grain/noise
-                            # Threshold is empirical and may need tuning
-                            if astd_value > 5.0:  # Typical threshold for film grain
+                            # Lower threshold for more sensitivity (was 5.0)
+                            if astd_value > 3.5:  # More sensitive threshold for film grain
                                 has_grain_indicators = True
                     except (ValueError, IndexError):
                         pass
                 
-                # Additional checks based on codec
-                if self.codec in ['mpeg2video', 'mpeg4'] and "noise" in stderr:
+                # Additional checks based on codec or noise patterns
+                if self.codec in ['mpeg2video', 'mpeg4', 'h264'] and "noise" in stderr:
                     has_grain_indicators = True
+                    
+                # Additional visual pattern detection
+                if "avgblur" in stderr or "grain" in stderr:
+                    has_grain_indicators = True
+                
+                # Report stats for this specific frame
+                astd_value = 0.0
+                if "astd:" in stderr:
+                    try:
+                        astd_parts = [part for part in stderr.split() if "astd:" in part]
+                        if astd_parts:
+                            astd_str = astd_parts[0].split("astd:")[1].strip()
+                            astd_value = float(astd_str)
+                    except (ValueError, IndexError):
+                        pass
+                
+                frame_report = f"Frame {i+1}: ASTD={astd_value:.2f}, "
+                frame_report += f"Grain detected: {'Yes' if has_grain_indicators else 'No'}"
+                logger.info(frame_report)
+                print(frame_report, flush=True)
                 
                 if has_grain_indicators:
                     grain_detected_count += 1
@@ -163,9 +182,10 @@ class VideoInfo:
             # Calculate confidence as percentage of frames with detected grain
             grain_confidence = (grain_detected_count / num_frames) * 100.0
             
-            # Set result based on confidence threshold
-            self.has_film_grain = grain_confidence >= 60.0
+            # Lower confidence threshold from 60% to 40%
+            self.has_film_grain = grain_confidence >= 40.0
             
+            # Final summary with more details
             logger.info(f"Film grain detection result: {'Detected' if self.has_film_grain else 'Not detected'} "
                         f"(confidence: {grain_confidence:.1f}%, frames with grain: {grain_detected_count}/{num_frames})")
             
@@ -264,12 +284,17 @@ class Transcoder:
                 bufsize=1  # Line buffered
             )
             
-            # Improved progress monitoring
+            # Improved progress monitoring with console output
             stderr_lines = []
             for line in process.stderr:
                 stderr_lines.append(line)
                 if "frame=" in line and "fps=" in line:
+                    # Print progress directly to console
+                    print(line.strip(), flush=True)
                     logger.debug(line.strip())
+                # Also print other important ffmpeg status messages
+                elif any(info in line for info in ["Stream mapping", "Duration:", "Output #0"]):
+                    print(line.strip(), flush=True)
             
             # Get return code and handle errors better
             returncode = process.wait()
@@ -343,6 +368,7 @@ def main():
     parser.add_argument('-p', '--preset', type=int, default=6, help='AV1 encoding preset (0-13, 0=highest quality/slowest, 13=lowest quality/fastest)')
     parser.add_argument('-c', '--crf', type=int, default=23, help='AV1 CRF value (0-63, lower = higher quality)')
     parser.add_argument('-g', '--enable-film-grain', action='store_true', help='Enable film grain synthesis detection and application')
+    parser.add_argument('--detect-only', action='store_true', help='Only detect film grain without transcoding')
     parser.add_argument('--parallel', action='store_true', help='Enable parallel processing')
     parser.add_argument('-w', '--max-workers', type=int, default=1, help='Maximum number of parallel workers')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
@@ -356,9 +382,59 @@ def main():
         'enable_film_grain': args.enable_film_grain,
         'parallel': args.parallel,
         'max_workers': args.max_workers,
-        'overwrite': args.overwrite
+        'overwrite': args.overwrite,
+        'detect_only': args.detect_only
     }
     
+    # Create a simple function to just detect film grain
+    def detect_grain_only(file_path):
+        try:
+            print(f"\nAnalyzing file: {file_path}")
+            video_info = VideoInfo(file_path)
+            result = "DETECTED" if video_info.has_film_grain else "NOT DETECTED"
+            print(f"Film grain detection result for {file_path}: {result}\n")
+            return video_info.has_film_grain
+        except Exception as e:
+            logger.error(f"Error during film grain detection: {e}")
+            return False
+    
+    # If detect-only mode, process files but just for detection
+    if args.detect_only:
+        if os.path.isfile(args.input):
+            # Process single file
+            detect_grain_only(args.input)
+        else:
+            # Process directory
+            file_list = []
+            
+            if args.recursive:
+                for root, _, files in os.walk(args.input):
+                    for file in files:
+                        if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
+                            file_list.append(os.path.join(root, file))
+            else:
+                for file in os.listdir(args.input):
+                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
+                        file_list.append(os.path.join(args.input, file))
+            
+            if not file_list:
+                logger.warning(f"No video files found in {args.input}")
+                sys.exit(0)
+            
+            print(f"Found {len(file_list)} video files to analyze")
+            
+            # Process files for grain detection only
+            grain_detected = 0
+            for file_path in file_list:
+                if detect_grain_only(file_path):
+                    grain_detected += 1
+            
+            print(f"\nAnalysis complete: Film grain detected in {grain_detected}/{len(file_list)} files")
+            
+        # Exit after detection is complete
+        sys.exit(0)
+    
+    # Continue with normal transcoding if not in detect-only mode
     transcoder = Transcoder(config)
     
     # Process file list if provided
