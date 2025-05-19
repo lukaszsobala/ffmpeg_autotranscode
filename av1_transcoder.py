@@ -490,7 +490,7 @@ class Transcoder:
                 logger.info(f"Successfully transcoded {input_file} to {output_file}")
                 return True
             else:
-                error_output = '\n'.join(stderr_lines[-10:])  # Show last 10 lines of error
+                error_output = '\n'.join(stderr_lines[-100:])  # Show last 100 lines of error
                 print(f"[ERROR] Transcoding failed with return code {returncode}. Last stderr lines:\n{error_output}")
                 logger.error(f"Transcoding failed with return code {returncode}. Error: {error_output}")
                 return False
