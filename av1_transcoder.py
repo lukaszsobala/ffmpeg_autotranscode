@@ -14,6 +14,7 @@ import argparse
 import logging
 from pathlib import Path
 import concurrent.futures
+import shlex
 from typing import List, Dict, Any, Optional
 import shutil
 
@@ -27,6 +28,20 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('av1_transcoder')
+
+def escape_filename(filename: str) -> str:
+    """
+    Properly escape filenames for use in FFmpeg commands.
+    Only escapes filename-specific special characters, not filter expressions.
+    
+    Args:
+        filename: The filename to escape
+        
+    Returns:
+        Properly escaped filename
+    """
+    # Use shlex.quote for proper shell escaping of filenames
+    return shlex.quote(filename)
 
 class VideoInfo:
     """Class to store and handle video information"""
@@ -142,11 +157,11 @@ class VideoInfo:
                         cmd = [
                             'jellyfin-ffmpeg',
                             '-ss', str(start_point),  # Start timestamp
-                            '-i', self.file_path,
+                            '-i', escape_filename(self.file_path),
                             '-vf', f'select=gte(n\\,{j})',  # Select frame j from the sequence
                             '-vframes', '1',
                             '-q:v', '1',
-                            frame_path
+                            frame_path  # No need to escape temp paths, they're safe
                         ]
                         subprocess.run(cmd, capture_output=True)
                         if os.path.exists(frame_path):
@@ -397,55 +412,36 @@ class Transcoder:
 
             # Build ffmpeg command with correct hardware acceleration flags
             cmd = [
-                'jellyfin-ffmpeg',
+                'jellyfin-ffmpeg', 
+                '-hwaccel', 'rkmpp', 
+                '-hwaccel_output_format', 'drm_prime',
+                '-i', input_file
             ]
             
-            # Add input format if detected
-            if hasattr(video_info, 'format_name') and video_info.format_name:
-                cmd.extend(['-f', video_info.format_name])
-                
-            # Add hardware acceleration options
-            cmd.extend([
-                '-hwaccel', 'rkmpp',
-                '-hwaccel_output_format', 'drm_prime',
-                '-afbc', 'rga',
-            #    '-hwaccel_device', self.config.get('device', '/dev/dri/card0'),
-                '-i', input_file,
-                '-c:a', 'copy'
-            ])
-            
-            # Add video scaling and mapping options with correct filters
-            cmd.extend([
-                '-vf', f'scale_rkrga=w={video_info.width}:h={video_info.height}:format=nv12,hwmap=mode=read,format=nv12',
-                '-map', '0',
-                '-map_metadata', '-1',
-                '-map_chapters', '-1',
-                '-threads', '0'
-            ])
-            
             # Add video codec options
-            # For 8-bit, the pixel format should be 'yuv420p'
-            # For 10-bit, the pixel format should be 'yuv420p10le'
-            pixel_format = 'yuv420p10le' if video_info.bit_depth == 10 else 'yuv420p'
             cmd.extend([
                 '-c:v', 'libsvtav1',
-                '-pix_fmt', pixel_format,
-                '-preset', str(self.config.get('preset', 6)),
+                '-preset', str(self.config.get('preset', 7)),
                 '-crf', str(self.config.get('crf', 23))
             ])
             
-            # Add film grain synthesis if detected and enabled
-            if video_info.has_film_grain and self.config.get('enable_film_grain', True):
-                grain_strength = self.config.get('grain_strength', 8)
-                cmd.extend([
-                    '-svtav1-params', f'film-grain-denoise={grain_strength}'
-                ])
+            # Add audio codec (copy)
+            cmd.extend(['-c:a', 'copy'])
             
-            # Add output file
+            # Set pixel format based on bit depth
+            pix_fmt = 'yuv420p10le' if video_info.bit_depth == 10 else 'yuv420p'
+            cmd.extend(['-pix_fmt', pix_fmt])
+            
+            # Add film grain synthesis if detected
+            if video_info.has_film_grain and self.config.get('film_grain', False):
+                # Use svtav1-params for film grain control
+                grain_str = str(self.config.get('grain_strength', 10))
+                cmd.extend(['-svtav1-params', f'film-grain-denoise={grain_str}'])
+            
+            # Set output file
             cmd.append(output_file)
             
             # Log the command
-            print("FFmpeg command:", ' '.join(cmd))
             logger.info(f"Transcoding command: {' '.join(cmd)}")
             
             # Debug: Print environment and command before running
@@ -557,11 +553,10 @@ def main():
     parser.add_argument('-i', '--input', help='Input file or directory')
     parser.add_argument('-o', '--output-dir', help='Output directory')
     parser.add_argument('-r', '--recursive', action='store_true', help='Recursively process directories')
-    parser.add_argument('-p', '--preset', type=int, default=6, help='AV1 encoding preset (0-13, 0=highest quality/slowest, 13=lowest quality/fastest)')
+    parser.add_argument('-p', '--preset', type=int, default=7, help='AV1 encoding preset (0-8, 0=highest quality/slowest, 8=lowest quality/fastest)')
     parser.add_argument('-c', '--crf', type=int, default=23, help='AV1 CRF value (0-63, lower = higher quality)')
-    parser.add_argument('-g', '--enable-film-grain', action='store_true', help='Enable film grain synthesis detection and application')
-    parser.add_argument('--detect-only', action='store_true', help='Only detect film grain without transcoding')
-    parser.add_argument('--grain-strength', type=int, default=8, help='Film grain strength (0-16, higher values add more grain)')
+    parser.add_argument('-f', '--film-grain', action='store_true', help='Enable film grain synthesis for detected film grain')
+    parser.add_argument('-g', '--grain-strength', type=int, default=10, help='Film grain strength (1-50, higher values add more grain)')
     parser.add_argument('--parallel', action='store_true', help='Enable parallel processing')
     parser.add_argument('-w', '--max-workers', type=int, default=1, help='Maximum number of parallel workers')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
@@ -578,7 +573,8 @@ def main():
     config = {
         'preset': args.preset,
         'crf': args.crf,
-        'enable_film_grain': args.enable_film_grain,
+        'film_grain': args.film_grain,
+        'grain_strength': args.grain_strength,
         'parallel': args.parallel,
         'max_workers': args.max_workers,
         'overwrite': args.overwrite,
@@ -588,57 +584,8 @@ def main():
         'debug': args.debug
     }
     
-    # Create a simple function to just detect film grain
-    def detect_grain_only(file_path):
-        try:
-            print(f"\nAnalyzing file: {file_path}")
-            video_info = VideoInfo(file_path, config)
-            result = "DETECTED" if video_info.has_film_grain else "NOT DETECTED"
-            print(f"Film grain detection result for {file_path}: {result}\n")
-            return video_info.has_film_grain
-        except Exception as e:
-            logger.error(f"Error during film grain detection: {e}")
-            return False
-
-    # If detect-only mode, process files but just for detection, then exit
-    if args.detect_only:
-        if os.path.isfile(args.input):
-            detect_grain_only(args.input)
-        else:
-            file_list = []
-            if args.recursive:
-                for root, _, files in os.walk(args.input):
-                    for file in files:
-                        if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
-                            file_list.append(os.path.join(root, file))
-            else:
-                for file in os.listdir(args.input):
-                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
-                        file_list.append(os.path.join(args.input, file))
-            if not file_list:
-                logger.warning(f"No video files found in {args.input}")
-                sys.exit(0)
-            grain_detected = 0
-            for file_path in file_list:
-                if detect_grain_only(file_path):
-                    grain_detected += 1
-            logger.info(f"Film grain analysis complete: Film grain detected in {grain_detected}/{len(file_list)} files")
-        sys.exit(0)
-
-    # Continue with normal transcoding if not in detect-only mode
     transcoder = Transcoder(config)
     
-    # Process file list if provided
-    if args.list:
-        try:
-            with open(args.list, 'r') as f:
-                file_list = [line.strip() for line in f if line.strip()]
-            transcoder.process_file_list(file_list, args.output_dir)
-        except Exception as e:
-            logger.error(f"Error reading file list: {e}")
-            sys.exit(1)
-    
-    # Process input file or directory
     input_path = args.input
     
     if not os.path.exists(input_path):
@@ -656,11 +603,11 @@ def main():
         if args.recursive:
             for root, _, files in os.walk(input_path):
                 for file in files:
-                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
+                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv')):
                         file_list.append(os.path.join(root, file))
         else:
             for file in os.listdir(input_path):
-                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
+                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv')):
                     file_list.append(os.path.join(input_path, file))
         
         if not file_list:
