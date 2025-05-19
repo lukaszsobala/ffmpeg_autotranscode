@@ -44,7 +44,7 @@ class VideoInfo:
         """Probe video file to extract information"""
         try:
             cmd = ['jellyfin-ffmpeg', '-v', 'error', '-select_streams', 'v:0', 
-                  '-show_entries', 'stream=width,height,pix_fmt,codec_name:format=duration', 
+                  '-show_entries', 'stream=width,height,pix_fmt,codec_name:format=duration,format_name', 
                   '-of', 'json', self.file_path]
             
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -60,14 +60,15 @@ class VideoInfo:
             pix_fmt = stream_info.get('pix_fmt', '')
             self.bit_depth = 10 if '10' in pix_fmt else 8
             
-            # Extract duration
+            # Extract duration and format name
             format_info = info.get('format', {})
             self.duration = float(format_info.get('duration', 0))
+            self.format_name = format_info.get('format_name', '').split(',')[0]  # Get first format if multiple
             
             # Detect film grain (simplified approach)
             self._detect_film_grain()
             
-            logger.info(f"Video info: {self.width}x{self.height}, {self.bit_depth}-bit, codec: {self.codec}")
+            logger.info(f"Video info: {self.width}x{self.height}, {self.bit_depth}-bit, codec: {self.codec}, format: {self.format_name}")
             
         except subprocess.CalledProcessError as e:
             logger.error(f"Error probing video: {e}")
@@ -139,19 +140,28 @@ class Transcoder:
                 logger.info(f"Output file {output_file} already exists, skipping")
                 return False
             
-            # Build ffmpeg command
+            # Build ffmpeg command with correct hardware acceleration flags
             cmd = [
                 'jellyfin-ffmpeg',
-                '-hwaccel', 'rkmpp',
-                '-hwaccel_device', '/dev/dri/card0',  # Explicitly specify the DRM device
-                '-i', input_file,
-                '-c:a', 'copy'
             ]
             
-            # Add video scaling and mapping options
-            # Fix the scale_rkrga syntax
+            # Add input format if detected
+            if hasattr(video_info, 'format_name') and video_info.format_name:
+                cmd.extend(['-f', video_info.format_name])
+                
+            # Add hardware acceleration options
             cmd.extend([
-                '-vf', f'scale_rkrga=w={video_info.width}:h={video_info.height}:format=nv12',
+                '-hwaccel', 'rkmpp',
+                '-hwaccel_output_format', 'drm_prime',
+                '-afbc', 'rga',
+                '-hwaccel_device', self.config.get('device', '/dev/dri/card0'),
+                '-i', input_file,
+                '-c:a', 'copy'
+            ])
+            
+            # Add video scaling and mapping options with correct filters
+            cmd.extend([
+                '-vf', f'scale_rkrga=w={video_info.width}:h={video_info.height}:format=nv12,hwmap=mode=read,format=nv12',
                 '-map_metadata', '-1',
                 '-map_chapters', '-1',
                 '-threads', '0'
@@ -167,10 +177,9 @@ class Transcoder:
             ])
             
             # Add film grain synthesis if detected and enabled
-            # Correct the film grain parameter for SVT-AV1
             if video_info.has_film_grain and self.config.get('enable_film_grain', True):
                 cmd.extend([
-                    '-svtav1-params', 'film-grain-denoise=8'  # Correct parameter for film grain
+                    '-svtav1-params', 'film-grain-denoise=8'
                 ])
             
             # Add output file
