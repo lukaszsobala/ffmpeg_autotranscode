@@ -79,13 +79,194 @@ class VideoInfo:
             
     def _detect_film_grain(self) -> None:
         """
-        Detect film grain in the video by analyzing multiple frames.
-        
-        This method extracts 20 random frames from the video, analyzes
-        their noise patterns, and calculates a confidence score for
-        film grain presence. Film grain is reported if confidence
-        exceeds 40%.
+        Advanced film grain detection using FFT analysis, temporal noise analysis,
+        and specialized filtering to detect characteristic film grain patterns.
         """
+        try:
+            if self.duration <= 0:
+                self.has_film_grain = False
+                return
+            
+            # Check for required libraries
+            try:
+                import numpy as np
+                import cv2
+                import tempfile
+                import random
+            except ImportError:
+                logger.warning("Advanced film grain detection requires numpy and opencv. Using simplified detection.")
+                self._detect_film_grain_simplified()
+                return
+                
+            # Use temporary directory for frame extraction
+            with tempfile.TemporaryDirectory() as temp_dir:
+                logger.info(f"Using advanced film grain detection for {self.file_path}")
+                print(f"Analyzing film grain using advanced methods...")
+                
+                # Frame extraction settings
+                num_frames = 10  # Number of frames to analyze
+                start_time = self.duration * 0.1
+                end_time = self.duration * 0.9
+                
+                # Select random timestamps for analysis
+                timestamps = sorted([random.uniform(start_time, end_time) for _ in range(num_frames)])
+                
+                # Metrics to track
+                grain_scores = []
+                temporal_scores = []
+                fft_scores = []
+                
+                # Extract frames
+                frame_files = []
+                for i, timestamp in enumerate(timestamps):
+                    frame_path = os.path.join(temp_dir, f"frame_{i:03d}.png")
+                    cmd = [
+                        'jellyfin-ffmpeg',
+                        '-ss', str(timestamp),
+                        '-i', self.file_path,
+                        '-vframes', '1',
+                        '-q:v', '1',
+                        frame_path
+                    ]
+                    subprocess.run(cmd, capture_output=True)
+                    if os.path.exists(frame_path):
+                        frame_files.append(frame_path)
+                
+                if len(frame_files) < 2:
+                    logger.warning("Not enough frames extracted for analysis")
+                    self.has_film_grain = False
+                    return
+                
+                # 1. FFT Analysis for high frequency noise patterns
+                for i, frame_file in enumerate(frame_files):
+                    # Load image
+                    img = cv2.imread(frame_file, cv2.IMREAD_GRAYSCALE)
+                    if img is None:
+                        continue
+                    
+                    # Apply FFT
+                    f_transform = np.fft.fft2(img)
+                    f_shift = np.fft.fftshift(f_transform)
+                    magnitude_spectrum = 20 * np.log(np.abs(f_shift) + 1)
+                    
+                    # Analyze high frequency content (typical of film grain)
+                    h, w = magnitude_spectrum.shape
+                    center_y, center_x = h // 2, w // 2
+                    
+                    # Define regions (center is low frequency, edges are high frequency)
+                    mask_high = np.ones_like(magnitude_spectrum, dtype=np.uint8)
+                    cv2.circle(mask_high, (center_x, center_y), min(h, w) // 4, 0, -1)
+                    
+                    # Calculate high frequency energy
+                    high_freq_energy = np.mean(magnitude_spectrum * mask_high)
+                    
+                    # Save FFT score (higher values indicate more grain)
+                    fft_score = high_freq_energy / np.mean(magnitude_spectrum)
+                    fft_scores.append(fft_score)
+                    
+                    # Report FFT analysis
+                    print(f"Frame {i+1}: FFT high frequency score: {fft_score:.2f}")
+                
+                # 2. Temporal analysis (noise pattern consistency between frames)
+                for i in range(len(frame_files) - 1):
+                    img1 = cv2.imread(frame_files[i], cv2.IMREAD_GRAYSCALE)
+                    img2 = cv2.imread(frame_files[i+1], cv2.IMREAD_GRAYSCALE)
+                    
+                    if img1 is None or img2 is None:
+                        continue
+                    
+                    # Resize if dimensions don't match
+                    if img1.shape != img2.shape:
+                        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+                    
+                    # Calculate frame difference
+                    diff = cv2.absdiff(img1, img2)
+                    
+                    # Apply threshold to isolate noise
+                    _, noise_mask = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
+                    
+                    # Calculate noise statistics
+                    noise_ratio = np.count_nonzero(noise_mask) / noise_mask.size
+                    noise_mean = np.mean(diff)
+                    noise_std = np.std(diff)
+                    
+                    # Film grain typically has consistent fine noise pattern
+                    temporal_score = (noise_ratio * 10) + (noise_std / 5)
+                    temporal_scores.append(temporal_score)
+                    
+                    print(f"Frame pair {i+1}-{i+2}: Temporal noise score: {temporal_score:.2f}")
+                
+                # 3. Texture analysis with specialized filters
+                for i, frame_file in enumerate(frame_files):
+                    img = cv2.imread(frame_file, cv2.IMREAD_GRAYSCALE)
+                    if img is None:
+                        continue
+                    
+                    # Apply Laplacian filter (edge detection)
+                    laplacian = cv2.Laplacian(img, cv2.CV_64F)
+                    
+                    # Calculate texture metrics
+                    texture_energy = np.sum(np.abs(laplacian)) / img.size
+                    texture_std = np.std(laplacian)
+                    
+                    # Combine metrics for grain score
+                    grain_score = texture_energy * 50 + texture_std / 10
+                    grain_scores.append(grain_score)
+                    
+                    print(f"Frame {i+1}: Texture grain score: {grain_score:.2f}")
+                
+                # 4. Analyze metadata (codec, format, etc.)
+                metadata_score = 0
+                grain_prone_codecs = ['mpeg2video', 'h264', 'prores', 'dnxhd']
+                if self.codec in grain_prone_codecs:
+                    metadata_score += 1
+                
+                # Combined analysis
+                # Normalize scores
+                if fft_scores:
+                    avg_fft = sum(fft_scores) / len(fft_scores)
+                else:
+                    avg_fft = 0
+                
+                if temporal_scores:
+                    avg_temporal = sum(temporal_scores) / len(temporal_scores)
+                else:
+                    avg_temporal = 0
+                
+                if grain_scores:
+                    avg_grain = sum(grain_scores) / len(grain_scores)
+                else:
+                    avg_grain = 0
+                
+                # Calculate weighted score
+                # Each method contributes differently to the final decision
+                weighted_score = (avg_fft * 0.4) + (avg_temporal * 0.3) + (avg_grain * 0.3) + (metadata_score * 0.2)
+                
+                # Threshold for detection (calibrated based on testing)
+                self.has_film_grain = weighted_score >= 1.2
+                
+                # Calculate confidence
+                confidence = min(100, weighted_score * 50)
+                
+                # Report final result
+                result = "Detected" if self.has_film_grain else "Not detected"
+                summary = (
+                    f"Film grain detection result: {result}\n"
+                    f"Confidence: {confidence:.1f}%\n"
+                    f"FFT score: {avg_fft:.2f}, Temporal score: {avg_temporal:.2f}, "
+                    f"Texture score: {avg_grain:.2f}, Metadata score: {metadata_score:.1f}"
+                )
+                
+                logger.info(summary)
+                print(summary)
+                
+        except Exception as e:
+            logger.warning(f"Advanced film grain detection failed: {e}. Falling back to simplified method.")
+            # Fall back to simplified detection
+            self._detect_film_grain_simplified()
+    
+    def _detect_film_grain_simplified(self) -> None:
+        """Simplified film grain detection method as fallback."""
         try:
             if self.duration <= 0:
                 self.has_film_grain = False
@@ -93,105 +274,29 @@ class VideoInfo:
                 
             import random
             
-            # Number of frames to analyze
-            num_frames = 20
+            # Simplified detection based on filename and codec
+            lower_filename = self.file_path.lower()
+            grain_indicators = ['grain', 'film', '35mm', '16mm', 'analog', 'vintage']
+            grain_prone_codecs = ['mpeg2video', 'h264', 'prores', 'dnxhd']
             
-            # Generate random timestamps throughout the video
-            # Avoid the first and last 10% of the video
-            start_time = self.duration * 0.1
-            end_time = self.duration * 0.9
-
-            # If the video is too short, just use the whole duration
-            if self.duration < 600:
-                start_time = 0
-                end_time = self.duration
+            # Simple heuristic detection
+            has_grain = False
             
-            # Track frames with detected grain
-            grain_detected_count = 0
-            grain_confidence = 0.0
-
-            # Generate random timestamps for frame analysis
-            timestamps = [random.uniform(start_time, end_time) for _ in range(num_frames)]
-            
-            logger.info(f"Analyzing {num_frames} frames for film grain in {self.file_path}")
-            
-            for i, timestamp in enumerate(timestamps):
-                # Use noise estimation and histogram analysis for grain detection
-                cmd = [
-                    'jellyfin-ffmpeg', '-ss', str(timestamp), '-i', self.file_path,
-                    '-vframes', '1', '-vf', 'format=gray,signalstats=stat=astd:outfilter=astats',
-                    '-f', 'null', '-'
-                ]
-                
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                
-                # Analyze output for noise patterns
-                # Look for standard deviation and noise metrics in the output
-                stderr = result.stderr.lower()
-                
-                # Simplified heuristics for grain detection
-                # High ASTD (average standard deviation) often indicates film grain
-                has_grain_indicators = False
-                
-                # Check for high standard deviation or noise metrics
-                if "astd:" in stderr:
-                    try:
-                        # Extract the ASTD value
-                        astd_parts = [part for part in stderr.split() if "astd:" in part]
-                        if astd_parts:
-                            astd_str = astd_parts[0].split("astd:")[1].strip()
-                            astd_value = float(astd_str)
-                            
-                            # Lower threshold for more sensitivity (was 5.0)
-                            if astd_value > 3.5:  # More sensitive threshold for film grain
-                                has_grain_indicators = True
-                    except (ValueError, IndexError):
-                        pass
-                
-                # Additional checks based on codec or noise patterns
-                if self.codec in ['mpeg2video', 'mpeg4', 'h264'] and "noise" in stderr:
-                    has_grain_indicators = True
+            # Check filename for indicators
+            for indicator in grain_indicators:
+                if indicator in lower_filename:
+                    has_grain = True
+                    break
                     
-                # Additional visual pattern detection
-                if "avgblur" in stderr or "grain" in stderr:
-                    has_grain_indicators = True
-                
-                # Report stats for this specific frame
-                astd_value = 0.0
-                if "astd:" in stderr:
-                    try:
-                        astd_parts = [part for part in stderr.split() if "astd:" in part]
-                        if astd_parts:
-                            astd_str = astd_parts[0].split("astd:")[1].strip()
-                            astd_value = float(astd_str)
-                    except (ValueError, IndexError):
-                        pass
-                
-                frame_report = f"Frame {i+1}: ASTD={astd_value:.2f}, "
-                frame_report += f"Grain detected: {'Yes' if has_grain_indicators else 'No'}"
-                logger.info(frame_report)
-                print(frame_report, flush=True)
-                
-                if has_grain_indicators:
-                    grain_detected_count += 1
-                
-                # Log progress every 5 frames
-                if (i + 1) % 5 == 0:
-                    logger.debug(f"Film grain analysis: {i + 1}/{num_frames} frames analyzed")
+            # Check codec
+            if self.codec in grain_prone_codecs:
+                has_grain = True
             
-            # Calculate confidence as percentage of frames with detected grain
-            grain_confidence = (grain_detected_count / num_frames) * 100.0
-            
-            # Lower confidence threshold from 60% to 40%
-            self.has_film_grain = grain_confidence >= 40.0
-            
-            # Final summary with more details
-            logger.info(f"Film grain detection result: {'Detected' if self.has_film_grain else 'Not detected'} "
-                        f"(confidence: {grain_confidence:.1f}%, frames with grain: {grain_detected_count}/{num_frames})")
+            self.has_film_grain = has_grain
+            logger.info(f"Simplified film grain detection: {'Detected' if has_grain else 'Not detected'}")
             
         except Exception as e:
-            logger.warning(f"Error during film grain detection: {e}")
-            # Default to no film grain if detection fails
+            logger.warning(f"Simplified film grain detection error: {e}")
             self.has_film_grain = False
 
 class Transcoder:
@@ -264,8 +369,9 @@ class Transcoder:
             
             # Add film grain synthesis if detected and enabled
             if video_info.has_film_grain and self.config.get('enable_film_grain', True):
+                grain_strength = self.config.get('grain_strength', 8)
                 cmd.extend([
-                    '-svtav1-params', 'film-grain-denoise=8'
+                    '-svtav1-params', f'film-grain-denoise={grain_strength}'
                 ])
             
             # Add output file
@@ -369,6 +475,7 @@ def main():
     parser.add_argument('-c', '--crf', type=int, default=23, help='AV1 CRF value (0-63, lower = higher quality)')
     parser.add_argument('-g', '--enable-film-grain', action='store_true', help='Enable film grain synthesis detection and application')
     parser.add_argument('--detect-only', action='store_true', help='Only detect film grain without transcoding')
+    parser.add_argument('--grain-strength', type=int, default=8, help='Film grain strength (0-16, higher values add more grain)')
     parser.add_argument('--parallel', action='store_true', help='Enable parallel processing')
     parser.add_argument('-w', '--max-workers', type=int, default=1, help='Maximum number of parallel workers')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
@@ -383,7 +490,8 @@ def main():
         'parallel': args.parallel,
         'max_workers': args.max_workers,
         'overwrite': args.overwrite,
-        'detect_only': args.detect_only
+        'detect_only': args.detect_only,
+        'grain_strength': args.grain_strength
     }
     
     # Create a simple function to just detect film grain
