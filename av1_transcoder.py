@@ -79,32 +79,94 @@ class VideoInfo:
             
     def _detect_film_grain(self) -> None:
         """
-        Detect film grain in the video.
-        This is a simplified approach and may need refinement.
+        Detect film grain in the video by analyzing multiple frames.
+        
+        This method extracts 20 random frames from the video, analyzes
+        their noise patterns, and calculates a confidence score for
+        film grain presence. Film grain is reported if confidence
+        exceeds 60%.
         """
         try:
-            # Extract a single frame from near the beginning
-            frame_time = min(10, self.duration / 4)  # Get frame from first 10 seconds or 1/4 of duration
+            if self.duration <= 0:
+                self.has_film_grain = False
+                return
+                
+            import random
             
-            # Using noise filter to analyze noise characteristics
-            cmd = [
-                'jellyfin-ffmpeg', '-ss', str(frame_time), '-i', self.file_path,
-                '-vframes', '1', '-vf', 'format=gray,split[a][b];[a]histogram=display_mode=0:level_height=200[hh];[b][hh]vstack',
-                '-f', 'null', '-'
-            ]
+            # Number of frames to analyze
+            num_frames = 20
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            # Generate random timestamps throughout the video
+            # Avoid the first and last 10% of the video
+            start_time = self.duration * 0.1
+            end_time = self.duration * 0.9
             
-            # For now, use a simple heuristic based on codec and quality
-            # More sophisticated grain detection would require analyzing frame variance
-            if self.codec in ['h264', 'h265', 'hevc', 'av1'] and "film grain" in result.stderr.lower():
-                self.has_film_grain = True
-                logger.info(f"Film grain detected in {self.file_path}")
-            else:
-                # For certain formats, assume film grain might be present
-                self.has_film_grain = self.codec in ['mpeg2video', 'mpeg4'] 
-                if self.has_film_grain:
-                    logger.info(f"Film grain assumed based on codec: {self.codec}")
+            if end_time <= start_time:
+                # Short video, use the whole duration
+                start_time = 0
+                end_time = self.duration
+                
+            timestamps = [random.uniform(start_time, end_time) for _ in range(num_frames)]
+            
+            # Track frames with detected grain
+            grain_detected_count = 0
+            grain_confidence = 0.0
+            
+            logger.info(f"Analyzing {num_frames} frames for film grain in {self.file_path}")
+            
+            for i, timestamp in enumerate(timestamps):
+                # Use noise estimation and histogram analysis for grain detection
+                cmd = [
+                    'jellyfin-ffmpeg', '-ss', str(timestamp), '-i', self.file_path,
+                    '-vframes', '1', '-vf', 'format=gray,signalstats=stat=astd:outfilter=astats',
+                    '-f', 'null', '-'
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                # Analyze output for noise patterns
+                # Look for standard deviation and noise metrics in the output
+                stderr = result.stderr.lower()
+                
+                # Simplified heuristics for grain detection
+                # High ASTD (average standard deviation) often indicates film grain
+                has_grain_indicators = False
+                
+                # Check for high standard deviation or noise metrics
+                if "astd:" in stderr:
+                    try:
+                        # Extract the ASTD value
+                        astd_parts = [part for part in stderr.split() if "astd:" in part]
+                        if astd_parts:
+                            astd_str = astd_parts[0].split("astd:")[1].strip()
+                            astd_value = float(astd_str)
+                            
+                            # Higher ASTD values typically indicate more grain/noise
+                            # Threshold is empirical and may need tuning
+                            if astd_value > 5.0:  # Typical threshold for film grain
+                                has_grain_indicators = True
+                    except (ValueError, IndexError):
+                        pass
+                
+                # Additional checks based on codec
+                if self.codec in ['mpeg2video', 'mpeg4'] and "noise" in stderr:
+                    has_grain_indicators = True
+                
+                if has_grain_indicators:
+                    grain_detected_count += 1
+                
+                # Log progress every 5 frames
+                if (i + 1) % 5 == 0:
+                    logger.debug(f"Film grain analysis: {i + 1}/{num_frames} frames analyzed")
+            
+            # Calculate confidence as percentage of frames with detected grain
+            grain_confidence = (grain_detected_count / num_frames) * 100.0
+            
+            # Set result based on confidence threshold
+            self.has_film_grain = grain_confidence >= 60.0
+            
+            logger.info(f"Film grain detection result: {'Detected' if self.has_film_grain else 'Not detected'} "
+                        f"(confidence: {grain_confidence:.1f}%, frames with grain: {grain_detected_count}/{num_frames})")
             
         except Exception as e:
             logger.warning(f"Error during film grain detection: {e}")
@@ -154,7 +216,7 @@ class Transcoder:
                 '-hwaccel', 'rkmpp',
                 '-hwaccel_output_format', 'drm_prime',
                 '-afbc', 'rga',
-                '-hwaccel_device', self.config.get('device', '/dev/dri/card0'),
+            #    '-hwaccel_device', self.config.get('device', '/dev/dri/card0'),
                 '-i', input_file,
                 '-c:a', 'copy'
             ])
