@@ -43,7 +43,7 @@ class VideoInfo:
     def _probe_video(self) -> None:
         """Probe video file to extract information"""
         try:
-            cmd = ['jellyfin-ffmpeg', '-v', 'error', '-select_streams', 'v:0', 
+            cmd = ['jellyfin-ffprobe', '-v', 'error', '-select_streams', 'v:0', 
                   '-show_entries', 'stream=width,height,pix_fmt,codec_name:format=duration,format_name', 
                   '-of', 'json', self.file_path]
             
@@ -225,16 +225,19 @@ class Transcoder:
             # Add video scaling and mapping options with correct filters
             cmd.extend([
                 '-vf', f'scale_rkrga=w={video_info.width}:h={video_info.height}:format=nv12,hwmap=mode=read,format=nv12',
+                '-map', '0',
                 '-map_metadata', '-1',
                 '-map_chapters', '-1',
                 '-threads', '0'
             ])
             
             # Add video codec options
-            bit_depth_option = '10' if video_info.bit_depth == 10 else '8'
+            # For 8-bit, the pixel format should be 'yuv420p'
+            # For 10-bit, the pixel format should be 'yuv420p10le'
+            pixel_format = 'yuv420p10le' if video_info.bit_depth == 10 else 'yuv420p'
             cmd.extend([
                 '-c:v', 'libsvtav1',
-                '-pix_fmt', f'yuv420p{bit_depth_option}le',
+                '-pix_fmt', pixel_format,
                 '-preset', str(self.config.get('preset', 6)),
                 '-crf', str(self.config.get('crf', 23))
             ])
@@ -249,6 +252,7 @@ class Transcoder:
             cmd.append(output_file)
             
             # Log the command
+            print("FFmpeg command:", ' '.join(cmd))
             logger.info(f"Transcoding command: {' '.join(cmd)}")
             
             # Run the transcoding process with proper output capture
@@ -352,8 +356,7 @@ def main():
         'enable_film_grain': args.enable_film_grain,
         'parallel': args.parallel,
         'max_workers': args.max_workers,
-        'overwrite': args.overwrite,
-        'device': args.device
+        'overwrite': args.overwrite
     }
     
     transcoder = Transcoder(config)
