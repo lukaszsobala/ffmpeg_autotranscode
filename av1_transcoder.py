@@ -188,7 +188,8 @@ class VideoInfo:
                         noise_std = np.std(diff)
                         
                         # Film grain typically has consistent fine noise pattern
-                        temporal_score = (noise_ratio * 10) + (noise_std / 5)
+                        # Multiply by 100 to increase sensitivity to temporal patterns
+                        temporal_score = ((noise_ratio * 10) + (noise_std / 5)) * 100
                         temporal_scores.append(temporal_score)
                         
                         # Add to the frame stats
@@ -198,12 +199,12 @@ class VideoInfo:
                                 'Temporal Score': f"{temporal_score:.2f}",
                                 'Noise Ratio': f"{noise_ratio:.4f}",
                                 'Noise StdDev': f"{noise_std:.2f}",
-                                'Temporal Indicates Grain': "Yes" if temporal_score > 10.0 else "No"
+                                'Temporal Indicates Grain': "Yes" if temporal_score > 1.0 else "No"
                             })
                         
                         print(f"  Sequence {seq_idx+1}, Frames {i+1}-{i+2}: Temporal Score={temporal_score:.2f}, "
                               f"Noise Ratio={noise_ratio:.4f}, Noise StdDev={noise_std:.2f}, "
-                              f"Grain Indicated: {'Yes' if temporal_score > 1.0 else 'No'}")
+                              f"Grain Indicated: {'Yes' if temporal_score > 100.0 else 'No'}")
                 
                 print(f"\n2. Texture Analysis (Edge Detection & Noise Patterns)")
                 print("="*70)
@@ -239,7 +240,7 @@ class VideoInfo:
                     
                     print(f"  Frame {frame_stats[i]['Frame'] if i < len(frame_stats) else i+1}: Texture Score={grain_score:.2f}, "
                           f"Texture Energy={texture_energy:.6f}, Edge StdDev={texture_std:.2f}, "
-                          f"Grain Indicated: {'Yes' if grain_score > 3.0 else 'No'}")
+                          f"Grain Indicated: {'Yes' if grain_score > 100.0 else 'No'}")
                 
                 # Combined analysis
                 # Normalize scores
@@ -254,13 +255,13 @@ class VideoInfo:
                     avg_grain = 0
                 
                 # Calculate weighted score (adjusted weights)
-                weighted_score = (avg_temporal * 0.15) + (avg_grain * 0.85)
+                weighted_score = (avg_temporal * 0.3) + (avg_grain * 0.7)
                 
-                # Threshold for detection (recalibrated)
-                self.has_film_grain = weighted_score >= 100.0
+                # Threshold for detection (increased to match the new temporal score scale)
+                self.has_film_grain = weighted_score >= 200.0
                 
                 # Calculate confidence
-                confidence = min(100, weighted_score * 10)
+                confidence = min(100, weighted_score * 5)  # Adjusted divisor to maintain reasonable confidence values
                 
                 # Print summary table of all frame analyses only in verbose mode
                 verbose_mode = self.config.get('verbose', False) if hasattr(self, 'config') else False
@@ -295,9 +296,9 @@ class VideoInfo:
                 print("\n" + "="*70)
                 print(f"FILM GRAIN ANALYSIS RESULT: {result}")
                 print(f"Overall Confidence: {confidence:.1f}%")
-                print(f"  - Temporal Score: {avg_temporal:.2f} (Weight: 15%)")
-                print(f"  - Texture Score: {avg_grain:.2f} (Weight: 85%)")
-                print(f"  - Final Weighted Score: {weighted_score:.2f} (Threshold: 100.0)")
+                print(f"  - Temporal Score: {avg_temporal:.2f} (Weight: 30%)")
+                print(f"  - Texture Score: {avg_grain:.2f} (Weight: 70%)")
+                print(f"  - Final Weighted Score: {weighted_score:.2f} (Threshold: 200.0)")
                 print("="*70 + "\n")
                 
                 summary = (
