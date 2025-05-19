@@ -65,7 +65,11 @@ class VideoInfo:
             self.duration = float(format_info.get('duration', 0))
             self.format_name = format_info.get('format_name', '').split(',')[0]  # Get first format if multiple
             
-            # Detect film grain (simplified approach)
+            # Before running film grain detection, log that we're starting the process
+            logger.info(f"Starting film grain detection for {self.file_path}")
+            print(f"\n=== Film Grain Analysis: {os.path.basename(self.file_path)} ===")
+            
+            # Detect film grain using advanced methods
             self._detect_film_grain()
             
             logger.info(f"Video info: {self.width}x{self.height}, {self.bit_depth}-bit, codec: {self.codec}, format: {self.format_name}")
@@ -93,6 +97,7 @@ class VideoInfo:
                 import cv2
                 import tempfile
                 import random
+                from tabulate import tabulate
             except ImportError:
                 logger.warning("Advanced film grain detection requires numpy and opencv. Using simplified detection.")
                 self._detect_film_grain_simplified()
@@ -101,7 +106,7 @@ class VideoInfo:
             # Use temporary directory for frame extraction
             with tempfile.TemporaryDirectory() as temp_dir:
                 logger.info(f"Using advanced film grain detection for {self.file_path}")
-                print(f"Analyzing film grain using advanced methods...")
+                print(f"Analyzing film grain using multiple detection methods...")
                 
                 # Frame extraction settings
                 num_frames = 10  # Number of frames to analyze
@@ -110,13 +115,18 @@ class VideoInfo:
                 
                 # Select random timestamps for analysis
                 timestamps = sorted([random.uniform(start_time, end_time) for _ in range(num_frames)])
+                print(f"Analyzing {num_frames} frames at timestamps: {', '.join([f'{t:.2f}s' for t in timestamps])}")
                 
                 # Metrics to track
                 grain_scores = []
                 temporal_scores = []
                 fft_scores = []
                 
+                # Stats collection for detailed reporting
+                frame_stats = []
+                
                 # Extract frames
+                print("\nExtracting frames for analysis...")
                 frame_files = []
                 for i, timestamp in enumerate(timestamps):
                     frame_path = os.path.join(temp_dir, f"frame_{i:03d}.png")
@@ -131,11 +141,15 @@ class VideoInfo:
                     subprocess.run(cmd, capture_output=True)
                     if os.path.exists(frame_path):
                         frame_files.append(frame_path)
+                        print(f"  Frame {i+1}: extracted at {timestamp:.2f}s")
                 
                 if len(frame_files) < 2:
                     logger.warning("Not enough frames extracted for analysis")
                     self.has_film_grain = False
                     return
+                
+                print(f"\n1. FFT Analysis (High Frequency Noise Detection)")
+                print("="*70)
                 
                 # 1. FFT Analysis for high frequency noise patterns
                 for i, frame_file in enumerate(frame_files):
@@ -157,15 +171,29 @@ class VideoInfo:
                     mask_high = np.ones_like(magnitude_spectrum, dtype=np.uint8)
                     cv2.circle(mask_high, (center_x, center_y), min(h, w) // 4, 0, -1)
                     
-                    # Calculate high frequency energy
+                    # Calculate region energies
                     high_freq_energy = np.mean(magnitude_spectrum * mask_high)
+                    total_energy = np.mean(magnitude_spectrum)
                     
                     # Save FFT score (higher values indicate more grain)
-                    fft_score = high_freq_energy / np.mean(magnitude_spectrum)
+                    fft_score = high_freq_energy / total_energy
                     fft_scores.append(fft_score)
                     
                     # Report FFT analysis
-                    print(f"Frame {i+1}: FFT high frequency score: {fft_score:.2f}")
+                    frame_stat = {
+                        'Frame': i+1,
+                        'FFT Score': f"{fft_score:.2f}",
+                        'High Freq Energy': f"{high_freq_energy:.2f}",
+                        'Total Energy': f"{total_energy:.2f}",
+                        'FFT Indicates Grain': "Yes" if fft_score > 1.5 else "No"
+                    }
+                    frame_stats.append(frame_stat)
+                    
+                    print(f"  Frame {i+1}: FFT Score={fft_score:.2f}, High Freq Energy={high_freq_energy:.2f}, "
+                          f"Total Energy={total_energy:.2f}, Grain Indicated: {'Yes' if fft_score > 1.5 else 'No'}")
+                
+                print(f"\n2. Temporal Analysis (Frame-to-Frame Noise Pattern)")
+                print("="*70)
                 
                 # 2. Temporal analysis (noise pattern consistency between frames)
                 for i in range(len(frame_files) - 1):
@@ -194,7 +222,21 @@ class VideoInfo:
                     temporal_score = (noise_ratio * 10) + (noise_std / 5)
                     temporal_scores.append(temporal_score)
                     
-                    print(f"Frame pair {i+1}-{i+2}: Temporal noise score: {temporal_score:.2f}")
+                    # Add to the frame stats
+                    if i < len(frame_stats):
+                        frame_stats[i].update({
+                            'Temporal Score': f"{temporal_score:.2f}",
+                            'Noise Ratio': f"{noise_ratio:.4f}",
+                            'Noise StdDev': f"{noise_std:.2f}",
+                            'Temporal Indicates Grain': "Yes" if temporal_score > 1.0 else "No"
+                        })
+                    
+                    print(f"  Frames {i+1}-{i+2}: Temporal Score={temporal_score:.2f}, "
+                          f"Noise Ratio={noise_ratio:.4f}, Noise StdDev={noise_std:.2f}, "
+                          f"Grain Indicated: {'Yes' if temporal_score > 1.0 else 'No'}")
+                
+                print(f"\n3. Texture Analysis (Edge Detection & Noise Patterns)")
+                print("="*70)
                 
                 # 3. Texture analysis with specialized filters
                 for i, frame_file in enumerate(frame_files):
@@ -213,13 +255,42 @@ class VideoInfo:
                     grain_score = texture_energy * 50 + texture_std / 10
                     grain_scores.append(grain_score)
                     
-                    print(f"Frame {i+1}: Texture grain score: {grain_score:.2f}")
+                    # Add to frame stats
+                    if i < len(frame_stats):
+                        frame_stats[i].update({
+                            'Texture Score': f"{grain_score:.2f}",
+                            'Texture Energy': f"{texture_energy:.6f}",
+                            'Edge StdDev': f"{texture_std:.2f}",
+                            'Texture Indicates Grain': "Yes" if grain_score > 3.0 else "No"
+                        })
+                    
+                    print(f"  Frame {i+1}: Texture Score={grain_score:.2f}, "
+                          f"Texture Energy={texture_energy:.6f}, Edge StdDev={texture_std:.2f}, "
+                          f"Grain Indicated: {'Yes' if grain_score > 3.0 else 'No'}")
+                
+                print(f"\n4. Metadata Analysis")
+                print("="*70)
                 
                 # 4. Analyze metadata (codec, format, etc.)
                 metadata_score = 0
+                metadata_factors = []
+                
                 grain_prone_codecs = ['mpeg2video', 'h264', 'prores', 'dnxhd']
                 if self.codec in grain_prone_codecs:
                     metadata_score += 1
+                    metadata_factors.append(f"Codec '{self.codec}' often contains grain")
+                
+                # Analyze filename for grain-related keywords
+                lower_filename = os.path.basename(self.file_path).lower()
+                grain_indicators = ['grain', 'film', '35mm', '16mm', 'analog', 'vintage']
+                for indicator in grain_indicators:
+                    if indicator in lower_filename:
+                        metadata_score += 0.5
+                        metadata_factors.append(f"Filename contains '{indicator}'")
+                
+                print(f"  Metadata Score: {metadata_score:.1f}")
+                for factor in metadata_factors:
+                    print(f"  • {factor}")
                 
                 # Combined analysis
                 # Normalize scores
@@ -248,8 +319,31 @@ class VideoInfo:
                 # Calculate confidence
                 confidence = min(100, weighted_score * 50)
                 
+                # Print summary table of all frame analyses
+                try:
+                    print("\nDetailed Frame Analysis Summary:")
+                    print(tabulate(frame_stats, headers="keys", tablefmt="grid"))
+                except Exception:
+                    # Fallback if tabulate is not available
+                    print("\nDetailed Frame Analysis Summary:")
+                    for stat in frame_stats:
+                        print(f"  Frame {stat.get('Frame', '?')}: "
+                              f"FFT={stat.get('FFT Score', '?')}, "
+                              f"Temporal={stat.get('Temporal Score', '?')}, "
+                              f"Texture={stat.get('Texture Score', '?')}")
+                
                 # Report final result
-                result = "Detected" if self.has_film_grain else "Not detected"
+                result = "DETECTED" if self.has_film_grain else "NOT DETECTED"
+                print("\n" + "="*70)
+                print(f"FILM GRAIN ANALYSIS RESULT: {result}")
+                print(f"Overall Confidence: {confidence:.1f}%")
+                print(f"  - FFT Score: {avg_fft:.2f} (Weight: 40%)")
+                print(f"  - Temporal Score: {avg_temporal:.2f} (Weight: 30%)")
+                print(f"  - Texture Score: {avg_grain:.2f} (Weight: 30%)")
+                print(f"  - Metadata Score: {metadata_score:.1f} (Weight: 20%)")
+                print(f"  - Final Weighted Score: {weighted_score:.2f} (Threshold: 1.20)")
+                print("="*70 + "\n")
+                
                 summary = (
                     f"Film grain detection result: {result}\n"
                     f"Confidence: {confidence:.1f}%\n"
@@ -258,10 +352,10 @@ class VideoInfo:
                 )
                 
                 logger.info(summary)
-                print(summary)
                 
         except Exception as e:
             logger.warning(f"Advanced film grain detection failed: {e}. Falling back to simplified method.")
+            print(f"Advanced detection failed: {e}. Using simplified method.")
             # Fall back to simplified detection
             self._detect_film_grain_simplified()
     
