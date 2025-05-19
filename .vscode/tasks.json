@@ -1,0 +1,23 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Transcode Video",
+			"type": "shell",
+			"command": "${workspaceFolder}/av1_transcoder.py",
+			"args": [
+				"-i",
+				"${input:videoFile}",
+				"-o",
+				"${input:outputDir}",
+				"-p",
+				"6",
+				"-c",
+				"23",
+				"-f"
+			],
+			"group": "build",
+			"problemMatcher": []
+		}
+	]
+}
