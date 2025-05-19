@@ -30,7 +30,7 @@ logger = logging.getLogger('av1_transcoder')
 class VideoInfo:
     """Class to store and handle video information"""
     
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, config: Dict[str, Any] = None):
         self.file_path = file_path
         self.width = 0
         self.height = 0
@@ -38,6 +38,7 @@ class VideoInfo:
         self.has_film_grain = False
         self.duration = 0
         self.codec = ""
+        self.config = config or {}
         self._probe_video()
         
     def _probe_video(self) -> None:
@@ -311,37 +312,55 @@ class VideoInfo:
                 
                 # Calculate weighted score
                 # Each method contributes differently to the final decision
-                weighted_score = (avg_fft * 0.4) + (avg_temporal * 0.3) + (avg_grain * 0.3) + (metadata_score * 0.2)
+                weighted_score = (avg_fft * 0.05) + (avg_temporal * 0.15) + (avg_grain * 0.6) + (metadata_score * 0.2)
                 
                 # Threshold for detection (calibrated based on testing)
-                self.has_film_grain = weighted_score >= 1.2
+                self.has_film_grain = weighted_score >= 10
                 
                 # Calculate confidence
                 confidence = min(100, weighted_score * 50)
                 
-                # Print summary table of all frame analyses
-                try:
-                    print("\nDetailed Frame Analysis Summary:")
-                    print(tabulate(frame_stats, headers="keys", tablefmt="grid"))
-                except Exception:
-                    # Fallback if tabulate is not available
-                    print("\nDetailed Frame Analysis Summary:")
-                    for stat in frame_stats:
-                        print(f"  Frame {stat.get('Frame', '?')}: "
-                              f"FFT={stat.get('FFT Score', '?')}, "
-                              f"Temporal={stat.get('Temporal Score', '?')}, "
-                              f"Texture={stat.get('Texture Score', '?')}")
+                # Print summary table of all frame analyses only in verbose mode
+                verbose_mode = self.config.get('verbose', False) if hasattr(self, 'config') else False
+                if verbose_mode:
+                    try:
+                        # Make a narrower table by selecting only key columns
+                        compact_stats = []
+                        for stat in frame_stats:
+                            compact_stat = {
+                                'Frame': stat.get('Frame', '?'),
+                                'FFT': stat.get('FFT Score', '?'),
+                                'Temp': stat.get('Temporal Score', '?'),
+                                'Texture': stat.get('Texture Score', '?'),
+                                'Grain?': 'Yes' if (
+                                    stat.get('FFT Indicates Grain', 'No') == 'Yes' or
+                                    stat.get('Temporal Indicates Grain', 'No') == 'Yes' or
+                                    stat.get('Texture Indicates Grain', 'No') == 'Yes'
+                                ) else 'No'
+                            }
+                            compact_stats.append(compact_stat)
+                            
+                        print("\nDetailed Frame Analysis Summary:")
+                        print(tabulate(compact_stats, headers="keys", tablefmt="grid"))
+                    except Exception:
+                        # Fallback if tabulate is not available
+                        print("\nDetailed Frame Analysis Summary:")
+                        for stat in frame_stats:
+                            print(f"  Frame {stat.get('Frame', '?')}: "
+                                  f"FFT={stat.get('FFT Score', '?')}, "
+                                  f"Temp={stat.get('Temporal Score', '?')}, "
+                                  f"Texture={stat.get('Texture Score', '?')}")
                 
                 # Report final result
                 result = "DETECTED" if self.has_film_grain else "NOT DETECTED"
                 print("\n" + "="*70)
                 print(f"FILM GRAIN ANALYSIS RESULT: {result}")
                 print(f"Overall Confidence: {confidence:.1f}%")
-                print(f"  - FFT Score: {avg_fft:.2f} (Weight: 40%)")
-                print(f"  - Temporal Score: {avg_temporal:.2f} (Weight: 30%)")
-                print(f"  - Texture Score: {avg_grain:.2f} (Weight: 30%)")
+                print(f"  - FFT Score: {avg_fft:.2f} (Weight: 5%)")
+                print(f"  - Temporal Score: {avg_temporal:.2f} (Weight: 15%)")
+                print(f"  - Texture Score: {avg_grain:.2f} (Weight: 60%)")
                 print(f"  - Metadata Score: {metadata_score:.1f} (Weight: 20%)")
-                print(f"  - Final Weighted Score: {weighted_score:.2f} (Threshold: 1.20)")
+                print(f"  - Final Weighted Score: {weighted_score:.2f} (Threshold: 10)")
                 print("="*70 + "\n")
                 
                 summary = (
@@ -411,7 +430,7 @@ class Transcoder:
             bool: True if transcoding was successful
         """
         try:
-            video_info = VideoInfo(input_file)
+            video_info = VideoInfo(input_file, self.config)
             
             if not output_file:
                 input_path = Path(input_file)
@@ -573,6 +592,7 @@ def main():
     parser.add_argument('--parallel', action='store_true', help='Enable parallel processing')
     parser.add_argument('-w', '--max-workers', type=int, default=1, help='Maximum number of parallel workers')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose output with detailed statistics')
     parser.add_argument('--list', help='File containing list of videos to transcode')
     
     args = parser.parse_args()
@@ -585,14 +605,15 @@ def main():
         'max_workers': args.max_workers,
         'overwrite': args.overwrite,
         'detect_only': args.detect_only,
-        'grain_strength': args.grain_strength
+        'grain_strength': args.grain_strength,
+        'verbose': args.verbose
     }
     
     # Create a simple function to just detect film grain
     def detect_grain_only(file_path):
         try:
             print(f"\nAnalyzing file: {file_path}")
-            video_info = VideoInfo(file_path)
+            video_info = VideoInfo(file_path, config)
             result = "DETECTED" if video_info.has_film_grain else "NOT DETECTED"
             print(f"Film grain detection result for {file_path}: {result}\n")
             return video_info.has_film_grain
@@ -623,18 +644,13 @@ def main():
                 logger.warning(f"No video files found in {args.input}")
                 sys.exit(0)
             
-            print(f"Found {len(file_list)} video files to analyze")
-            
-            # Process files for grain detection only
             grain_detected = 0
             for file_path in file_list:
                 if detect_grain_only(file_path):
                     grain_detected += 1
             
-            print(f"\nAnalysis complete: Film grain detected in {grain_detected}/{len(file_list)} files")
-            
-        # Exit after detection is complete
-        sys.exit(0)
+            logger.info(f"Film grain analysis complete: Film grain detected in {grain_detected}/{len(file_list)} files")
+            return
     
     # Continue with normal transcoding if not in detect-only mode
     transcoder = Transcoder(config)
@@ -645,7 +661,6 @@ def main():
             with open(args.list, 'r') as f:
                 file_list = [line.strip() for line in f if line.strip()]
             transcoder.process_file_list(file_list, args.output_dir)
-            return
         except Exception as e:
             logger.error(f"Error reading file list: {e}")
             sys.exit(1)
