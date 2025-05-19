@@ -109,138 +109,110 @@ class VideoInfo:
                 logger.info(f"Using advanced film grain detection for {self.file_path}")
                 print(f"Analyzing film grain using multiple detection methods...")
                 
-                # Frame extraction settings
-                num_frames = 10  # Number of frames to analyze
+                # Frame extraction settings for texture analysis (random frames)
+                num_sample_points = 4  # Number of different points in the video to analyze
+                num_frames_per_point = 3  # Number of consecutive frames to extract at each point
                 start_time = self.duration * 0.1
                 end_time = self.duration * 0.9
                 
-                # Select random timestamps for analysis
-                timestamps = sorted([random.uniform(start_time, end_time) for _ in range(num_frames)])
-                print(f"Analyzing {num_frames} frames at timestamps: {', '.join([f'{t:.2f}s' for t in timestamps])}")
+                # Select random starting points for analysis
+                sample_points = sorted([random.uniform(start_time, end_time) for _ in range(num_sample_points)])
+                print(f"Analyzing {num_sample_points} segments with {num_frames_per_point} consecutive frames each")
                 
                 # Metrics to track
                 grain_scores = []
                 temporal_scores = []
-                fft_scores = []
                 
                 # Stats collection for detailed reporting
                 frame_stats = []
                 
-                # Extract frames
-                print("\nExtracting frames for analysis...")
-                frame_files = []
-                for i, timestamp in enumerate(timestamps):
-                    frame_path = os.path.join(temp_dir, f"frame_{i:03d}.png")
-                    cmd = [
-                        'jellyfin-ffmpeg',
-                        '-ss', str(timestamp),
-                        '-i', self.file_path,
-                        '-vframes', '1',
-                        '-q:v', '1',
-                        frame_path
-                    ]
-                    subprocess.run(cmd, capture_output=True)
-                    if os.path.exists(frame_path):
-                        frame_files.append(frame_path)
-                        print(f"  Frame {i+1}: extracted at {timestamp:.2f}s")
+                # Extract frame sequences
+                print("\nExtracting frame sequences for analysis...")
+                frame_sequences = []
                 
-                if len(frame_files) < 2:
-                    logger.warning("Not enough frames extracted for analysis")
+                for i, start_point in enumerate(sample_points):
+                    sequence = []
+                    print(f"  Sequence {i+1}: extracting {num_frames_per_point} consecutive frames at {start_point:.2f}s")
+                    
+                    # Extract consecutive frames for this sequence
+                    for j in range(num_frames_per_point):
+                        frame_path = os.path.join(temp_dir, f"seq{i}_frame{j:03d}.png")
+                        # For consecutive frames, use -vframes with a single timestamp
+                        cmd = [
+                            'jellyfin-ffmpeg',
+                            '-ss', str(start_point),  # Start timestamp
+                            '-i', self.file_path,
+                            '-vf', f'select=gte(n\\,{j})',  # Select frame j from the sequence
+                            '-vframes', '1',
+                            '-q:v', '1',
+                            frame_path
+                        ]
+                        subprocess.run(cmd, capture_output=True)
+                        if os.path.exists(frame_path):
+                            sequence.append(frame_path)
+                            frame_stats.append({'Frame': f"S{i+1}F{j+1}", 'Timestamp': f"{start_point+j/30:.2f}s"})
+                    
+                    if len(sequence) >= 2:  # Need at least 2 frames for temporal analysis
+                        frame_sequences.append(sequence)
+                
+                if not frame_sequences:
+                    logger.warning("Could not extract frame sequences for analysis")
                     self.has_film_grain = False
                     return
                 
-                print(f"\n1. FFT Analysis (High Frequency Noise Detection)")
+                print(f"\n1. Temporal Analysis (Frame-to-Frame Noise Pattern)")
                 print("="*70)
                 
-                # 1. FFT Analysis for high frequency noise patterns
-                for i, frame_file in enumerate(frame_files):
-                    # Load image
-                    img = cv2.imread(frame_file, cv2.IMREAD_GRAYSCALE)
-                    if img is None:
-                        continue
-                    
-                    # Apply FFT
-                    f_transform = np.fft.fft2(img)
-                    f_shift = np.fft.fftshift(f_transform)
-                    magnitude_spectrum = 20 * np.log(np.abs(f_shift) + 1)
-                    
-                    # Analyze high frequency content (typical of film grain)
-                    h, w = magnitude_spectrum.shape
-                    center_y, center_x = h // 2, w // 2
-                    
-                    # Define regions (center is low frequency, edges are high frequency)
-                    mask_high = np.ones_like(magnitude_spectrum, dtype=np.uint8)
-                    cv2.circle(mask_high, (center_x, center_y), min(h, w) // 4, 0, -1)
-                    
-                    # Calculate region energies
-                    high_freq_energy = np.mean(magnitude_spectrum * mask_high)
-                    total_energy = np.mean(magnitude_spectrum)
-                    
-                    # Save FFT score (higher values indicate more grain)
-                    fft_score = high_freq_energy / total_energy
-                    fft_scores.append(fft_score)
-                    
-                    # Report FFT analysis
-                    frame_stat = {
-                        'Frame': i+1,
-                        'FFT Score': f"{fft_score:.2f}",
-                        'High Freq Energy': f"{high_freq_energy:.2f}",
-                        'Total Energy': f"{total_energy:.2f}",
-                        'FFT Indicates Grain': "Yes" if fft_score > 1.5 else "No"
-                    }
-                    frame_stats.append(frame_stat)
-                    
-                    print(f"  Frame {i+1}: FFT Score={fft_score:.2f}, High Freq Energy={high_freq_energy:.2f}, "
-                          f"Total Energy={total_energy:.2f}, Grain Indicated: {'Yes' if fft_score > 1.5 else 'No'}")
+                # Temporal analysis on truly consecutive frames
+                for seq_idx, sequence in enumerate(frame_sequences):
+                    for i in range(len(sequence) - 1):
+                        img1 = cv2.imread(sequence[i], cv2.IMREAD_GRAYSCALE)
+                        img2 = cv2.imread(sequence[i+1], cv2.IMREAD_GRAYSCALE)
+                        
+                        if img1 is None or img2 is None:
+                            continue
+                        
+                        # Resize if dimensions don't match
+                        if img1.shape != img2.shape:
+                            img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+                        
+                        # Calculate frame difference
+                        diff = cv2.absdiff(img1, img2)
+                        
+                        # Apply threshold to isolate noise
+                        _, noise_mask = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
+                        
+                        # Calculate noise statistics
+                        noise_ratio = np.count_nonzero(noise_mask) / noise_mask.size
+                        noise_mean = np.mean(diff)
+                        noise_std = np.std(diff)
+                        
+                        # Film grain typically has consistent fine noise pattern
+                        temporal_score = (noise_ratio * 10) + (noise_std / 5)
+                        temporal_scores.append(temporal_score)
+                        
+                        # Add to the frame stats
+                        frame_idx = seq_idx * (num_frames_per_point - 1) + i
+                        if frame_idx < len(frame_stats):
+                            frame_stats[frame_idx].update({
+                                'Temporal Score': f"{temporal_score:.2f}",
+                                'Noise Ratio': f"{noise_ratio:.4f}",
+                                'Noise StdDev': f"{noise_std:.2f}",
+                                'Temporal Indicates Grain': "Yes" if temporal_score > 10.0 else "No"
+                            })
+                        
+                        print(f"  Sequence {seq_idx+1}, Frames {i+1}-{i+2}: Temporal Score={temporal_score:.2f}, "
+                              f"Noise Ratio={noise_ratio:.4f}, Noise StdDev={noise_std:.2f}, "
+                              f"Grain Indicated: {'Yes' if temporal_score > 1.0 else 'No'}")
                 
-                print(f"\n2. Temporal Analysis (Frame-to-Frame Noise Pattern)")
+                print(f"\n2. Texture Analysis (Edge Detection & Noise Patterns)")
                 print("="*70)
                 
-                # 2. Temporal analysis (noise pattern consistency between frames)
-                for i in range(len(frame_files) - 1):
-                    img1 = cv2.imread(frame_files[i], cv2.IMREAD_GRAYSCALE)
-                    img2 = cv2.imread(frame_files[i+1], cv2.IMREAD_GRAYSCALE)
-                    
-                    if img1 is None or img2 is None:
-                        continue
-                    
-                    # Resize if dimensions don't match
-                    if img1.shape != img2.shape:
-                        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
-                    
-                    # Calculate frame difference
-                    diff = cv2.absdiff(img1, img2)
-                    
-                    # Apply threshold to isolate noise
-                    _, noise_mask = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
-                    
-                    # Calculate noise statistics
-                    noise_ratio = np.count_nonzero(noise_mask) / noise_mask.size
-                    noise_mean = np.mean(diff)
-                    noise_std = np.std(diff)
-                    
-                    # Film grain typically has consistent fine noise pattern
-                    temporal_score = (noise_ratio * 10) + (noise_std / 5)
-                    temporal_scores.append(temporal_score)
-                    
-                    # Add to the frame stats
-                    if i < len(frame_stats):
-                        frame_stats[i].update({
-                            'Temporal Score': f"{temporal_score:.2f}",
-                            'Noise Ratio': f"{noise_ratio:.4f}",
-                            'Noise StdDev': f"{noise_std:.2f}",
-                            'Temporal Indicates Grain': "Yes" if temporal_score > 1.0 else "No"
-                        })
-                    
-                    print(f"  Frames {i+1}-{i+2}: Temporal Score={temporal_score:.2f}, "
-                          f"Noise Ratio={noise_ratio:.4f}, Noise StdDev={noise_std:.2f}, "
-                          f"Grain Indicated: {'Yes' if temporal_score > 1.0 else 'No'}")
+                # Flatten all frames for texture analysis
+                all_frames = [frame for sequence in frame_sequences for frame in sequence]
                 
-                print(f"\n3. Texture Analysis (Edge Detection & Noise Patterns)")
-                print("="*70)
-                
-                # 3. Texture analysis with specialized filters
-                for i, frame_file in enumerate(frame_files):
+                # Texture analysis with specialized filters
+                for i, frame_file in enumerate(all_frames):
                     img = cv2.imread(frame_file, cv2.IMREAD_GRAYSCALE)
                     if img is None:
                         continue
@@ -262,44 +234,15 @@ class VideoInfo:
                             'Texture Score': f"{grain_score:.2f}",
                             'Texture Energy': f"{texture_energy:.6f}",
                             'Edge StdDev': f"{texture_std:.2f}",
-                            'Texture Indicates Grain': "Yes" if grain_score > 3.0 else "No"
+                            'Texture Indicates Grain': "Yes" if grain_score > 100.0 else "No"
                         })
                     
-                    print(f"  Frame {i+1}: Texture Score={grain_score:.2f}, "
+                    print(f"  Frame {frame_stats[i]['Frame'] if i < len(frame_stats) else i+1}: Texture Score={grain_score:.2f}, "
                           f"Texture Energy={texture_energy:.6f}, Edge StdDev={texture_std:.2f}, "
                           f"Grain Indicated: {'Yes' if grain_score > 3.0 else 'No'}")
                 
-                print(f"\n4. Metadata Analysis")
-                print("="*70)
-                
-                # 4. Analyze metadata (codec, format, etc.)
-                metadata_score = 0
-                metadata_factors = []
-                
-                grain_prone_codecs = ['mpeg2video', 'h264', 'prores', 'dnxhd']
-                if self.codec in grain_prone_codecs:
-                    metadata_score += 1
-                    metadata_factors.append(f"Codec '{self.codec}' often contains grain")
-                
-                # Analyze filename for grain-related keywords
-                lower_filename = os.path.basename(self.file_path).lower()
-                grain_indicators = ['grain', 'film', '35mm', '16mm', 'analog', 'vintage']
-                for indicator in grain_indicators:
-                    if indicator in lower_filename:
-                        metadata_score += 0.5
-                        metadata_factors.append(f"Filename contains '{indicator}'")
-                
-                print(f"  Metadata Score: {metadata_score:.1f}")
-                for factor in metadata_factors:
-                    print(f"  • {factor}")
-                
                 # Combined analysis
                 # Normalize scores
-                if fft_scores:
-                    avg_fft = sum(fft_scores) / len(fft_scores)
-                else:
-                    avg_fft = 0
-                
                 if temporal_scores:
                     avg_temporal = sum(temporal_scores) / len(temporal_scores)
                 else:
@@ -310,15 +253,14 @@ class VideoInfo:
                 else:
                     avg_grain = 0
                 
-                # Calculate weighted score
-                # Each method contributes differently to the final decision
-                weighted_score = (avg_fft * 0.05) + (avg_temporal * 0.15) + (avg_grain * 0.6) + (metadata_score * 0.2)
+                # Calculate weighted score (adjusted weights)
+                weighted_score = (avg_temporal * 0.15) + (avg_grain * 0.85)
                 
-                # Threshold for detection (calibrated based on testing)
-                self.has_film_grain = weighted_score >= 10
+                # Threshold for detection (recalibrated)
+                self.has_film_grain = weighted_score >= 100.0
                 
                 # Calculate confidence
-                confidence = min(100, weighted_score * 50)
+                confidence = min(100, weighted_score * 10)
                 
                 # Print summary table of all frame analyses only in verbose mode
                 verbose_mode = self.config.get('verbose', False) if hasattr(self, 'config') else False
@@ -329,11 +271,9 @@ class VideoInfo:
                         for stat in frame_stats:
                             compact_stat = {
                                 'Frame': stat.get('Frame', '?'),
-                                'FFT': stat.get('FFT Score', '?'),
                                 'Temp': stat.get('Temporal Score', '?'),
                                 'Texture': stat.get('Texture Score', '?'),
                                 'Grain?': 'Yes' if (
-                                    stat.get('FFT Indicates Grain', 'No') == 'Yes' or
                                     stat.get('Temporal Indicates Grain', 'No') == 'Yes' or
                                     stat.get('Texture Indicates Grain', 'No') == 'Yes'
                                 ) else 'No'
@@ -347,8 +287,7 @@ class VideoInfo:
                         print("\nDetailed Frame Analysis Summary:")
                         for stat in frame_stats:
                             print(f"  Frame {stat.get('Frame', '?')}: "
-                                  f"FFT={stat.get('FFT Score', '?')}, "
-                                  f"Temp={stat.get('Temporal Score', '?')}, "
+                                  f"Temporal={stat.get('Temporal Score', '?')}, "
                                   f"Texture={stat.get('Texture Score', '?')}")
                 
                 # Report final result
@@ -356,18 +295,16 @@ class VideoInfo:
                 print("\n" + "="*70)
                 print(f"FILM GRAIN ANALYSIS RESULT: {result}")
                 print(f"Overall Confidence: {confidence:.1f}%")
-                print(f"  - FFT Score: {avg_fft:.2f} (Weight: 5%)")
                 print(f"  - Temporal Score: {avg_temporal:.2f} (Weight: 15%)")
-                print(f"  - Texture Score: {avg_grain:.2f} (Weight: 60%)")
-                print(f"  - Metadata Score: {metadata_score:.1f} (Weight: 20%)")
-                print(f"  - Final Weighted Score: {weighted_score:.2f} (Threshold: 10)")
+                print(f"  - Texture Score: {avg_grain:.2f} (Weight: 85%)")
+                print(f"  - Final Weighted Score: {weighted_score:.2f} (Threshold: 100.0)")
                 print("="*70 + "\n")
                 
                 summary = (
                     f"Film grain detection result: {result}\n"
                     f"Confidence: {confidence:.1f}%\n"
-                    f"FFT score: {avg_fft:.2f}, Temporal score: {avg_temporal:.2f}, "
-                    f"Texture score: {avg_grain:.2f}, Metadata score: {metadata_score:.1f}"
+                    f"Temporal score: {avg_temporal:.2f}, "
+                    f"Texture score: {avg_grain:.2f}"
                 )
                 
                 logger.info(summary)
@@ -620,16 +557,13 @@ def main():
         except Exception as e:
             logger.error(f"Error during film grain detection: {e}")
             return False
-    
-    # If detect-only mode, process files but just for detection
+
+    # If detect-only mode, process files but just for detection, then exit
     if args.detect_only:
         if os.path.isfile(args.input):
-            # Process single file
             detect_grain_only(args.input)
         else:
-            # Process directory
             file_list = []
-            
             if args.recursive:
                 for root, _, files in os.walk(args.input):
                     for file in files:
@@ -639,19 +573,16 @@ def main():
                 for file in os.listdir(args.input):
                     if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
                         file_list.append(os.path.join(args.input, file))
-            
             if not file_list:
                 logger.warning(f"No video files found in {args.input}")
                 sys.exit(0)
-            
             grain_detected = 0
             for file_path in file_list:
                 if detect_grain_only(file_path):
                     grain_detected += 1
-            
             logger.info(f"Film grain analysis complete: Film grain detected in {grain_detected}/{len(file_list)} files")
-            return
-    
+        sys.exit(0)
+
     # Continue with normal transcoding if not in detect-only mode
     transcoder = Transcoder(config)
     
