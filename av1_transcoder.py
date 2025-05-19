@@ -14,7 +14,7 @@ import argparse
 import logging
 from pathlib import Path
 import concurrent.futures
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 # Set up logging
 logging.basicConfig(
@@ -100,17 +100,18 @@ class VideoInfo:
             # Avoid the first and last 10% of the video
             start_time = self.duration * 0.1
             end_time = self.duration * 0.9
-            
-            if end_time <= start_time:
-                # Short video, use the whole duration
+
+            # If the video is too short, just use the whole duration
+            if self.duration < 600:
                 start_time = 0
                 end_time = self.duration
-                
-            timestamps = [random.uniform(start_time, end_time) for _ in range(num_frames)]
             
             # Track frames with detected grain
             grain_detected_count = 0
             grain_confidence = 0.0
+
+            # Generate random timestamps for frame analysis
+            timestamps = [random.uniform(start_time, end_time) for _ in range(num_frames)]
             
             logger.info(f"Analyzing {num_frames} frames for film grain in {self.file_path}")
             
@@ -337,8 +338,7 @@ def main():
     parser.add_argument('-r', '--recursive', action='store_true', help='Recursively process directories')
     parser.add_argument('-p', '--preset', type=int, default=6, help='AV1 encoding preset (0-13, 0=highest quality/slowest, 13=lowest quality/fastest)')
     parser.add_argument('-c', '--crf', type=int, default=23, help='AV1 CRF value (0-63, lower = higher quality)')
-    parser.add_argument('-f', '--enable-film-grain', action='store_true', help='Enable film grain synthesis detection and application')
-    parser.add_argument('-d', '--device', default='/dev/dri/card0', help='Hardware device path (default: /dev/dri/card0)')
+    parser.add_argument('-g', '--enable-film-grain', action='store_true', help='Enable film grain synthesis detection and application')
     parser.add_argument('--parallel', action='store_true', help='Enable parallel processing')
     parser.add_argument('-w', '--max-workers', type=int, default=1, help='Maximum number of parallel workers')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
