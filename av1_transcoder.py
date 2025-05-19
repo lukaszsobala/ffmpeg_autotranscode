@@ -551,9 +551,10 @@ class Transcoder:
 
 def main():
     """Main function"""
-    parser = argparse.ArgumentParser(description='AV1 Automatic Transcoder')
+    parser = argparse.ArgumentParser(description='Automatic RKMPP Transcoder to AV1')
     
-    parser.add_argument('-i', '--input', required=True, help='Input file or directory')
+    # Remove required=True from --input
+    parser.add_argument('-i', '--input', help='Input file or directory')
     parser.add_argument('-o', '--output-dir', help='Output directory')
     parser.add_argument('-r', '--recursive', action='store_true', help='Recursively process directories')
     parser.add_argument('-p', '--preset', type=int, default=6, help='AV1 encoding preset (0-13, 0=highest quality/slowest, 13=lowest quality/fastest)')
@@ -569,7 +570,11 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug output for troubleshooting')
     
     args = parser.parse_args()
-    
+
+    # Enforce that at least one of --input or --list is provided
+    if not args.input and not args.list:
+        parser.error("At least one of --input or --list must be specified.")
+
     config = {
         'preset': args.preset,
         'crf': args.crf,
