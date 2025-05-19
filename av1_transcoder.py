@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 import concurrent.futures
 from typing import List, Dict, Any, Optional
+import shutil
 
 # Set up logging
 logging.basicConfig(
@@ -378,7 +379,22 @@ class Transcoder:
             if os.path.exists(output_file) and not self.config.get('overwrite', False):
                 logger.info(f"Output file {output_file} already exists, skipping")
                 return False
-            
+
+            # Debug: Print current working directory and environment
+            if self.config.get('debug', False):
+                print(f"[DEBUG] Current working directory: {os.getcwd()}")
+                print(f"[DEBUG] PATH: {os.environ.get('PATH')}")
+                print(f"[DEBUG] Environment: {os.environ}")
+
+            # Debug: Check if jellyfin-ffmpeg is in PATH
+            ffmpeg_path = shutil.which('jellyfin-ffmpeg')
+            if self.config.get('debug', False) or not ffmpeg_path:
+                print(f"[DEBUG] Resolved jellyfin-ffmpeg path: {ffmpeg_path}")
+                if not ffmpeg_path:
+                    print("[ERROR] jellyfin-ffmpeg not found in PATH. Please check your environment.")
+                    logger.error("jellyfin-ffmpeg not found in PATH.")
+                    return False
+
             # Build ffmpeg command with correct hardware acceleration flags
             cmd = [
                 'jellyfin-ffmpeg',
@@ -432,14 +448,28 @@ class Transcoder:
             print("FFmpeg command:", ' '.join(cmd))
             logger.info(f"Transcoding command: {' '.join(cmd)}")
             
+            # Debug: Print environment and command before running
+            if self.config.get('debug', False):
+                print(f"[DEBUG] About to run: {' '.join(cmd)}")
+                print(f"[DEBUG] Using environment: {os.environ}")
+
             # Run the transcoding process with proper output capture
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                bufsize=1  # Line buffered
-            )
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    bufsize=1  # Line buffered
+                )
+            except FileNotFoundError as e:
+                print(f"[ERROR] Failed to execute command: {e}")
+                logger.error(f"Failed to execute command: {e}")
+                return False
+            except Exception as e:
+                print(f"[ERROR] Unexpected error when starting process: {e}")
+                logger.error(f"Unexpected error when starting process: {e}")
+                return False
             
             # Improved progress monitoring with console output
             stderr_lines = []
@@ -461,11 +491,15 @@ class Transcoder:
                 return True
             else:
                 error_output = '\n'.join(stderr_lines[-10:])  # Show last 10 lines of error
+                print(f"[ERROR] Transcoding failed with return code {returncode}. Last stderr lines:\n{error_output}")
                 logger.error(f"Transcoding failed with return code {returncode}. Error: {error_output}")
                 return False
                 
         except Exception as e:
             logger.error(f"Error during transcoding: {e}")
+            if self.config.get('debug', False):
+                import traceback
+                traceback.print_exc()
             return False
     
     def process_file_list(self, file_list: List[str], output_dir: Optional[str] = None) -> None:
@@ -532,6 +566,7 @@ def main():
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output with detailed statistics')
     parser.add_argument('--list', help='File containing list of videos to transcode')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output for troubleshooting')
     
     args = parser.parse_args()
     
@@ -544,7 +579,8 @@ def main():
         'overwrite': args.overwrite,
         'detect_only': args.detect_only,
         'grain_strength': args.grain_strength,
-        'verbose': args.verbose
+        'verbose': args.verbose,
+        'debug': args.debug
     }
     
     # Create a simple function to just detect film grain
