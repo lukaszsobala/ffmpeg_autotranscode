@@ -394,95 +394,49 @@ class Transcoder:
                 logger.info(f"Output file {output_file} already exists, skipping")
                 return False
             
-            # Build ffmpeg command with correct hardware acceleration flags
+            # Build ffmpeg command
             cmd = [
-                'jellyfin-ffmpeg',
+                'jellyfin-ffmpeg', 
+                '-hwaccel', 'rkmpp', 
+                '-hwaccel_output_format', 'drm_prime',
+                '-i', input_file
             ]
             
-            # Add input format if detected
-            if hasattr(video_info, 'format_name') and video_info.format_name:
-                cmd.extend(['-f', video_info.format_name])
-                
-            # Add hardware acceleration options
-            cmd.extend([
-                '-hwaccel', 'rkmpp',
-                '-hwaccel_output_format', 'drm_prime',
-                '-afbc', 'rga',
-            #    '-hwaccel_device', self.config.get('device', '/dev/dri/card0'),
-                '-i', escape_filename(input_file),
-                '-c:a', 'copy'
-            ])
-            
-            # Add video scaling and mapping options with correct filters
-            cmd.extend([
-                '-vf', f'scale_rkrga=w={video_info.width}:h={video_info.height}:format=nv12,hwmap=mode=read,format=nv12',
-                '-map', '0',
-                '-map_metadata', '-1',
-                '-map_chapters', '-1',
-                '-threads', '0'
-            ])
-            
             # Add video codec options
-            # For 8-bit, the pixel format should be 'yuv420p'
-            # For 10-bit, the pixel format should be 'yuv420p10le'
-            pixel_format = 'yuv420p10le' if video_info.bit_depth == 10 else 'yuv420p'
             cmd.extend([
                 '-c:v', 'libsvtav1',
-                '-pix_fmt', pixel_format,
-                '-preset', str(self.config.get('preset', 6)),
+                '-preset', str(self.config.get('preset', 7)),
                 '-crf', str(self.config.get('crf', 23))
             ])
             
-            # Add film grain synthesis if detected and enabled
-            if video_info.has_film_grain and self.config.get('enable_film_grain', True):
-                grain_strength = self.config.get('grain_strength', 8)
-                cmd.extend([
-                    '-svtav1-params', f'film-grain-denoise={grain_strength}'
-                ])
+            # Add audio codec (copy)
+            cmd.extend(['-c:a', 'copy'])
             
-            # Add output file
-            cmd.append(escape_filename(output_file))
+            # Set pixel format based on bit depth
+            pix_fmt = 'yuv420p10le' if video_info.bit_depth == 10 else 'yuv420p'
+            cmd.extend(['-pix_fmt', pix_fmt])
             
-            # Convert command list to string for logging
-            cmd_str = ' '.join(cmd)
+            # Add film grain synthesis if detected
+            if video_info.has_film_grain and self.config.get('film_grain', False):
+                # Use svtav1-params for film grain control
+                grain_str = str(self.config.get('grain_strength', 10))
+                cmd.extend(['-svtav1-params', f'film-grain-denoise={grain_str}'])
+            
+            # Set output file
+            cmd.append(output_file)
             
             # Log the command
-            print("FFmpeg command:", cmd_str)
-            logger.info(f"Transcoding command: {cmd_str}")
+            logger.info(f"Transcoding command: {' '.join(cmd)}")
             
-            # Run the transcoding process with shell=True to ensure correct argument parsing
-            process = subprocess.Popen(
-                cmd_str,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                bufsize=1  # Line buffered
-            )
+            # Run the transcoding process
+            subprocess.run(cmd, check=True)
             
-            # Improved progress monitoring with console output
-            stderr_lines = []
-            for line in process.stderr:
-                stderr_lines.append(line)
-                if "frame=" in line and "fps=" in line:
-                    # Print progress directly to console
-                    print(line.strip(), flush=True)
-                    logger.debug(line.strip())
-                # Also print other important ffmpeg status messages
-                elif any(info in line for info in ["Stream mapping", "Duration:", "Output #0"]):
-                    print(line.strip(), flush=True)
+            logger.info(f"Successfully transcoded {input_file} to {output_file}")
+            return True
             
-            # Get return code and handle errors better
-            returncode = process.wait()
-            
-            if returncode == 0:
-                logger.info(f"Successfully transcoded {input_file} to {output_file}")
-                return True
-            else:
-                error_output = '\n'.join(stderr_lines[-10:])  # Show last 10 lines of error
-                logger.error(f"Transcoding failed with return code {returncode}. Error: {error_output}")
-                return False
-                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Transcoding failed: {e}")
+            return False
         except Exception as e:
             logger.error(f"Error during transcoding: {e}")
             return False
@@ -541,82 +495,30 @@ def main():
     parser.add_argument('-i', '--input', required=True, help='Input file or directory')
     parser.add_argument('-o', '--output-dir', help='Output directory')
     parser.add_argument('-r', '--recursive', action='store_true', help='Recursively process directories')
-    parser.add_argument('-p', '--preset', type=int, default=6, help='AV1 encoding preset (0-13, 0=highest quality/slowest, 13=lowest quality/fastest)')
+    parser.add_argument('-p', '--preset', type=int, default=7, help='AV1 encoding preset (0-8, 0=highest quality/slowest, 8=lowest quality/fastest)')
     parser.add_argument('-c', '--crf', type=int, default=23, help='AV1 CRF value (0-63, lower = higher quality)')
-    parser.add_argument('-g', '--enable-film-grain', action='store_true', help='Enable film grain synthesis detection and application')
-    parser.add_argument('--detect-only', action='store_true', help='Only detect film grain without transcoding')
-    parser.add_argument('--grain-strength', type=int, default=8, help='Film grain strength (0-16, higher values add more grain)')
+    parser.add_argument('-f', '--film-grain', action='store_true', help='Enable film grain synthesis for detected film grain')
+    parser.add_argument('-g', '--grain-strength', type=int, default=10, help='Film grain strength (1-50, higher values add more grain)')
     parser.add_argument('--parallel', action='store_true', help='Enable parallel processing')
     parser.add_argument('-w', '--max-workers', type=int, default=1, help='Maximum number of parallel workers')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output with detailed statistics')
-    parser.add_argument('--list', help='File containing list of videos to transcode')
     
     args = parser.parse_args()
     
     config = {
         'preset': args.preset,
         'crf': args.crf,
-        'enable_film_grain': args.enable_film_grain,
+        'film_grain': args.film_grain,
+        'grain_strength': args.grain_strength,
         'parallel': args.parallel,
         'max_workers': args.max_workers,
         'overwrite': args.overwrite,
-        'detect_only': args.detect_only,
-        'grain_strength': args.grain_strength,
         'verbose': args.verbose
     }
     
-    # Create a simple function to just detect film grain
-    def detect_grain_only(file_path):
-        try:
-            print(f"\nAnalyzing file: {file_path}")
-            video_info = VideoInfo(file_path, config)
-            result = "DETECTED" if video_info.has_film_grain else "NOT DETECTED"
-            print(f"Film grain detection result for {file_path}: {result}\n")
-            return video_info.has_film_grain
-        except Exception as e:
-            logger.error(f"Error during film grain detection: {e}")
-            return False
-
-    # If detect-only mode, process files but just for detection, then exit
-    if args.detect_only:
-        if os.path.isfile(args.input):
-            detect_grain_only(args.input)
-        else:
-            file_list = []
-            if args.recursive:
-                for root, _, files in os.walk(args.input):
-                    for file in files:
-                        if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
-                            file_list.append(os.path.join(root, file))
-            else:
-                for file in os.listdir(args.input):
-                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
-                        file_list.append(os.path.join(args.input, file))
-            if not file_list:
-                logger.warning(f"No video files found in {args.input}")
-                sys.exit(0)
-            grain_detected = 0
-            for file_path in file_list:
-                if detect_grain_only(file_path):
-                    grain_detected += 1
-            logger.info(f"Film grain analysis complete: Film grain detected in {grain_detected}/{len(file_list)} files")
-        sys.exit(0)
-
-    # Continue with normal transcoding if not in detect-only mode
     transcoder = Transcoder(config)
     
-    # Process file list if provided
-    if args.list:
-        try:
-            with open(args.list, 'r') as f:
-                file_list = [line.strip() for line in f if line.strip()]
-            transcoder.process_file_list(file_list, args.output_dir)
-        except Exception as e:
-            logger.error(f"Error reading file list: {e}")
-            sys.exit(1)
-    
-    # Process input file or directory
     input_path = args.input
     
     if not os.path.exists(input_path):
@@ -634,11 +536,11 @@ def main():
         if args.recursive:
             for root, _, files in os.walk(input_path):
                 for file in files:
-                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
+                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv')):
                         file_list.append(os.path.join(root, file))
         else:
             for file in os.listdir(input_path):
-                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')):
+                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv')):
                     file_list.append(os.path.join(input_path, file))
         
         if not file_list:
