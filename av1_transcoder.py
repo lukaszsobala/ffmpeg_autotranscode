@@ -14,6 +14,7 @@ import argparse
 import logging
 from pathlib import Path
 import concurrent.futures
+import shlex
 from typing import List, Dict, Any, Optional
 
 # Set up logging
@@ -26,6 +27,20 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('av1_transcoder')
+
+def escape_filename(filename: str) -> str:
+    """
+    Properly escape filenames for use in FFmpeg commands.
+    Only escapes filename-specific special characters, not filter expressions.
+    
+    Args:
+        filename: The filename to escape
+        
+    Returns:
+        Properly escaped filename
+    """
+    # Use shlex.quote for proper shell escaping of filenames
+    return shlex.quote(filename)
 
 class VideoInfo:
     """Class to store and handle video information"""
@@ -141,11 +156,11 @@ class VideoInfo:
                         cmd = [
                             'jellyfin-ffmpeg',
                             '-ss', str(start_point),  # Start timestamp
-                            '-i', self.file_path,
+                            '-i', escape_filename(self.file_path),
                             '-vf', f'select=gte(n\\,{j})',  # Select frame j from the sequence
                             '-vframes', '1',
                             '-q:v', '1',
-                            frame_path
+                            frame_path  # No need to escape temp paths, they're safe
                         ]
                         subprocess.run(cmd, capture_output=True)
                         if os.path.exists(frame_path):
@@ -394,7 +409,7 @@ class Transcoder:
                 '-hwaccel_output_format', 'drm_prime',
                 '-afbc', 'rga',
             #    '-hwaccel_device', self.config.get('device', '/dev/dri/card0'),
-                '-i', input_file,
+                '-i', escape_filename(input_file),
                 '-c:a', 'copy'
             ])
             
@@ -426,15 +441,19 @@ class Transcoder:
                 ])
             
             # Add output file
-            cmd.append(output_file)
+            cmd.append(escape_filename(output_file))
+            
+            # Convert command list to string for logging
+            cmd_str = ' '.join(cmd)
             
             # Log the command
-            print("FFmpeg command:", ' '.join(cmd))
-            logger.info(f"Transcoding command: {' '.join(cmd)}")
+            print("FFmpeg command:", cmd_str)
+            logger.info(f"Transcoding command: {cmd_str}")
             
-            # Run the transcoding process with proper output capture
+            # Run the transcoding process with shell=True to ensure correct argument parsing
             process = subprocess.Popen(
-                cmd,
+                cmd_str,
+                shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
