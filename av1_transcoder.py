@@ -12,11 +12,15 @@ import subprocess
 import json
 import argparse
 import logging
+import re
+import datetime
 from pathlib import Path
 import concurrent.futures
 import shlex
 from typing import List, Dict, Any, Optional
 import shutil
+import tempfile
+import uuid
 
 # Set up logging
 logging.basicConfig(
@@ -366,6 +370,26 @@ class VideoInfo:
             logger.warning(f"Simplified film grain detection error: {e}")
             self.has_film_grain = False
 
+def estimate_completion_time(frame, fps, total_frames):
+    """
+    Estimate completion time based on current progress
+    
+    Args:
+        frame: Current frame number
+        fps: Current processing speed (frames per second)
+        total_frames: Total number of frames to process
+        
+    Returns:
+        Estimated time remaining in seconds
+    """
+    if frame <= 0 or fps <= 0 or total_frames <= 0:
+        return None
+    
+    remaining_frames = total_frames - frame
+    seconds_remaining = remaining_frames / fps
+    
+    return seconds_remaining
+
 class Transcoder:
     """Class to handle video transcoding"""
     
@@ -388,7 +412,8 @@ class Transcoder:
             
             if not output_file:
                 input_path = Path(input_file)
-                output_file = str(input_path.with_stem(f"{input_path.stem}_av1").with_suffix('.mkv'))
+                output_format = self.config.get('output_format', 'mkv')
+                output_file = str(input_path.with_stem(f"{input_path.stem}_av1").with_suffix(f'.{output_format}'))
             
             # Skip if output already exists and overwrite not enabled
             if os.path.exists(output_file) and not self.config.get('overwrite', False):
@@ -410,6 +435,10 @@ class Transcoder:
                     logger.error("jellyfin-ffmpeg not found in PATH.")
                     return False
 
+            # Check if we should use SvtAv1EncApp workflow
+            if self.config.get('use_svt_pipe', False):
+                return self.transcode_with_svt_pipe(input_file, output_file, video_info)
+            
             # Build ffmpeg command with correct hardware acceleration flags
             cmd = [
                 'jellyfin-ffmpeg', 
@@ -421,12 +450,21 @@ class Transcoder:
             # Add video codec options
             cmd.extend([
                 '-c:v', 'libsvtav1',
-                '-preset', str(self.config.get('preset', 7)),
+                '-preset', str(self.config.get('preset', 4)),
                 '-crf', str(self.config.get('crf', 23))
             ])
             
-            # Add audio codec (copy)
-            cmd.extend(['-c:a', 'copy'])
+            # Add audio codec (copy or transcode)
+            if self.config.get('transcode_audio', False):
+                cmd.extend(['-c:a', 'libopus', '-b:a', f"{self.config.get('audio_bitrate', 128)}k"])
+            else:
+                cmd.extend(['-c:a', 'copy'])
+            
+            # Handle subtitle streams
+            if self.config.get('copy_subtitles', True):
+                cmd.extend(['-c:s', 'copy'])
+            else:
+                cmd.extend(['-sn'])  # No subtitles
             
             # Set pixel format based on bit depth
             pix_fmt = 'yuv420p10le' if video_info.bit_depth == 10 else 'yuv420p'
@@ -435,8 +473,13 @@ class Transcoder:
             # Add film grain synthesis if detected
             if video_info.has_film_grain and self.config.get('film_grain', False):
                 # Use svtav1-params for film grain control
-                grain_str = str(self.config.get('grain_strength', 10))
+                grain_str = str(self.config.get('grain_strength', 8))
                 cmd.extend(['-svtav1-params', f'film-grain-denoise={grain_str}'])
+            
+            # Add custom ffmpeg parameters if provided
+            if self.config.get('custom_params'):
+                custom_params = self.config.get('custom_params').split()
+                cmd.extend(custom_params)
             
             # Set output file
             cmd.append(output_file)
@@ -467,14 +510,65 @@ class Transcoder:
                 logger.error(f"Unexpected error when starting process: {e}")
                 return False
             
-            # Improved progress monitoring with console output
+            # Improved progress monitoring with console output and ETA
             stderr_lines = []
+            total_frames = 0
+            current_frame = 0
+            current_fps = 0
+            
+            # Try to get total frames for progress reporting
+            duration_cmd = ['jellyfin-ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                          '-show_entries', 'stream=nb_frames,r_frame_rate', '-of', 'json', input_file]
+            try:
+                duration_result = subprocess.run(duration_cmd, capture_output=True, text=True, check=False)
+                if duration_result.returncode == 0:
+                    duration_info = json.loads(duration_result.stdout)
+                    # Get frames directly if available
+                    stream_info = duration_info.get('streams', [{}])[0]
+                    nb_frames = stream_info.get('nb_frames')
+                    if nb_frames and nb_frames.isdigit():
+                        total_frames = int(nb_frames)
+                    # Otherwise calculate from duration and frame rate
+                    elif hasattr(video_info, 'duration') and video_info.duration > 0:
+                        # Parse frame rate (usually in format "num/denom")
+                        r_frame_rate = stream_info.get('r_frame_rate', '25/1')
+                        if '/' in r_frame_rate:
+                            num, denom = map(int, r_frame_rate.split('/'))
+                            frame_rate = num / denom
+                        else:
+                            frame_rate = float(r_frame_rate)
+                        total_frames = int(video_info.duration * frame_rate)
+            except Exception as e:
+                if self.config.get('debug', False):
+                    print(f"[DEBUG] Failed to get frame count: {e}")
+
             for line in process.stderr:
                 stderr_lines.append(line)
                 if "frame=" in line and "fps=" in line:
-                    # Print progress directly to console
-                    print(line.strip(), flush=True)
-                    logger.debug(line.strip())
+                    # Extract current frame and fps
+                    frame_match = re.search(r'frame=\s*(\d+)', line)
+                    fps_match = re.search(r'fps=\s*(\d+\.?\d*)', line)
+                    
+                    if frame_match and fps_match:
+                        current_frame = int(frame_match.group(1))
+                        current_fps = float(fps_match.group(1))
+                        
+                        # Calculate progress and ETA
+                        if total_frames > 0:
+                            progress = (current_frame / total_frames) * 100
+                            eta_seconds = estimate_completion_time(current_frame, current_fps, total_frames)
+                            
+                            if eta_seconds is not None:
+                                eta_str = str(datetime.timedelta(seconds=int(eta_seconds)))
+                                progress_line = f"{line.strip()} | Progress: {progress:.1f}% | ETA: {eta_str}"
+                            else:
+                                progress_line = f"{line.strip()} | Progress: {progress:.1f}%"
+                        else:
+                            progress_line = line.strip()
+                            
+                        print(progress_line, flush=True)
+                    else:
+                        print(line.strip(), flush=True)
                 # Also print other important ffmpeg status messages
                 elif any(info in line for info in ["Stream mapping", "Duration:", "Output #0"]):
                     print(line.strip(), flush=True)
@@ -498,6 +592,171 @@ class Transcoder:
                 traceback.print_exc()
             return False
     
+    def transcode_with_svt_pipe(self, input_file: str, output_file: str, video_info: VideoInfo) -> bool:
+        """
+        Transcode a video file to AV1 using SvtAv1EncApp with pipe workflow
+        
+        Args:
+            input_file: Path to input video file
+            output_file: Path to output file
+            video_info: VideoInfo object with video metadata
+            
+        Returns:
+            bool: True if transcoding was successful
+        """
+        try:
+            # First check if SvtAv1EncApp exists
+            svt_path = shutil.which('SvtAv1EncApp')
+            if not svt_path:
+                logger.error("SvtAv1EncApp not found in PATH. Cannot use pipe workflow.")
+                print("[ERROR] SvtAv1EncApp not found. Install it or use the standard encoding method.")
+                return False
+                
+            # Create a temporary file for the intermediate IVF
+            temp_dir = tempfile.gettempdir()
+            temp_id = uuid.uuid4()
+            temp_ivf = os.path.join(temp_dir, f"svt_av1_{temp_id}.ivf")
+            
+            logger.info(f"Starting SvtAv1EncApp pipe workflow for {input_file}")
+            print(f"\n=== Starting AV1 encoding with SvtAv1EncApp: {os.path.basename(input_file)} ===")
+            
+            # Build pipeline command
+            # Step 1: Extract video and pipe to SvtAv1EncApp
+            pixel_format = 'yuv420p10le' if video_info.bit_depth == 10 else 'yuv420p'
+            input_depth = '10' if video_info.bit_depth == 10 else '8'
+            preset = str(self.config.get('preset', 4))  
+            crf = str(self.config.get('crf', 23))
+            
+            # Configure film grain if detected
+            film_grain_param = ""
+            if video_info.has_film_grain and self.config.get('film_grain', False):
+                grain_str = str(self.config.get('grain_strength', 8))
+                film_grain_param = f"--film-grain {grain_str}"
+                
+            # Build extraction and encoding command
+            # Note: We need the combined command for shell=True execution with pipe
+            combined_cmd = (
+                f"ffmpeg -i {shlex.quote(input_file)} -map 0:v:0 -pix_fmt {pixel_format} "
+                f"-f yuv4mpegpipe -strict -1 - | "
+                f"SvtAv1EncApp -i stdin --preset {preset} --keyint 240 --input-depth {input_depth} "
+                f"--crf {crf} {film_grain_param} --tune 0 -b {shlex.quote(temp_ivf)}"
+            )
+            
+            print("Step 1: Extracting video and encoding with SvtAv1EncApp")
+            print(f"Command: {combined_cmd}")
+            logger.info(f"SVT-AV1 pipe command: {combined_cmd}")
+            
+            # Execute the combined command with shell=True to enable piping
+            process = subprocess.Popen(
+                combined_cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1
+            )
+            
+            # Monitor the encoding progress
+            for line in process.stderr:
+                print(line.strip(), flush=True)
+                
+            returncode = process.wait()
+            if returncode != 0:
+                logger.error(f"SvtAv1EncApp encoding failed with return code {returncode}")
+                print(f"[ERROR] SvtAv1EncApp encoding failed with return code {returncode}")
+                # Clean up the temporary file if it exists
+                if os.path.exists(temp_ivf):
+                    os.remove(temp_ivf)
+                return False
+                
+            print(f"Step 1 complete. Intermediate file created at: {temp_ivf}")
+            
+            # Step 2: Mux the AV1 video with audio and subtitles
+            print("Step 2: Muxing AV1 video with audio and subtitles")
+            
+            mux_cmd = [
+                'ffmpeg',
+                '-i', temp_ivf,
+                '-i', input_file
+            ]
+            
+            # Add stream mapping
+            mux_cmd.extend(['-map', '0:v'])  # First input (IVF): video
+            
+            # Handle audio streams
+            if self.config.get('transcode_audio', False):
+                mux_cmd.extend([
+                    '-map', '1:a?',  # Second input: all audio streams
+                    '-c:a', 'libopus',
+                    '-b:a', f"{self.config.get('audio_bitrate', 128)}k"
+                ])
+            else:
+                mux_cmd.extend([
+                    '-map', '1:a?',  # Second input: all audio streams
+                    '-c:a', 'copy'
+                ])
+                
+            # Handle subtitle streams
+            if self.config.get('copy_subtitles', True):
+                mux_cmd.extend([
+                    '-map', '1:s?',  # Second input: all subtitle streams
+                    '-c:s', 'copy'
+                ])
+            
+            # Set video codec as copy since it's already encoded
+            mux_cmd.extend(['-c:v', 'copy'])
+            
+            # Add custom ffmpeg parameters if provided
+            if self.config.get('custom_params'):
+                custom_params = self.config.get('custom_params').split()
+                mux_cmd.extend(custom_params)
+                
+            # Set output file
+            mux_cmd.append(output_file)
+            
+            print(f"Muxing command: {' '.join(mux_cmd)}")
+            logger.info(f"Muxing command: {' '.join(mux_cmd)}")
+            
+            # Execute muxing command
+            mux_process = subprocess.Popen(
+                mux_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1
+            )
+            
+            # Monitor the muxing progress
+            for line in mux_process.stderr:
+                print(line.strip(), flush=True)
+                
+            mux_returncode = mux_process.wait()
+            
+            # Clean up the temporary file
+            if os.path.exists(temp_ivf):
+                os.remove(temp_ivf)
+                print(f"Removed temporary file: {temp_ivf}")
+            
+            if mux_returncode != 0:
+                logger.error(f"Muxing failed with return code {mux_returncode}")
+                print(f"[ERROR] Muxing failed with return code {mux_returncode}")
+                return False
+                
+            logger.info(f"Successfully transcoded {input_file} to {output_file} using SvtAv1EncApp workflow")
+            print(f"Successfully transcoded {input_file} to {output_file}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during SvtAv1EncApp transcoding: {e}")
+            print(f"[ERROR] SvtAv1EncApp transcoding failed: {e}")
+            if self.config.get('debug', False):
+                import traceback
+                traceback.print_exc()
+            # Clean up temporary file if it exists
+            if 'temp_ivf' in locals() and os.path.exists(temp_ivf):
+                os.remove(temp_ivf)
+            return False
+            
     def process_file_list(self, file_list: List[str], output_dir: Optional[str] = None) -> None:
         """
         Process a list of files for transcoding
@@ -547,22 +806,34 @@ class Transcoder:
 
 def main():
     """Main function"""
-    parser = argparse.ArgumentParser(description='Automatic RKMPP Transcoder to AV1')
+    parser = argparse.ArgumentParser(description='Automatic Transcoder to AV1 using Rockchip RKMPP')
     
     # Remove required=True from --input
     parser.add_argument('-i', '--input', help='Input file or directory')
     parser.add_argument('-o', '--output-dir', help='Output directory')
     parser.add_argument('-r', '--recursive', action='store_true', help='Recursively process directories')
-    parser.add_argument('-p', '--preset', type=int, default=7, help='AV1 encoding preset (0-8, 0=highest quality/slowest, 8=lowest quality/fastest)')
+    parser.add_argument('-p', '--preset', type=int, default=4, help='AV1 encoding preset (0-12, 0=highest quality/slowest, 12=lowest quality/fastest)')
     parser.add_argument('-c', '--crf', type=int, default=23, help='AV1 CRF value (0-63, lower = higher quality)')
     parser.add_argument('-f', '--film-grain', action='store_true', help='Enable film grain synthesis for detected film grain')
-    parser.add_argument('-g', '--grain-strength', type=int, default=10, help='Film grain strength (1-50, higher values add more grain)')
+    parser.add_argument('-g', '--grain-strength', type=int, default=8, help='Film grain strength (1-50, higher values add more grain)')
     parser.add_argument('--parallel', action='store_true', help='Enable parallel processing')
     parser.add_argument('-w', '--max-workers', type=int, default=1, help='Maximum number of parallel workers')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output with detailed statistics')
     parser.add_argument('--list', help='File containing list of videos to transcode')
     parser.add_argument('--debug', action='store_true', help='Enable debug output for troubleshooting')
+    parser.add_argument('--output-format', default='mkv', choices=['mkv', 'mp4', 'webm'], 
+                        help='Output container format (default: mkv)')
+    parser.add_argument('--detect-only', action='store_true', help='Only detect film grain without transcoding')
+    parser.add_argument('--copy-subtitles', action='store_true', default=True, help='Copy subtitle streams (default: True)')
+    parser.add_argument('--no-subtitles', dest='copy_subtitles', action='store_false', help='Don\'t include subtitles')
+    parser.add_argument('--transcode-audio', action='store_true', help='Transcode audio to Opus')
+    parser.add_argument('--audio-bitrate', type=int, default=128, help='Audio bitrate in kbps when transcoding audio')
+    parser.add_argument('--custom-params', help='Additional custom parameters to pass to ffmpeg')
+    
+    # Add arguments for SvtAv1EncApp workflow
+    parser.add_argument('--use-svt-pipe', action='store_true', 
+                       help='Use SvtAv1EncApp piped workflow instead of jellyfin-ffmpeg')
     
     args = parser.parse_args()
 
@@ -579,43 +850,62 @@ def main():
         'max_workers': args.max_workers,
         'overwrite': args.overwrite,
         'detect_only': args.detect_only,
-        'grain_strength': args.grain_strength,
+        'output_format': args.output_format,
+        'copy_subtitles': args.copy_subtitles,
+        'transcode_audio': args.transcode_audio,
+        'audio_bitrate': args.audio_bitrate,
+        'custom_params': args.custom_params,
+        'use_svt_pipe': args.use_svt_pipe,
         'verbose': args.verbose,
         'debug': args.debug
     }
     
     transcoder = Transcoder(config)
     
-    input_path = args.input
+    # Process file list if provided
+    if args.list:
+        try:
+            with open(args.list, 'r') as f:
+                file_list = [line.strip() for line in f if line.strip()]
+            logger.info(f"Processing {len(file_list)} files from list file: {args.list}")
+            transcoder.process_file_list(file_list, args.output_dir)
+            sys.exit(0)  # Exit after processing the list
+        except Exception as e:
+            logger.error(f"Error reading file list: {e}")
+            sys.exit(1)
     
-    if not os.path.exists(input_path):
-        logger.error(f"Input path does not exist: {input_path}")
-        sys.exit(1)
-    
-    if os.path.isfile(input_path):
-        # Process single file
-        transcoder.transcode_video(input_path, None if not args.output_dir else 
-                                  str(Path(args.output_dir) / f"{Path(input_path).stem}_av1.mkv"))
-    else:
-        # Process directory
-        file_list = []
+    # Only process input path if --list is not provided or after processing list
+    if args.input:
+        input_path = args.input
         
-        if args.recursive:
-            for root, _, files in os.walk(input_path):
-                for file in files:
-                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv')):
-                        file_list.append(os.path.join(root, file))
+        if not os.path.exists(input_path):
+            logger.error(f"Input path does not exist: {input_path}")
+            sys.exit(1)
+        
+        if os.path.isfile(input_path):
+            # Process single file
+            transcoder.transcode_video(input_path, None if not args.output_dir else 
+                                      str(Path(args.output_dir) / f"{Path(input_path).stem}_av1.mkv"))
         else:
-            for file in os.listdir(input_path):
-                if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv')):
-                    file_list.append(os.path.join(input_path, file))
-        
-        if not file_list:
-            logger.warning(f"No video files found in {input_path}")
-            sys.exit(0)
-        
-        logger.info(f"Found {len(file_list)} video files to process")
-        transcoder.process_file_list(file_list, args.output_dir)
+            # Process directory
+            file_list = []
+            
+            if args.recursive:
+                for root, _, files in os.walk(input_path):
+                    for file in files:
+                        if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv')):
+                            file_list.append(os.path.join(root, file))
+            else:
+                for file in os.listdir(input_path):
+                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv')):
+                        file_list.append(os.path.join(input_path, file))
+            
+            if not file_list:
+                logger.warning(f"No video files found in {input_path}")
+                sys.exit(0)
+            
+            logger.info(f"Found {len(file_list)} video files to process")
+            transcoder.process_file_list(file_list, args.output_dir)
 
 if __name__ == "__main__":
     main()
