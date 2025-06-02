@@ -38,36 +38,34 @@ Transcode all videos in a directory:
 ./av1_transcoder.py -i /path/to/videos -o /path/to/output
 ```
 
-### Advanced Options
+### Command-Line Options
 
-```
-usage: av1_transcoder.py [-h] -i INPUT [-o OUTPUT_DIR] [-r] [-p PRESET] [-c CRF]
-                         [-f] [--parallel] [-w MAX_WORKERS] [--overwrite]
-                         [--list LIST]
+| Option/Flag                                 | Description                                                                                         |
+|---------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| -h, --help                                 | Show help message and exit.                                                                        |
+| -i INPUT, --input INPUT                    | Input file or directory to transcode.                                                              |
+| -o OUTPUT_DIR, --output-dir OUTPUT_DIR     | Output directory for transcoded files.                                                             |
+| -r, --recursive                            | Recursively process all video files in subdirectories.                                             |
+| -p PRESET, --preset PRESET                 | AV1 encoding preset (0-12). 0 = highest quality/slowest, 12 = lowest quality/fastest.              |
+| -c CRF, --crf CRF                          | AV1 CRF value (0-63). Lower values mean higher quality and larger files.                           |
+| -f, --film-grain                           | Enable film grain synthesis for detected film grain.                                               |
+| -g, --grain-strength GRAIN_STRENGTH        | Film grain strength (1-50, higher values add more grain). Default: 8.                             |
+| --parallel                                 | Enable parallel processing of multiple files.                                                      |
+| -w MAX_WORKERS, --max-workers MAX_WORKERS  | Maximum number of parallel workers (used with --parallel).                                         |
+| --overwrite                                | Overwrite existing output files if they already exist.                                             |
+| --list LIST                                | Path to a text file containing a list of video files to transcode (one per line).                  |
+| --verbose                                  | Enable verbose output with detailed statistics.                                                    |
+| --debug                                    | Enable debug output for troubleshooting.                                                           |
+| --output-format {mkv,mp4,webm}             | Output container format (default: mkv).                                                           |
+| --detect-only                              | Only detect film grain without transcoding.                                                        |
+| --copy-subtitles                           | Copy subtitle streams (default: True).                                                            |
+| --no-subtitles                             | Do not include subtitles in the output.                                                           |
+| --transcode-audio                          | Transcode audio to Opus.                                                                          |
+| --audio-bitrate AUDIO_BITRATE              | Audio bitrate in kbps when transcoding audio (default: 128).                                      |
+| --custom-params CUSTOM_PARAMS              | Additional custom parameters to pass to ffmpeg.                                                    |
+| --use-svt-pipe                             | Use SvtAv1EncApp piped workflow instead of jellyfin-ffmpeg.                                        |
 
-AV1 Automatic Transcoder
-
-options:
-  -h, --help            show this help message and exit
-  -i INPUT, --input INPUT
-                        Input file or directory
-  -o OUTPUT_DIR, --output-dir OUTPUT_DIR
-                        Output directory
-  -r, --recursive       Recursively process directories
-  -p PRESET, --preset PRESET
-                        AV1 encoding preset (0-13, 0=highest quality/slowest,
-                        13=lowest quality/fastest)
-  -c CRF, --crf CRF     AV1 CRF value (0-63, lower = higher quality)
-  -f, --enable-film-grain
-                        Enable film grain synthesis detection and application
-  --parallel            Enable parallel processing
-  -w MAX_WORKERS, --max-workers MAX_WORKERS
-                        Maximum number of parallel workers
-  --overwrite           Overwrite existing output files
-  --list LIST           File containing list of videos to transcode
-```
-
-## Example Commands
+### Example Commands
 
 Process a single file with specific quality settings:
 
@@ -87,8 +85,20 @@ Process a list of videos:
 ./av1_transcoder.py --list video_list.txt -o /output
 ```
 
+Detect film grain only (no transcoding):
+
+```bash
+./av1_transcoder.py -i input.mkv --detect-only
+```
+
+Transcode with custom audio and output format:
+
+```bash
+./av1_transcoder.py -i input.mkv --transcode-audio --audio-bitrate 192 --output-format mp4
+```
+
 ## Output
 
-Transcoded videos will be named with "_av1" appended to the original filename and saved with the .mkv extension.
+Transcoded videos will be named with "_av1" appended to the original filename and saved with the selected extension (default: .mkv).
 
 The script also creates a `transcoder.log` file with detailed information about the transcoding process.
