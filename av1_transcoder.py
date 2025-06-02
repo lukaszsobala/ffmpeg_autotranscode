@@ -450,8 +450,8 @@ class Transcoder:
             # Add video codec options
             cmd.extend([
                 '-c:v', 'libsvtav1',
-                '-preset', str(self.config.get('preset', 4)),
-                '-crf', str(self.config.get('crf', 23))
+                '-preset', str(self.config['preset']),
+                '-crf', str(self.config['crf'])
             ])
             
             # Add audio codec (copy or transcode)
@@ -473,8 +473,7 @@ class Transcoder:
             # Add film grain synthesis if detected
             if video_info.has_film_grain and self.config.get('film_grain', False):
                 # Use svtav1-params for film grain control
-                grain_str = str(self.config.get('grain_strength', 8))
-                cmd.extend(['-svtav1-params', f'film-grain-denoise={grain_str}'])
+                cmd.extend(['-svtav1-params', f'film-grain-denoise={self.config.get("grain_strength", 8)}'])
             
             # Add custom ffmpeg parameters if provided
             if self.config.get('custom_params'):
@@ -624,22 +623,19 @@ class Transcoder:
             # Step 1: Extract video and pipe to SvtAv1EncApp
             pixel_format = 'yuv420p10le' if video_info.bit_depth == 10 else 'yuv420p'
             input_depth = '10' if video_info.bit_depth == 10 else '8'
-            preset = str(self.config.get('preset', 4))  
-            crf = str(self.config.get('crf', 23))
             
             # Configure film grain if detected
             film_grain_param = ""
             if video_info.has_film_grain and self.config.get('film_grain', False):
-                grain_str = str(self.config.get('grain_strength', 8))
-                film_grain_param = f"--film-grain {grain_str}"
+                film_grain_param = f"--film-grain {self.config.get('grain_strength', 8)}"
                 
             # Build extraction and encoding command
             # Note: We need the combined command for shell=True execution with pipe
             combined_cmd = (
                 f"ffmpeg -i {shlex.quote(input_file)} -map 0:v:0 -pix_fmt {pixel_format} "
                 f"-f yuv4mpegpipe -strict -1 - | "
-                f"SvtAv1EncApp -i stdin --preset {preset} --keyint 240 --input-depth {input_depth} "
-                f"--crf {crf} {film_grain_param} --tune 0 -b {shlex.quote(temp_ivf)}"
+                f"SvtAv1EncApp -i stdin --preset {self.config['preset']} --keyint 240 --input-depth {input_depth} "
+                f"--crf {self.config['crf']} {film_grain_param} --tune 0 -b {shlex.quote(temp_ivf)}"
             )
             
             print("Step 1: Extracting video and encoding with SvtAv1EncApp")
@@ -815,7 +811,7 @@ def main():
     parser.add_argument('-p', '--preset', type=int, default=4, help='AV1 encoding preset (0-12, 0=highest quality/slowest, 12=lowest quality/fastest)')
     parser.add_argument('-c', '--crf', type=int, default=23, help='AV1 CRF value (0-63, lower = higher quality)')
     parser.add_argument('-f', '--film-grain', action='store_true', help='Enable film grain synthesis for detected film grain')
-    parser.add_argument('-g', '--grain-strength', type=int, default=8, help='Film grain strength (1-50, higher values add more grain)')
+    parser.add_argument('-g', '--grain_strength', type=int, default=8, help='Film grain strength (1-50, higher values add more grain)')
     parser.add_argument('--parallel', action='store_true', help='Enable parallel processing')
     parser.add_argument('-w', '--max-workers', type=int, default=1, help='Maximum number of parallel workers')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output files')
