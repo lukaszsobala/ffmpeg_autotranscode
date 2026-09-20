@@ -127,16 +127,43 @@ first step, not an optional one.
 Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
 `-w/--workers`, `-o/--output-dir`, `--grain {auto,always,never}`.
 
-## Resuming
+## Stopping and resuming
 
-Two independent layers, which matters when a single film takes many hours:
+A single film can take half a day, so stopping one is a normal thing to do rather
+than an emergency. Three independent layers:
 
-- **Within a file**: Av1an keeps completed chunks, so an interrupted encode resumes
-  where it stopped.
+- **Within a file**: Av1an keeps completed chunks under `work_dir`, so an
+  interrupted encode restarts from the chunk it was on. The chunk in flight is the
+  only work lost -- seconds of video, not hours.
+- **The staged copy**: kept when a run does not finish, so resuming does not read
+  the source off the library disk a second time.
 - **Across a library**: a JSON ledger records every finished file. Re-running skips
   them. A source that changed size is treated as new and reprocessed.
 
-Both are safe to interrupt with Ctrl-C.
+### How to stop
+
+| | |
+|---|---|
+| `Ctrl-C`, or `kill <pid>` | Stop and checkpoint. Exit code 130; nothing is written to the ledger, so a rerun picks the file up again. |
+| `Ctrl-C` twice | Give up on a tool that is slow to wind down. Chunks already finished are still kept. |
+| `kill -STOP -<pgid>` / `kill -CONT -<pgid>` | Freeze and thaw in place, losing nothing at all -- the encode keeps its memory and carries on mid-chunk. Use this for a pause measured in minutes. |
+| Power cut | Same as Ctrl-C, minus the chunk in flight, with one caveat below. |
+
+To resume, run the same command again. It must be the *same* command: the resume
+digest follows the source path, and Av1an will happily reuse chunks encoded at a
+different preset or CRF without saying so. Changing settings means deleting that
+file's directory under `work_dir` first.
+
+Stopping is never mistaken for finishing. The output is muxed under a `.part` name
+and renamed into place only once it is complete, so a half-written file can never
+be read as "already transcoded" on the next run.
+
+The one weak spot is a power cut, not a signal. Av1an rewrites `done.json` in place
+after each chunk (`File::create` then `write_all`, with no rename), so losing power
+inside that write leaves a file it later refuses to parse, and the film restarts
+from zero. The window is a fraction of a millisecond per chunk against hours of
+encoding, and the cost is one film, so this is worth knowing rather than worth
+engineering around. A UPS closes it entirely.
 
 ## Staging
 

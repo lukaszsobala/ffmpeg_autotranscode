@@ -6,6 +6,8 @@ Deliberately stdlib-only (unittest, no pytest) so this runs on a bare board:
 
 from __future__ import annotations
 
+import os
+import signal
 import tempfile
 import unittest
 from dataclasses import replace
@@ -16,6 +18,7 @@ from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
 from autotranscode.state import Ledger, Record
 from autotranscode.tools import Toolchain
+from autotranscode.util import CommandError
 
 TABLE = """filmgrn1
 E 0 3000000 1 7391 1
@@ -577,3 +580,157 @@ class TestStaging(unittest.TestCase):
         cfg.staging.min_free_multiple = 0.5
         with self.assertRaises(config.ConfigError):
             config.validate(cfg)
+
+
+class TestStopAndResume(unittest.TestCase):
+    """An encode runs for hours, so stopping it must never cost more than the
+    chunk in flight, and must never be mistaken for a finished or failed file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+        self.source = self.root / "library" / "Film (1975).mkv"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_bytes(b"x" * 4096)
+
+        self.cfg = config.Config()
+        self.cfg.grain.mode = "never"
+        self.cfg.paths.work_dir = str(self.root / "work")
+        self.cfg.staging.enabled = True
+        self.cfg.staging.directory = str(self.root / "staging")
+
+    def _info(self) -> MediaInfo:
+        return make_info(path=self.source, size_bytes=self.source.stat().st_size)
+
+    def _stub_encode(self, behaviour):
+        original = pipeline.encode.run_encode
+        pipeline.encode.run_encode = behaviour
+        self.addCleanup(setattr, pipeline.encode, "run_encode", original)
+
+    def _stub_probe(self):
+        """process_one probes for real; these tests are about what happens after."""
+        original = pipeline.probe
+        pipeline.probe = lambda path, chain: self._info()
+        self.addCleanup(setattr, pipeline, "probe", original)
+
+    def test_an_interrupted_file_keeps_its_staged_copy(self):
+        # Deleting it would force the resumed run to re-read the whole source off
+        # the library disk, which is exactly what staging exists to avoid.
+        def interrupt(*_args, **_kwargs):
+            raise KeyboardInterrupt
+
+        self._stub_probe()
+        self._stub_encode(interrupt)
+        staged = pipeline.stage_source(self._info(), self.cfg)
+
+        with self.assertRaises(KeyboardInterrupt):
+            pipeline.process_one(self.source, make_chain(), self.cfg)
+
+        self.assertTrue(staged.is_file(), "the staged copy must survive an interrupt")
+
+    def test_a_finished_file_drops_its_staged_copy(self):
+        self._stub_probe()
+        staged = pipeline.stage_source(self._info(), self.cfg)
+        work = pipeline._work_dir(self.source, self.cfg)
+
+        def encoded(*_args, **_kwargs):
+            (work / "encoded.mkv").write_bytes(b"e" * 4096)
+
+        def fake_mux(video, info, out, chain, cfg, dry_run=False):
+            Path(out).write_bytes(b"o" * 8)
+            return out
+
+        self._stub_encode(encoded)
+        original_mux = pipeline.mux.mux
+        pipeline.mux.mux = fake_mux
+        self.addCleanup(setattr, pipeline.mux, "mux", original_mux)
+
+        record = pipeline.process_one(self.source, make_chain(), self.cfg)
+        self.assertEqual(record.status, "done")
+        self.assertFalse(staged.exists(), "a finished file has no use for its copy")
+
+    def test_an_unstaged_mux_is_renamed_into_place_not_written_there(self):
+        # Without staging the mux writes beside the destination and renames, so an
+        # interrupt cannot leave a short file that check_skip reads as "done".
+        self.cfg.staging.enabled = False
+        destination = self.root / "library" / "out.mkv"
+        work = pipeline._work_dir(self.source, self.cfg)
+        seen: list[Path] = []
+
+        def encoded(*_args, **_kwargs):
+            (work / "encoded.mkv").write_bytes(b"e" * 4096)
+
+        self._stub_encode(encoded)
+
+        def fake_mux(video, info, out, chain, cfg, dry_run=False):
+            seen.append(Path(out))
+            Path(out).write_bytes(b"o" * 8)
+            return out
+
+        original_mux = pipeline.mux.mux
+        pipeline.mux.mux = fake_mux
+        self.addCleanup(setattr, pipeline.mux, "mux", original_mux)
+
+        info = self._info()
+        record = pipeline._transcode(
+            self.source, info, info, destination, None, work,
+            make_chain(), self.cfg, 0.0, dry_run=False,
+        )
+        self.assertEqual(record.status, "done")
+        self.assertNotEqual(seen[0], destination, "the mux must not write the final name")
+        self.assertTrue(destination.is_file())
+        self.assertFalse(seen[0].exists(), "the temporary must be renamed away, not copied")
+
+    def test_a_partial_output_does_not_look_like_a_finished_one(self):
+        # The .part name is what keeps the next run from skipping the title.
+        partial = self.root / "library" / "out.mkv.part"
+        partial.write_bytes(b"o" * 8)
+        pipeline.check_skip(self._info(), self.root / "library" / "out.mkv", self.cfg)
+
+    def test_a_tool_killed_by_our_own_signal_is_not_recorded_as_a_failure(self):
+        # Av1an traps SIGINT and exits non-zero; blaming the file for that would
+        # leave a misleading ledger entry and a misleading exit code.
+        self.cfg.staging.enabled = False
+        ledger = Ledger(self.root / "state.json")
+
+        def fail(*_args, **_kwargs):
+            raise CommandError(["av1an"], 1, "stopped")
+
+        original = pipeline.process_one
+        pipeline.process_one = fail
+        self.addCleanup(setattr, pipeline, "process_one", original)
+
+        stop = pipeline.StopRequest()
+        stop.seen = True
+        with self.assertRaises(KeyboardInterrupt):
+            pipeline._process_all([self.source], make_chain(), self.cfg, ledger, stop)
+        self.assertEqual(ledger.records, {}, "an interrupted file must stay unrecorded")
+
+    def test_the_same_failure_without_a_signal_is_still_a_failure(self):
+        self.cfg.staging.enabled = False
+        ledger = Ledger(self.root / "state.json")
+
+        def fail(*_args, **_kwargs):
+            raise CommandError(["av1an"], 1, "broken")
+
+        original = pipeline.process_one
+        pipeline.process_one = fail
+        self.addCleanup(setattr, pipeline, "process_one", original)
+
+        failures = pipeline._process_all(
+            [self.source], make_chain(), self.cfg, ledger, pipeline.StopRequest()
+        )
+        self.assertEqual(failures, 1)
+        self.assertEqual(ledger.get(self.source).status, "failed")
+
+    def test_sigterm_stops_the_run_the_same_way_ctrl_c_does(self):
+        # systemctl stop and a plain kill must checkpoint, not kill outright.
+        with pipeline.stop_signals() as stop:
+            self.assertFalse(stop.seen)
+            with self.assertRaises(KeyboardInterrupt):
+                os.kill(os.getpid(), signal.SIGTERM)
+            self.assertTrue(stop.seen)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)

@@ -50,6 +50,18 @@ class Toolchain:
     # ---- capability helpers -------------------------------------------------
 
     @property
+    def bin_dirs(self) -> list[str]:
+        """Directories holding the binaries we resolved, for a child process's PATH.
+
+        Av1an spawns SvtAv1EncApp, ffmpeg and mkvmerge by bare name, so a tool found
+        through the config rather than on PATH is invisible to it. `doctor` passing
+        while the encode dies with "Encoder SvtAv1EncApp not found" is exactly the
+        gap this closes.
+        """
+        found = (self.ffmpeg, self.ffprobe, self.svtav1encapp, self.mkvmerge)
+        return list(dict.fromkeys(str(Path(path).parent) for path in found if path))
+
+    @property
     def has_libvmaf(self) -> bool:
         return "libvmaf" in self.filters
 

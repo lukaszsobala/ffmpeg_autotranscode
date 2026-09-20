@@ -10,6 +10,7 @@ import os
 import shlex
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,9 +47,19 @@ def _child_locale() -> str:
             locale.setlocale(locale.LC_ALL, previous)
 
 
-def child_env() -> dict[str, str]:
-    """os.environ with the locale pinned. LC_ALL overrides LANG and every LC_*."""
-    return {**os.environ, "LC_ALL": _child_locale()}
+def child_env(extra_path: Sequence[str] = ()) -> dict[str, str]:
+    """os.environ with the locale pinned. LC_ALL overrides LANG and every LC_*.
+
+    `extra_path` is prepended to PATH. A child that resolves its own helpers by
+    bare name -- Av1an looks up SvtAv1EncApp, ffmpeg and mkvmerge that way -- would
+    otherwise miss the binaries we located through the config, and would silently
+    prefer a different copy to the one `doctor` reported on.
+    """
+    env = {**os.environ, "LC_ALL": _child_locale()}
+    if extra_path:
+        unique = list(dict.fromkeys(extra_path))
+        env["PATH"] = os.pathsep.join([*unique, env.get("PATH", "")]).rstrip(os.pathsep)
+    return env
 
 
 class CommandError(RuntimeError):
@@ -79,6 +90,7 @@ def run(
     capture: bool = True,
     cwd: Path | None = None,
     dry_run: bool = False,
+    extra_path: Sequence[str] = (),
 ) -> Completed:
     """Run a command, logging it first so failures are always reproducible by hand."""
     log.debug("exec: %s", shlex.join(argv))
@@ -92,7 +104,7 @@ def run(
         capture_output=capture,
         text=True,
         errors="replace",
-        env=child_env(),
+        env=child_env(extra_path),
     )
     elapsed = time.monotonic() - started
     result = Completed(argv, proc.returncode, proc.stdout or "", proc.stderr or "", elapsed)

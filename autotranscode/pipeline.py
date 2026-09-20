@@ -11,10 +11,14 @@ what to run and what to do when a step declines to help.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
+import os
 import shutil
+import signal
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 
@@ -28,6 +32,44 @@ from .util import CommandError, human_duration, human_size, log
 
 class SkipFile(Exception):
     """This file should not be transcoded; the message says why."""
+
+
+class StopRequest:
+    """Whether a stop signal has arrived. See `stop_signals`."""
+
+    __slots__ = ("seen",)
+
+    def __init__(self) -> None:
+        self.seen = False
+
+
+@contextlib.contextmanager
+def stop_signals() -> Iterator[StopRequest]:
+    """Make stopping a run deterministic, for both Ctrl-C and `kill`.
+
+    Two problems this solves. Av1an traps SIGINT itself and exits non-zero, which
+    races Python's own KeyboardInterrupt: the same Ctrl-C was sometimes recorded as
+    a *failed* file rather than an interrupted one. And SIGTERM -- what `systemctl
+    stop` and a plain `kill` send -- killed the run outright, skipping the cleanup
+    that decides what to keep.
+
+    Both now set a flag and raise KeyboardInterrupt, so there is exactly one stop
+    path. A second signal restores the default handler first, so an operator who
+    really wants out is never trapped by a tool that is slow to wind down.
+    """
+    state = StopRequest()
+
+    def handle(signum: int, _frame: object) -> None:
+        state.seen = True
+        signal.signal(signum, signal.SIG_DFL)
+        raise KeyboardInterrupt
+
+    previous = {sig: signal.signal(sig, handle) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield state
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def discover(inputs: list[Path], cfg: Config) -> list[Path]:
@@ -238,16 +280,34 @@ def process_one(
     read = replace(info, path=staged) if staged is not None else info
 
     try:
-        return _transcode(
+        record = _transcode(
             source, info, read, final, staged_out, work, chain, cfg, started,
             dry_run=dry_run,
         )
-    finally:
+    except SkipFile:
+        # A decided skip is a finished outcome, so the copy has served its purpose.
+        _drop_staged(staged, staged_out, cfg)
+        raise
+    except BaseException:
+        # Interrupted or failed: keep the staged source. The next attempt resumes
+        # from Av1an's finished chunks and must not re-read the whole file off the
+        # library disk to do it -- which is the entire point of staging. A partial
+        # output is never reusable, so that one goes.
         if staged_out is not None:
             staged_out.unlink(missing_ok=True)
-        if staged is not None and not cfg.staging.keep:
-            staged.unlink(missing_ok=True)
-            log.debug("staged copy removed: %s", staged)
+        if staged is not None:
+            log.info("  keeping the staged copy so a rerun resumes without re-reading the source")
+        raise
+    _drop_staged(staged, staged_out, cfg)
+    return record
+
+
+def _drop_staged(staged: Path | None, staged_out: Path | None, cfg: Config) -> None:
+    if staged_out is not None:
+        staged_out.unlink(missing_ok=True)
+    if staged is not None and not cfg.staging.keep:
+        staged.unlink(missing_ok=True)
+        log.debug("staged copy removed: %s", staged)
 
 
 def _transcode(
@@ -285,7 +345,7 @@ def _transcode(
     encoded = work / "encoded.mkv"
     encoded.unlink(missing_ok=True)
     argv = encode.build_command(read, encoded, chain, cfg, work / "av1an", denoise)
-    encode.run_encode(argv, cfg, dry_run=dry_run)
+    encode.run_encode(argv, cfg, chain, dry_run=dry_run)
 
     if dry_run:
         return Record(
@@ -312,7 +372,11 @@ def _transcode(
     # When staging, mux locally rather than onto the destination disk. The result
     # only moves once it has earned its place, so an encode that fails the size
     # check never touches that disk at all.
-    muxed = staged_out if staged_out is not None else final
+    # Never mux straight to the destination name. An interrupt partway through
+    # would leave a short file there, and the next run's "output already exists"
+    # check would read it as finished -- silently shipping a truncated film.
+    muxed = staged_out if staged_out is not None else final.with_name(final.name + ".part")
+    muxed.unlink(missing_ok=True)
     mux.mux(video, read, muxed, chain, cfg)
 
     output_bytes = muxed.stat().st_size
@@ -336,6 +400,10 @@ def _transcode(
             # read it as "already done" and the title would be silently abandoned.
             final.unlink(missing_ok=True)
             raise
+    else:
+        # Same directory, so this is an atomic rename: the destination name either
+        # does not exist or is the complete file, never anything in between.
+        os.replace(muxed, final)
 
     elapsed = time.monotonic() - started
     log.info(
@@ -374,6 +442,19 @@ def _cleanup(work: Path, cfg: Config, table: Path | None) -> None:
 def process_all(
     sources: list[Path], chain: Toolchain, cfg: Config, ledger: Ledger, *, dry_run: bool = False
 ) -> int:
+    with stop_signals() as stop:
+        return _process_all(sources, chain, cfg, ledger, stop, dry_run=dry_run)
+
+
+def _process_all(
+    sources: list[Path],
+    chain: Toolchain,
+    cfg: Config,
+    ledger: Ledger,
+    stop: StopRequest,
+    *,
+    dry_run: bool = False,
+) -> int:
     failures = 0
     total = len(sources)
 
@@ -391,6 +472,12 @@ def process_all(
             ledger.record(source, Record(source=str(source), status="skipped", reason=str(exc)))
             continue
         except (CommandError, OSError, ValueError) as exc:
+            # A tool killed by our own stop signal exits non-zero before Python
+            # gets round to raising KeyboardInterrupt. Without this the ledger
+            # would blame the file for the operator's Ctrl-C.
+            if stop.seen:
+                log.warning("interrupted; Av1an progress is kept, rerun to resume")
+                raise KeyboardInterrupt from exc
             failures += 1
             log.error("  failed: %s", str(exc).splitlines()[0] if str(exc) else exc)
             log.debug("failure detail", exc_info=True)

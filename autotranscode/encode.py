@@ -185,7 +185,7 @@ def build_command(
     return argv
 
 
-def run_encode(argv: list[str], cfg: Config, dry_run: bool = False) -> None:
+def run_encode(argv: list[str], cfg: Config, chain: Toolchain, dry_run: bool = False) -> None:
     """Run Av1an with its output streamed to the terminal rather than captured.
 
     These encodes run for hours; swallowing the progress bar would be unkind.
@@ -193,4 +193,4 @@ def run_encode(argv: list[str], cfg: Config, dry_run: bool = False) -> None:
     if cfg.machine.nice > 0:
         argv = ["nice", "-n", str(cfg.machine.nice), *argv]
     log.info("encoding (this is the long part)")
-    run(argv, capture=False, dry_run=dry_run)
+    run(argv, capture=False, dry_run=dry_run, extra_path=chain.bin_dirs)
