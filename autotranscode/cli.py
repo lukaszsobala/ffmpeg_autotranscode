@@ -9,7 +9,14 @@ from pathlib import Path
 
 from . import __version__, config, encode, grain, pipeline, probe, tools
 from .state import Ledger
-from .util import CommandError, human_size, log, setup_logging
+from .util import (
+    CommandError,
+    child_locale,
+    human_size,
+    log,
+    setup_logging,
+    unusable_locale_vars,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +94,19 @@ def cmd_doctor(cfg: config.Config, chain: tools.Toolchain) -> int:
     print("All prerequisites satisfied.")
     if not chain.has_grain_pipeline:
         print("Note: grain pipeline unavailable; encoding will proceed without it.")
+    if broken := unusable_locale_vars():
+        # Not fatal, and deliberately not an error: runs are unaffected because
+        # every child gets LC_ALL forced. Say so anyway, because by-hand commands
+        # in this shell will abort and the message they give blames nothing useful.
+        print("\nNote: this shell names locales the machine has not generated:")
+        for variable in broken:
+            print(f"  {variable}")
+        print(f"Transcodes are unaffected -- every tool is run with LC_ALL={child_locale()}.")
+        print("Running these tools by hand in this shell aborts with")
+        print('  locale::facet::_S_create_c_locale name not valid')
+        print("Usually SSH importing the client's LC_* through AcceptEnv. Either unset")
+        print("them in your shell, stop the client sending them, or generate the")
+        print("locales with: sudo dpkg-reconfigure locales")
     return 0
 
 
@@ -142,7 +162,10 @@ def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> 
         print(f"  output: {out}")
         argv = encode.build_command(info, Path("<encoded.mkv>"), chain, cfg,
                                     Path("<temp>"), "<denoise-if-grainy>")
-        print(f"  encode: {shlex.join(argv)}")
+        # The LC_ALL prefix is not decoration: it is what a real run sets, and
+        # without it this command aborts in any shell holding a locale the machine
+        # has not generated. Printing it makes the line safe to paste.
+        print(f"  encode: LC_ALL={child_locale()} {shlex.join(argv)}")
     return 0
 
 

@@ -6,6 +6,7 @@ Deliberately stdlib-only (unittest, no pytest) so this runs on a bare board:
 
 from __future__ import annotations
 
+import locale
 import os
 import signal
 import tempfile
@@ -13,7 +14,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from autotranscode import config, encode, mux, pipeline
+from autotranscode import config, encode, mux, pipeline, util
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
 from autotranscode.state import Ledger, Record
@@ -758,3 +759,31 @@ class TestConfigDiscovery(unittest.TestCase):
     def test_a_directory_of_that_name_is_not_a_config(self):
         (self.root / "autotranscode.toml").mkdir()
         self.assertIsNone(config.default_path())
+
+
+class TestLocaleGuard(unittest.TestCase):
+    """SSH imports the client's LC_* wholesale; a headless board has almost none."""
+
+    def setUp(self):
+        self.addCleanup(os.environ.pop, "LC_TELEPHONE", None)
+        os.environ.pop("LC_TELEPHONE", None)
+
+    def test_a_locale_the_machine_lacks_is_reported(self):
+        os.environ["LC_TELEPHONE"] = "zz_ZZ.UTF-8"
+        self.assertIn("LC_TELEPHONE=zz_ZZ.UTF-8", util.unusable_locale_vars())
+
+    def test_checking_does_not_disturb_our_own_locale(self):
+        before = locale.setlocale(locale.LC_ALL)
+        os.environ["LC_TELEPHONE"] = "zz_ZZ.UTF-8"
+        util.unusable_locale_vars()
+        self.assertEqual(locale.setlocale(locale.LC_ALL), before)
+
+    def test_children_are_given_a_locale_that_exists(self):
+        # The whole point: whatever the shell holds, a child gets something valid.
+        os.environ["LC_TELEPHONE"] = "zz_ZZ.UTF-8"
+        forced = util.child_env()["LC_ALL"]
+        previous = locale.setlocale(locale.LC_ALL)
+        try:
+            locale.setlocale(locale.LC_ALL, forced)
+        finally:
+            locale.setlocale(locale.LC_ALL, previous)

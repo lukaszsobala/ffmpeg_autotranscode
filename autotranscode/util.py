@@ -18,7 +18,7 @@ log = logging.getLogger("autotranscode")
 
 
 @functools.cache
-def _child_locale() -> str:
+def child_locale() -> str:
     """A locale name verified to exist, forced on every child process.
 
     Two reasons not to inherit whatever the shell happens to have.
@@ -55,11 +55,36 @@ def child_env(extra_path: Sequence[str] = ()) -> dict[str, str]:
     otherwise miss the binaries we located through the config, and would silently
     prefer a different copy to the one `doctor` reported on.
     """
-    env = {**os.environ, "LC_ALL": _child_locale()}
+    env = {**os.environ, "LC_ALL": child_locale()}
     if extra_path:
         unique = list(dict.fromkeys(extra_path))
         env["PATH"] = os.pathsep.join([*unique, env.get("PATH", "")]).rstrip(os.pathsep)
     return env
+
+
+def unusable_locale_vars() -> list[str]:
+    """Locale variables in *our own* environment naming a locale this machine lacks.
+
+    Never a problem for a run -- every child gets LC_ALL forced -- but a real one
+    for the commands `plan` prints, which are meant to be pasted into the same
+    shell, where mkvmerge dies with "_S_create_c_locale name not valid". SSH is the
+    usual source: `AcceptEnv LANG LC_*` imports the client's locales wholesale, and
+    a headless board has generated almost none of them.
+    """
+    bad: list[str] = []
+    previous = locale.setlocale(locale.LC_ALL)
+    try:
+        for name, value in sorted(os.environ.items()):
+            if not value or (name != "LANG" and not name.startswith("LC_")):
+                continue
+            try:
+                locale.setlocale(locale.LC_ALL, value)
+            except locale.Error:
+                bad.append(f"{name}={value}")
+    finally:
+        with contextlib.suppress(locale.Error):
+            locale.setlocale(locale.LC_ALL, previous)
+    return bad
 
 
 class CommandError(RuntimeError):

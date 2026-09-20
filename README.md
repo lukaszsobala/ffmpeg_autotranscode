@@ -91,6 +91,16 @@ usually are not — set `paths.*` in the config to absolute paths rather than
 fighting `PATH`. Av1an is handed those locations too, so it runs the same binaries
 `doctor` reported on.
 
+### If a tool aborts with `_S_create_c_locale name not valid`
+
+That is a C++ tool, usually mkvmerge, refusing a locale the machine has never
+generated. Transcodes are immune — every child process is given a locale verified
+to exist — but the same command typed by hand will abort. `doctor` names the
+offending variables. The usual cause is `AcceptEnv LANG LC_*` in `sshd_config`
+importing the locales of whatever machine you are connecting *from*, so unsetting
+them on the client is the tidiest fix; `sudo dpkg-reconfigure locales` on the board
+works too.
+
 ## Use
 
 ```bash
