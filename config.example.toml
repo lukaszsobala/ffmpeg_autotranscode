@@ -9,7 +9,7 @@
 
 [machine]
 # "rk3588"      Rockchip boards. No AV1 hardware encoder exists, so SVT-AV1 runs on
-#               the CPU; defaults to preset 8 / crf 32 / 2 workers.
+#               the CPU; defaults to preset 4 / crf 32 / 2 workers.
 # "workstation" many fast cores; preset 4 / crf 28.
 # "generic"     conservative middle ground.
 profile = "rk3588"
@@ -47,7 +47,7 @@ work_dir = "~/.cache/autotranscode"
 state_file = "~/.cache/autotranscode/state.json"
 
 [encode]
-preset = 8          # SVT-AV1 preset, -1 (slowest) .. 13. Each step is ~1.5-2x speed.
+preset = 4          # SVT-AV1 preset, -1 (slowest) .. 13. Each step is ~1.5-2.2x speed.
 crf = 32            # 1..70. Lower is higher quality and bigger.
 pix_format = "yuv420p10le"   # 10-bit even from 8-bit sources: cheap, and avoids banding.
 tune = 0            # 0 = VQ (subjective quality), 2 = SSIM. Use 0 for watching.

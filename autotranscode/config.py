@@ -16,8 +16,14 @@ from typing import Any
 PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     "rk3588": {
         "machine": {"workers": 2, "hwaccel_decode": "rkmpp"},
-        # preset 8 is the realistic floor on A76 cores; 6 roughly halves throughput again.
-        "encode": {"preset": 8, "crf": 32, "chunk_method": "hybrid"},
+        # Measured on a ROCK 5B, 1080p, 150 frames, these settings: preset 8 = 30.6 fps,
+        # 6 = 13.7, 4 = 6.6, 3 = 4.4, 2 = 2.6. Bitstream against preset 8: -17.3% at 6,
+        # -29.0% at 4, -30.4% at 3, -34.9% at 2. Preset 4 takes 83% of the total
+        # available gain at 2.6x less time than preset 2, and preset 3 is dominated --
+        # it costs 1.5x preset 4 for 1.9%, because the only tools it adds are the
+        # self-guided restoration filter and the full PD0 path. Preset 2 is the next
+        # real step (4x4 blocks and compound inter prediction), at ~22h per 2h film.
+        "encode": {"preset": 4, "crf": 32, "chunk_method": "hybrid"},
         "grain": {"samples": 4, "sample_seconds": 2},
         "target_quality": {"enabled": False},
     },

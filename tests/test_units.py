@@ -90,7 +90,7 @@ class TestConfig(unittest.TestCase):
             path = Path(tmp) / "c.toml"
             path.write_text('[machine]\nprofile = "rk3588"\n[encode]\ncrf = 25\n')
             cfg = config.load(path)
-            self.assertEqual(cfg.encode.preset, 8)   # from the rk3588 profile
+            self.assertEqual(cfg.encode.preset, 4)   # from the rk3588 profile
             self.assertEqual(cfg.encode.crf, 25)     # overridden by the file
             self.assertEqual(cfg.machine.workers, 2)
 
