@@ -6,6 +6,7 @@ Machine profiles only change *defaults*; anything set explicitly in the file win
 
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -223,6 +224,19 @@ def _merge_profile(cfg: Config, profile: str) -> None:
         raise ConfigError(f"unknown machine profile '{profile}'; known: {sorted(PROFILES)}")
     for section, values in overrides.items():
         _apply_section(getattr(cfg, section), values, section)
+
+
+def default_path() -> Path | None:
+    """Where the config lives when -c is not given, or None if there is none.
+
+    Worth having because the failure mode without it is quiet: forgetting the flag
+    does not error, it silently falls back to built-in defaults that name no tool
+    paths, and the run then dies reporting the tools as missing.
+    """
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base).expanduser() if base else Path.home() / ".config"
+    path = root / "autotranscode.toml"
+    return path if path.is_file() else None
 
 
 def load(path: Path | None) -> Config:

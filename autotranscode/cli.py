@@ -19,7 +19,9 @@ def build_parser() -> argparse.ArgumentParser:
                     "using Av1an, SVT-AV1, grav1synth and jellyfin-ffmpeg.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("-c", "--config", type=Path, help="path to a TOML config file")
+    parser.add_argument("-c", "--config", type=Path,
+                        help="path to a TOML config file "
+                             "(default: ~/.config/autotranscode.toml if it exists)")
     parser.add_argument("-v", "--verbose", action="count", default=1,
                         help="repeat for debug output")
     parser.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
@@ -148,12 +150,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(0 if args.quiet else args.verbose, args.log_file)
 
+    chosen = args.config or config.default_path()
     try:
-        cfg = config.load(args.config)
+        cfg = config.load(chosen)
         apply_overrides(cfg, args)
     except config.ConfigError as exc:
         log.error("config error: %s", exc)
         return 2
+    log.debug("config: %s", chosen or "built-in defaults (no file found)")
 
     try:
         chain = tools.detect(cfg)

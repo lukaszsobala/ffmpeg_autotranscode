@@ -734,3 +734,27 @@ class TestStopAndResume(unittest.TestCase):
             self.assertTrue(stop.seen)
         self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
+class TestConfigDiscovery(unittest.TestCase):
+    """Forgetting -c used to run on built-in defaults and blame the tools."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(os.environ.pop, "XDG_CONFIG_HOME", None)
+        os.environ["XDG_CONFIG_HOME"] = str(self.root)
+
+    def test_nothing_there_means_built_in_defaults(self):
+        self.assertIsNone(config.default_path())
+
+    def test_a_config_in_the_xdg_directory_is_found(self):
+        wanted = self.root / "autotranscode.toml"
+        wanted.write_text("[encode]\ncrf = 25\n", encoding="utf-8")
+        self.assertEqual(config.default_path(), wanted)
+        self.assertEqual(config.load(config.default_path()).encode.crf, 25)
+
+    def test_a_directory_of_that_name_is_not_a_config(self):
+        (self.root / "autotranscode.toml").mkdir()
+        self.assertIsNone(config.default_path())

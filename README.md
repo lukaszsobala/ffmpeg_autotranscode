@@ -77,22 +77,33 @@ Elsewhere you need `jellyfin-ffmpeg`, `SvtAv1EncApp`, `av1an`, `grav1synth` and
 `mkvtoolnix` on `PATH`. Then:
 
 ```bash
-pip install -e .          # optional; `python3 -m autotranscode` works without it
-autotranscode doctor      # says exactly what is missing and how to get it
+python3 -m venv .venv && .venv/bin/pip install -e .   # or: uv venv .venv && uv pip install -e .
+.venv/bin/autotranscode doctor                        # says what is missing and how to get it
 ```
 
-Python 3.11+ and no Python dependencies at all — everything heavy is an external binary.
+There is nothing to install *into* the venv beyond this package: Python 3.11+ and
+no dependencies at all, because everything heavy is an external binary. The venv
+buys you the `autotranscode` command rather than `python3 -m autotranscode`, which
+works just as well from the repository root with no install at all.
+
+If the tools live somewhere not on `PATH` — `~/.cargo/bin` and `~/.local/bin`
+usually are not — set `paths.*` in the config to absolute paths rather than
+fighting `PATH`. Av1an is handed those locations too, so it runs the same binaries
+`doctor` reported on.
 
 ## Use
 
 ```bash
 cp config.example.toml ~/.config/autotranscode.toml
 
-autotranscode -c ~/.config/autotranscode.toml doctor
-autotranscode -c ~/.config/autotranscode.toml measure /media/films        # calibrate first
-autotranscode -c ~/.config/autotranscode.toml plan    /media/films        # see the commands
-autotranscode -c ~/.config/autotranscode.toml run     /media/films
+autotranscode doctor
+autotranscode measure /media/films        # calibrate the grain threshold first
+autotranscode plan    /media/films        # see the commands without running them
+autotranscode run     /media/films
 ```
+
+`~/.config/autotranscode.toml` is picked up automatically (`$XDG_CONFIG_HOME` is
+honoured). `-c` overrides it; with neither, the built-in defaults apply.
 
 `run` accepts files, directories, or a `.txt` file listing one path per line.
 
