@@ -33,7 +33,43 @@ COLOR_MATRIX = {
 }
 
 
-def svt_params(info: MediaInfo, cfg: Config, crf: int | None = None) -> list[str]:
+def dovi_tonemap_filter(info: MediaInfo, cfg: Config) -> str:
+    """The tonemapx filter for a DV source whose base layer is not viewable.
+
+    Only profile 5 (and profile 10 signalling no compatibility) needs this. It is
+    the same filter Jellyfin uses on machines without a usable GPU: tonemapx reads
+    the RPU itself (apply_dovi is on by default) and reshapes the picture. The
+    catch is that tonemapx only writes BT.709 -- there is no CPU path from
+    profile 5 to HDR10 -- so this trades HDR away to make the file playable at
+    all, which is why it is opt-in.
+    """
+    if info.base_layer != "none" or cfg.dolby_vision.profile5 != "tonemap-sdr":
+        return ""
+    dv = cfg.dolby_vision
+    return (
+        f"tonemapx=tonemap={dv.tonemap_algorithm}"
+        f":desat={dv.tonemap_desat}"
+        f":peak={dv.tonemap_peak}"
+        ":t=bt709:m=bt709:p=bt709"
+        ":apply_dovi=1"
+        ":format=yuv420p10"
+    )
+
+
+def effective_color(info: MediaInfo, cfg: Config) -> tuple[str, str, str]:
+    """(primaries, transfer, matrix) of the frames the encoder will actually see.
+
+    Normally the source's own tags, but a tonemapped profile 5 arrives as BT.709
+    and must be signalled that way or players will stretch it back into HDR.
+    """
+    if dovi_tonemap_filter(info, cfg):
+        return "bt709", "bt709", "bt709"
+    return info.color_primaries, info.color_transfer, info.color_space
+
+
+def svt_params(
+    info: MediaInfo, cfg: Config, chain: Toolchain, crf: int | None = None
+) -> list[str]:
     """Encoder flags passed straight to SvtAv1EncApp (not FFmpeg syntax)."""
     enc = cfg.encode
     params: list[str] = [
@@ -43,7 +79,7 @@ def svt_params(info: MediaInfo, cfg: Config, crf: int | None = None) -> list[str
         "--variance-boost-strength", str(enc.variance_boost_strength),
     ]
 
-    if enc.ac_bias > 0:
+    if enc.ac_bias > 0 and "--ac-bias" in chain.svt_options:
         # Biases rate-distortion toward high-frequency error; helps texture and
         # any grain the denoiser left behind survive the encode.
         params += ["--ac-bias", str(enc.ac_bias)]
@@ -52,16 +88,26 @@ def svt_params(info: MediaInfo, cfg: Config, crf: int | None = None) -> list[str
         params += ["--keyint", str(round(info.fps * enc.keyint_sec))]
 
     # Preserve colour signalling. Getting this wrong is how HDR turns grey.
-    if (primaries := COLOR_PRIMARIES.get(info.color_primaries)) is not None:
+    src_primaries, src_transfer, src_matrix = effective_color(info, cfg)
+    if (primaries := COLOR_PRIMARIES.get(src_primaries)) is not None:
         params += ["--color-primaries", str(primaries)]
-    if (transfer := COLOR_TRANSFER.get(info.color_transfer)) is not None:
+    if (transfer := COLOR_TRANSFER.get(src_transfer)) is not None:
         params += ["--transfer-characteristics", str(transfer)]
-    if (matrix := COLOR_MATRIX.get(info.color_space)) is not None:
+    if (matrix := COLOR_MATRIX.get(src_matrix)) is not None:
         params += ["--matrix-coefficients", str(matrix)]
     if info.color_range in {"tv", "limited"}:
         params += ["--color-range", "0"]
     elif info.color_range in {"pc", "full"}:
         params += ["--color-range", "1"]
+
+    # HDR10 static metadata. Without it a player has no idea what display the
+    # grade was made for, and tone-maps against a guess. Only meaningful while the
+    # output is still PQ, so a tonemapped profile 5 drops it along with the HDR.
+    if src_transfer == "smpte2084":
+        if info.mastering_display and "--mastering-display" in chain.svt_options:
+            params += ["--mastering-display", info.mastering_display.svt_argument()]
+        if info.content_light and "--content-light" in chain.svt_options:
+            params += ["--content-light", info.content_light.svt_argument()]
 
     params += enc.extra_svt_params
     return params
@@ -88,16 +134,19 @@ def build_command(
     temp_dir: Path,
     denoise_filter: str = "",
 ) -> list[str]:
-    """Assemble the full Av1an invocation for one file."""
-    assert chain.av1an, "av1an is required"
+    """Assemble the full Av1an invocation for one file.
+
+    Tolerates a missing Av1an so that `plan` still shows the command it would run;
+    `tools.require` is what actually gates a real encode.
+    """
     enc = cfg.encode
 
     argv: list[str] = [
-        chain.av1an,
+        chain.av1an or "av1an",
         "-i", str(info.path),
         "-o", str(output),
         "-e", "svt-av1",
-        "-v", " ".join(svt_params(info, cfg)),
+        "-v", " ".join(svt_params(info, cfg, chain)),
         "--pix-format", pix_format(info, cfg),
         "-m", enc.chunk_method,
         "-c", enc.concat,
@@ -115,10 +164,12 @@ def build_command(
     if cfg.machine.workers > 0:
         argv += ["-w", str(cfg.machine.workers)]
 
-    if denoise_filter:
-        # Denoising happens inside Av1an's chunk pipeline, so no full-size
-        # intermediate file is ever written.
-        argv += ["-f", f"-vf {denoise_filter}"]
+    # Filters run inside Av1an's chunk pipeline, so no full-size intermediate file
+    # is ever written. Tonemapping comes first: everything after it works in the
+    # output colour space.
+    filters = [f for f in (dovi_tonemap_filter(info, cfg), denoise_filter) if f]
+    if filters:
+        argv += ["-f", f"-vf {','.join(filters)}"]
 
     tq = cfg.target_quality
     if tq.enabled:

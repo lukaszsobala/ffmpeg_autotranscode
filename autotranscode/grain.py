@@ -346,13 +346,14 @@ def build_table(
     return final_table
 
 
-def apply_table(
-    video: Path, table: Path, chain: Toolchain, output: Path, chroma: bool
-) -> Path:
-    """Rewrite the grain headers of a finished AV1 stream from a grain table."""
-    argv = [chain.grav1synth, "apply", str(video), "-o", str(output), "-g", str(table),
-            "--replace"]
-    if chroma:
-        argv.append("--chroma")
+def apply_table(video: Path, table: Path, chain: Toolchain, output: Path) -> Path:
+    """Rewrite the grain headers of a finished AV1 stream from a grain table.
+
+    grav1synth 0.2.0's `apply` takes only the input, -o, -g and -y; there is no
+    --replace and no --chroma. Whether chroma planes get grain is decided by the
+    table, which `diff` fills in from the source (the sCb/sCr lines), not by a flag
+    here.
+    """
+    argv = [chain.grav1synth, "apply", str(video), "-o", str(output), "-g", str(table), "-y"]
     run(argv)
     return output

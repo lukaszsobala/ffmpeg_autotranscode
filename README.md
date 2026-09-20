@@ -138,10 +138,85 @@ Two independent layers, which matters when a single film takes many hours:
 
 Both are safe to interrupt with Ctrl-C.
 
+## Staging
+
+An encode reads its source many times over many hours: scene detection walks it,
+every chunk decodes part of it, the grain probe pulls samples, the mux takes the
+audio and subtitles. If the library lives on a NAS or a spinning disk, that is hours
+of constant activity and the drive never gets to idle.
+
+Turning on staging copies each file to local storage once and works from the copy:
+
+```toml
+[staging]
+enabled = true
+directory = ""          # empty => <work_dir>/staging
+min_free_multiple = 1.5 # free space needed: the copy, plus room for the output
+```
+
+Both directions are staged, because a destination folder on the same disk keeps it
+in use just as reading does:
+
+- **Reads** come from the local copy: scene detection, every chunk, the grain probe,
+  and the mux's audio and subtitles.
+- **The write** goes to local storage too. The finished file moves to its
+  destination only after it passes the `output.min_saving_percent` check, so an
+  encode that gets rejected never touches that disk at all.
+- **Unchanged**: the output path, the ledger entry, and the digest that makes Av1an
+  resumable all still follow the real source, so switching staging on or off never
+  invalidates half-finished work.
+
+The net effect is that the library disk is read once at the start and written once at
+the end, and is free to spin down for the hours in between.
+
+It is only an optimisation, so it never fails a file. If the directory is unusable,
+there is not enough free space, or the copy itself fails, it logs why and works in
+place instead. A run interrupted mid-encode leaves its copy behind on purpose; the
+next run checks the size still matches and reuses it.
+
+Leave it off when the library already lives on the same fast storage as
+`paths.work_dir` — it would just be an extra copy.
+
+## Dolby Vision
+
+A Dolby Vision title is an ordinary HEVC (or AV1) video plus an RPU carrying
+per-shot metadata. The RPU cannot come with us: Av1an's chunked pipeline does not
+carry it through, and it would not survive the re-encode in any case.
+
+What matters is the **base layer** underneath it, and for most profiles that is a
+complete picture on its own:
+
+| Profile | Base layer | Handling |
+|---|---|---|
+| 7 (UHD Blu-ray, dual layer) | HDR10 | encoded; RPU and enhancement layer dropped |
+| 8.1 | HDR10 | encoded; RPU dropped |
+| 8.2 | SDR | encoded; RPU dropped |
+| 8.4 | HLG | encoded; RPU dropped |
+| 10.x | per compatibility id | encoded, or skipped when it signals none |
+| 5 | **none** — IPT-PQ-C2 | skipped by default |
+
+This is the same trade Jellyfin makes when it transcodes these files on the fly, and
+the classification follows Jellyfin's own (`MediaStream.GetVideoColorRange`),
+including its sanity check: a file claiming HDR10 compatibility while tagged
+something else is out of spec, so the colour tags are believed rather than the
+claim.
+
+Profile 5 is the exception — without the RPU it decodes to badly skewed colour, so
+it is skipped. Setting `dolby_vision.profile5 = "tonemap-sdr"` will instead reshape
+it with ffmpeg's `tonemapx` filter, which reads the RPU on the CPU. That filter only
+writes BT.709, so it turns an HDR master into SDR; it is opt-in for that reason.
+(libplacebo could reach HDR10, but needs a Vulkan device the RK3588's Mali GPU does
+not provide.)
+
+Set `dolby_vision.mode = "skip"` to leave every DV title alone.
+
+**HDR10 static metadata** — mastering display colour volume and MaxCLL/MaxFALL — is
+read from the source and passed to the encoder, so what a DV title loses is the
+per-shot dynamic metadata, not the whole HDR grade.
+
 ## What it refuses to do
 
-- **Dolby Vision** files are skipped. The DV RPU does not survive Av1an's chunked
-  pipeline, and quietly degrading DV to HDR10 is worse than not touching the file.
+- **Dolby Vision profile 5**, unless you opt into SDR conversion (above).
 - Files already in AV1, clips shorter than `library.min_duration_sec`, and any result
   that saves less than `output.min_saving_percent` (the output is deleted and the file
   is marked skipped).

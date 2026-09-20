@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
+import locale
 import logging
+import os
 import shlex
 import subprocess
 import time
@@ -10,6 +14,41 @@ from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger("autotranscode")
+
+
+@functools.cache
+def _child_locale() -> str:
+    """A locale name verified to exist, forced on every child process.
+
+    Two reasons not to inherit whatever the shell happens to have.
+
+    First, a locale that is *named* but never generated breaks C++ tools outright.
+    A stock DietPi image sets LC_NUMERIC=en_US.UTF-8 while generating only en_GB,
+    and mkvmerge then aborts with "locale::facet::_S_create_c_locale name not
+    valid" -- on every invocation, which kills Av1an's concatenation step after a
+    full encode has already been paid for.
+
+    Second, we hand decimal numbers to these tools ("--ac-bias 0.5",
+    "hqdn3d=1.4:1.0:6:6", "L(1000.0000,0.0001)"). A locale using comma as the
+    decimal separator would change how they are parsed.
+    """
+    previous = locale.setlocale(locale.LC_ALL)
+    try:
+        for candidate in ("C.UTF-8", "C.utf8", "C"):
+            try:
+                locale.setlocale(locale.LC_ALL, candidate)
+            except locale.Error:
+                continue
+            return candidate
+        return "C"
+    finally:
+        with contextlib.suppress(locale.Error):
+            locale.setlocale(locale.LC_ALL, previous)
+
+
+def child_env() -> dict[str, str]:
+    """os.environ with the locale pinned. LC_ALL overrides LANG and every LC_*."""
+    return {**os.environ, "LC_ALL": _child_locale()}
 
 
 class CommandError(RuntimeError):
@@ -53,6 +92,7 @@ def run(
         capture_output=capture,
         text=True,
         errors="replace",
+        env=child_env(),
     )
     elapsed = time.monotonic() - started
     result = Completed(argv, proc.returncode, proc.stdout or "", proc.stderr or "", elapsed)

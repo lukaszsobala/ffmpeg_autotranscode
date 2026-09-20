@@ -15,6 +15,7 @@ import datetime as dt
 import hashlib
 import shutil
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from . import encode, grain, mux
@@ -79,21 +80,134 @@ def check_skip(info: MediaInfo, output: Path, cfg: Config) -> None:
         raise SkipFile(f"already {info.codec}")
     if info.duration and info.duration < cfg.library.min_duration_sec:
         raise SkipFile(f"shorter than {cfg.library.min_duration_sec:.0f}s")
-    if info.has_dolby_vision:
-        # The DV RPU travels as side data that Av1an's chunked pipeline does not
-        # carry through; transcoding would silently drop it to plain HDR10.
-        raise SkipFile("Dolby Vision RPU would be lost")
+    if info.pix_fmt in {"", "unknown"}:
+        # Av1an probes the source itself and aborts with "missing field `pix_fmt`"
+        # when ffprobe cannot name the pixel format. Catching it here costs nothing
+        # and turns a confusing failure mid-encode into a clear skip.
+        raise SkipFile("pixel format unreadable; Av1an cannot probe this file")
+    check_dolby_vision(info, cfg)
     if output.resolve() == info.path.resolve():
         raise SkipFile("output path equals source path")
     if output.exists():
         raise SkipFile(f"output already exists: {output.name}")
 
 
-def _work_dir(info: MediaInfo, cfg: Config) -> Path:
-    digest = hashlib.sha256(str(info.path.resolve()).encode()).hexdigest()[:16]
+def check_dolby_vision(info: MediaInfo, cfg: Config) -> None:
+    """Decide whether a Dolby Vision source can be transcoded, and say what is lost.
+
+    The RPU is lost either way: AV1 cannot carry it through Av1an's chunked
+    pipeline. The question is only whether what remains is a watchable picture.
+    For profiles 7, 8.x and 10.x it is -- a correctly tagged HDR10, HLG or SDR
+    base layer, which is exactly what Jellyfin serves when it transcodes these
+    files on the fly. Only profile 5 (and profile 10 signalling no compatibility)
+    decodes to skewed colour without the RPU.
+    """
+    dv = info.dolby_vision
+    if dv is None:
+        return
+
+    if cfg.dolby_vision.mode == "skip":
+        raise SkipFile(f"Dolby Vision profile {dv.name} (dolby_vision.mode = 'skip')")
+
+    layer = info.base_layer
+    if layer == "none":
+        if cfg.dolby_vision.profile5 == "tonemap-sdr":
+            log.warning(
+                "  DV profile %s has no viewable base layer; reshaping to SDR BT.709 "
+                "with tonemapx (this discards HDR)", dv.name,
+            )
+            return
+        raise SkipFile(
+            f"Dolby Vision profile {dv.name}: no base layer to fall back on "
+            "(set dolby_vision.profile5 = 'tonemap-sdr' to convert it to SDR instead)"
+        )
+
+    if layer == "invalid":
+        log.warning(
+            "  DV profile %s signals a base layer its colour tags contradict "
+            "(%s/%s/%s); encoding what the tags say",
+            dv.name, info.color_primaries or "?", info.color_transfer or "?",
+            info.color_space or "?",
+        )
+        return
+
+    log.info("  %s: encoding the %s base layer, RPU not carried over",
+             dv.describe(), layer)
+
+
+def _work_dir(source: Path, cfg: Config) -> Path:
+    """Per-file scratch directory, keyed to the source path.
+
+    Takes a Path rather than a MediaInfo on purpose: this digest is what lets
+    Av1an resume across runs, so it must follow the real source and never a
+    staged copy. Passing the path explicitly makes that hard to get wrong.
+    """
+    digest = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
     path = cfg.work_dir / digest
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _staged_path(source: Path, cfg: Config, suffix: str) -> Path:
+    """Name staged files by the whole source path, so identically named files in
+    different folders cannot collide."""
+    digest = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
+    return cfg.staging_dir / f"{digest}{suffix}"
+
+
+def staged_output_path(source: Path, cfg: Config) -> Path:
+    return _staged_path(source, cfg, f".out.{cfg.output.container}")
+
+
+def stage_source(info: MediaInfo, cfg: Config) -> Path | None:
+    """Copy the source to local storage, returning the copy's path.
+
+    Returns None when staging is not possible, because this is an optimisation and
+    never a reason to refuse a file: the caller falls back to reading in place.
+
+    An interrupted run leaves its copy behind on purpose. A second run finds it,
+    checks the size still matches and reuses it, so resuming does not re-read the
+    whole source across the network or off a sleeping disk.
+    """
+    root = cfg.staging_dir
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("  staging directory unusable (%s); reading the source in place", exc)
+        return None
+
+    staged = _staged_path(info.path, cfg, info.path.suffix)
+
+    if staged.is_file() and staged.stat().st_size == info.size_bytes:
+        log.info("  reusing staged copy from an earlier run: %s", staged)
+        return staged
+    staged.unlink(missing_ok=True)
+
+    # The multiple covers the copy itself plus the encoded output, which is staged
+    # alongside it and is normally a small fraction of the source.
+    needed = int(info.size_bytes * cfg.staging.min_free_multiple)
+    free = shutil.disk_usage(root).free
+    if free < needed:
+        log.warning(
+            "  not staging: %s free at %s, want %s (%.2fx the source); "
+            "reading the source in place",
+            human_size(free), root, human_size(needed), cfg.staging.min_free_multiple,
+        )
+        return None
+
+    log.info("  staging %s to %s", human_size(info.size_bytes), root)
+    started = time.monotonic()
+    try:
+        shutil.copyfile(info.path, staged)
+    except OSError as exc:
+        log.warning("  staging failed (%s); reading the source in place", exc)
+        staged.unlink(missing_ok=True)
+        return None
+
+    elapsed = time.monotonic() - started
+    rate = info.size_bytes / elapsed if elapsed else 0.0
+    log.info("  staged in %s (%s/s)", human_duration(elapsed), human_size(int(rate)))
+    return staged
 
 
 def process_one(
@@ -108,15 +222,60 @@ def process_one(
     check_skip(info, final, cfg)
     final.parent.mkdir(parents=True, exist_ok=True)
 
-    work = _work_dir(info, cfg)
+    # Everything above is keyed to the real source: the output path, the work
+    # directory digest that makes Av1an resumable, and the ledger entry. Only the
+    # steps that actually *read* the video move to the staged copy.
+    work = _work_dir(source, cfg)
+
+    staged: Path | None = None
+    staged_out: Path | None = None
+    if cfg.staging.enabled and not dry_run:
+        staged = stage_source(info, cfg)
+        # Stage the write as well, but only once the read staged successfully:
+        # that is what proved the directory usable and the free space sufficient.
+        if staged is not None:
+            staged_out = staged_output_path(source, cfg)
+    read = replace(info, path=staged) if staged is not None else info
+
+    try:
+        return _transcode(
+            source, info, read, final, staged_out, work, chain, cfg, started,
+            dry_run=dry_run,
+        )
+    finally:
+        if staged_out is not None:
+            staged_out.unlink(missing_ok=True)
+        if staged is not None and not cfg.staging.keep:
+            staged.unlink(missing_ok=True)
+            log.debug("staged copy removed: %s", staged)
+
+
+def _transcode(
+    source: Path,
+    info: MediaInfo,
+    read: MediaInfo,
+    final: Path,
+    staged_out: Path | None,
+    work: Path,
+    chain: Toolchain,
+    cfg: Config,
+    started: float,
+    *,
+    dry_run: bool,
+) -> Record:
+    """The pipeline proper.
+
+    `info` describes the source, `read` says where to read it, and `staged_out` --
+    when set -- says where to write the result before moving it to `final`.
+    """
     report: grain.GrainReport | None = None
     table: Path | None = None
 
     if cfg.grain.mode != "never":
-        report = grain.measure(info, chain, cfg, work)
+        report = grain.measure(read, chain, cfg, work)
         log.info("  %s", report.describe())
         if report.grainy and not dry_run:
-            table = grain.build_table(info, chain, cfg, report, work)
+            table = grain.build_table(read, chain, cfg, report, work)
             if table is None:
                 log.warning("  no grain table; encoding without denoising to avoid losing grain")
 
@@ -125,7 +284,7 @@ def process_one(
 
     encoded = work / "encoded.mkv"
     encoded.unlink(missing_ok=True)
-    argv = encode.build_command(info, encoded, chain, cfg, work / "av1an", denoise)
+    argv = encode.build_command(read, encoded, chain, cfg, work / "av1an", denoise)
     encode.run_encode(argv, cfg, dry_run=dry_run)
 
     if dry_run:
@@ -142,27 +301,43 @@ def process_one(
     video = encoded
     if table:
         grainy = work / "grainy.mkv"
-        try:
-            grain.apply_table(encoded, table, chain, grainy, cfg.grain.chroma)
-            video = grainy
-            log.info("  film grain applied from table")
-        except CommandError as exc:
-            log.warning("  grav1synth apply failed (%s); shipping the denoised encode",
-                        exc.stderr.strip()[:200])
+        # No fallback here on purpose. The encode was denoised precisely because we
+        # had a table to put the grain back with; shipping it without that step
+        # would quietly deliver a smeared picture. Failing keeps the work directory,
+        # so Av1an resumes from its finished chunks once the cause is fixed.
+        grain.apply_table(encoded, table, chain, grainy)
+        video = grainy
+        log.info("  film grain applied from table")
 
-    mux.mux(video, info, final, chain, cfg)
+    # When staging, mux locally rather than onto the destination disk. The result
+    # only moves once it has earned its place, so an encode that fails the size
+    # check never touches that disk at all.
+    muxed = staged_out if staged_out is not None else final
+    mux.mux(video, read, muxed, chain, cfg)
 
-    output_bytes = final.stat().st_size
+    output_bytes = muxed.stat().st_size
     saving = 100.0 * (1 - output_bytes / info.size_bytes) if info.size_bytes else 0.0
-    elapsed = time.monotonic() - started
 
     if saving < cfg.output.min_saving_percent:
-        final.unlink(missing_ok=True)
+        muxed.unlink(missing_ok=True)
         _cleanup(work, cfg, table)
         raise SkipFile(
             f"only {saving:.1f}% smaller, below the {cfg.output.min_saving_percent:.0f}% threshold"
         )
 
+    if staged_out is not None:
+        log.info("  writing %s to %s", human_size(output_bytes), final.parent)
+        # shutil.move, not os.replace: staging is normally on a different
+        # filesystem from the library, so this is a copy-and-delete.
+        try:
+            shutil.move(str(muxed), str(final))
+        except OSError:
+            # Never leave a half-written file at the destination: check_skip would
+            # read it as "already done" and the title would be silently abandoned.
+            final.unlink(missing_ok=True)
+            raise
+
+    elapsed = time.monotonic() - started
     log.info(
         "  done in %s: %s -> %s (%.1f%% smaller)",
         human_duration(elapsed), human_size(info.size_bytes), human_size(output_bytes), saving,

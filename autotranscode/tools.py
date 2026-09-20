@@ -31,6 +31,7 @@ class Toolchain:
     ffmpeg: str
     ffprobe: str
     av1an: str | None
+    svtav1encapp: str | None
     grav1synth: str | None
     mkvmerge: str | None
 
@@ -41,6 +42,9 @@ class Toolchain:
     hwaccels: set[str] = field(default_factory=set)
     filters: set[str] = field(default_factory=set)
     encoders: set[str] = field(default_factory=set)
+    # Long options SvtAv1EncApp actually accepts. Flags come and go between
+    # releases, so we ask the binary rather than assume the build has them.
+    svt_options: set[str] = field(default_factory=set)
     has_vapoursynth: bool = False
 
     # ---- capability helpers -------------------------------------------------
@@ -52,6 +56,16 @@ class Toolchain:
     @property
     def has_grain_pipeline(self) -> bool:
         return self.av1an is not None and self.grav1synth is not None
+
+    @property
+    def has_hdr10_metadata(self) -> bool:
+        """Whether the encoder can be told the mastering display and light levels."""
+        return {"--mastering-display", "--content-light"} <= self.svt_options
+
+    @property
+    def has_dovi_tonemap(self) -> bool:
+        """tonemapx reshapes Dolby Vision profile 5 on the CPU; libplacebo needs a GPU."""
+        return "tonemapx" in self.filters
 
     def hwaccel_args(self, requested: str) -> list[str]:
         """FFmpeg flags for hardware-accelerated *decode*.
@@ -122,6 +136,7 @@ def detect(cfg: Config) -> Toolchain:
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
         av1an=_which(cfg.paths.av1an),
+        svtav1encapp=_which(cfg.paths.svtav1encapp),
         grav1synth=_which(cfg.paths.grav1synth),
         mkvmerge=_which(cfg.paths.mkvmerge),
     )
@@ -151,10 +166,10 @@ def detect(cfg: Config) -> Toolchain:
     ):
         chain.av1an_version = match.group(1)
 
-    if (svt := shutil.which("SvtAv1EncApp")) and (
-        match := re.search(r"SVT-AV1.*?v?(\d+\.\d+\.\d+)", _capture([svt, "--version"]))
-    ):
-        chain.svtav1_version = match.group(1)
+    if svt := chain.svtav1encapp:
+        if match := re.search(r"SVT-AV1.*?v?(\d+\.\d+\.\d+)", _capture([svt, "--version"])):
+            chain.svtav1_version = match.group(1)
+        chain.svt_options = set(re.findall(r"--[a-z0-9][a-z0-9-]+", _capture([svt, "--help"])))
 
     chain.has_vapoursynth = shutil.which("vspipe") is not None
     return chain
@@ -166,13 +181,14 @@ def require(chain: Toolchain, cfg: Config) -> None:
 
     if chain.av1an is None:
         problems.append("av1an not found (cargo install av1an, or see scripts/bootstrap-rk3588.sh)")
-    if shutil.which("SvtAv1EncApp") is None:
+    if chain.svtav1encapp is None:
         # Av1an drives the encoder binary directly, not through FFmpeg. This also
         # matters for grain: --fgs-table is documented as available only through the
         # SvtAv1Enc interface, so it is unreachable via ffmpeg -svtav1-params.
         problems.append(
-            "SvtAv1EncApp not found on PATH; Av1an needs the standalone encoder binary "
-            "(having libsvtav1 inside ffmpeg is not sufficient)"
+            "SvtAv1EncApp not found; Av1an needs the standalone encoder binary "
+            "(having libsvtav1 inside ffmpeg is not sufficient). Put it on PATH or "
+            "set paths.svtav1encapp in the config."
         )
     if cfg.encode.concat == "mkvmerge" and chain.mkvmerge is None:
         problems.append("mkvmerge not found (apt install mkvtoolnix) or set encode.concat='ffmpeg'")
@@ -180,6 +196,11 @@ def require(chain: Toolchain, cfg: Config) -> None:
         problems.append(
             "grav1synth not found but grain.mode != 'never' "
             "(cargo install grav1synth, or set grain.mode='never')"
+        )
+    if cfg.dolby_vision.profile5 == "tonemap-sdr" and not chain.has_dovi_tonemap:
+        problems.append(
+            "dolby_vision.profile5='tonemap-sdr' needs an ffmpeg with the tonemapx "
+            "filter (jellyfin-ffmpeg has it); set it back to 'skip' otherwise"
         )
     if cfg.target_quality.enabled and cfg.target_quality.metric == "vmaf" and not chain.has_libvmaf:
         problems.append(
@@ -201,11 +222,16 @@ def describe(chain: Toolchain) -> str:
         f"ffmpeg      {chain.ffmpeg}  ({chain.ffmpeg_version or 'unknown version'})",
         f"ffprobe     {chain.ffprobe}",
         f"av1an       {chain.av1an or 'MISSING'}  ({chain.av1an_version or '-'})",
+        f"svtav1      {chain.svtav1encapp or 'MISSING'}  ({chain.svtav1_version or '-'})",
         f"grav1synth  {chain.grav1synth or 'MISSING'}",
         f"mkvmerge    {chain.mkvmerge or 'MISSING'}",
-        f"SVT-AV1     {chain.svtav1_version or 'unknown'}",
         f"vapoursynth {'yes' if chain.has_vapoursynth else 'no'}",
         f"libvmaf     {'yes' if chain.has_libvmaf else 'no'}",
+        f"hdr10 meta  {'yes' if chain.has_hdr10_metadata else 'no'}  "
+        "(--mastering-display / --content-light)",
+        f"ac-bias     {'yes' if '--ac-bias' in chain.svt_options else 'no'}",
+        f"dovi p5     {'yes' if chain.has_dovi_tonemap else 'no'}  "
+        "(tonemapx, for profile 5 -> SDR)",
         f"hwaccels    {', '.join(sorted(chain.hwaccels)) or 'none'}",
     ]
     return "\n".join(lines)

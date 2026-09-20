@@ -35,6 +35,7 @@ class Paths:
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
     av1an: str = "av1an"
+    svtav1encapp: str = "SvtAv1EncApp"
     grav1synth: str = "grav1synth"
     mkvmerge: str = "mkvmerge"
     work_dir: str = "~/.cache/autotranscode"
@@ -88,8 +89,48 @@ class Grain:
     # Mean PSNR (dB) between source and its denoised self, measured on samples.
     # Lower => the denoiser removed more => more grain. Below this we take the grain route.
     threshold_db: float = 44.0
-    chroma: bool = False
     keep_table: bool = True
+
+
+@dataclass(slots=True)
+class Staging:
+    """Copy each source to local storage before reading it.
+
+    An encode reads its source many times over many hours -- scene detection, every
+    chunk, the grain samples, the final mux. Pointed at a NAS or a spinning disk
+    that is constant activity, and the drive never gets to idle. Copying the file
+    once and working from the copy turns that into a single sequential read.
+
+    Off by default: it costs disk space equal to the largest source, and it is
+    pointless when the library already lives on the same fast storage as work_dir.
+    """
+
+    enabled: bool = False
+    directory: str = ""  # empty => <work_dir>/staging
+    # Require this multiple of the source size to be free before copying, so
+    # staging cannot fill the disk the encode also needs for its chunks.
+    min_free_multiple: float = 1.5
+    keep: bool = False  # leave the copy behind afterwards (debugging)
+
+
+@dataclass(slots=True)
+class DolbyVision:
+    """What to do with Dolby Vision sources.
+
+    The RPU cannot survive: AV1 carriage aside, Av1an's chunked pipeline drops it.
+    What survives is the base layer, and for every profile except 5 that is a
+    complete HDR10, HLG or SDR picture -- the same thing Jellyfin serves when it
+    transcodes these titles on the fly. Encoding it is a real option; refusing the
+    whole file was not.
+    """
+
+    mode: str = "base-layer"  # base-layer | skip
+    # Profile 5 has no viewable base layer. tonemapx can reshape it using the RPU,
+    # but only down to SDR BT.709, so it is opt-in rather than automatic.
+    profile5: str = "skip"  # skip | tonemap-sdr
+    tonemap_algorithm: str = "bt2390"
+    tonemap_desat: float = 0.0
+    tonemap_peak: float = 0.0
 
 
 @dataclass(slots=True)
@@ -133,6 +174,8 @@ class Config:
     encode: Encode = field(default_factory=Encode)
     target_quality: TargetQuality = field(default_factory=TargetQuality)
     grain: Grain = field(default_factory=Grain)
+    staging: Staging = field(default_factory=Staging)
+    dolby_vision: DolbyVision = field(default_factory=DolbyVision)
     audio: Audio = field(default_factory=Audio)
     subtitles: Subtitles = field(default_factory=Subtitles)
     output: Output = field(default_factory=Output)
@@ -145,6 +188,11 @@ class Config:
     @property
     def state_path(self) -> Path:
         return Path(self.paths.state_file).expanduser()
+
+    @property
+    def staging_dir(self) -> Path:
+        directory = self.staging.directory
+        return Path(directory).expanduser() if directory else self.work_dir / "staging"
 
 
 class ConfigError(ValueError):
@@ -208,6 +256,12 @@ def validate(cfg: Config) -> None:
         raise ConfigError("grain.mode must be auto, always or never")
     if cfg.grain.analysis not in {"sampled", "full"}:
         raise ConfigError("grain.analysis must be sampled or full")
+    if cfg.staging.min_free_multiple < 1.0:
+        raise ConfigError("staging.min_free_multiple must be at least 1.0")
+    if cfg.dolby_vision.mode not in {"base-layer", "skip"}:
+        raise ConfigError("dolby_vision.mode must be base-layer or skip")
+    if cfg.dolby_vision.profile5 not in {"skip", "tonemap-sdr"}:
+        raise ConfigError("dolby_vision.profile5 must be skip or tonemap-sdr")
     if cfg.audio.mode not in {"copy", "opus", "smart"}:
         raise ConfigError("audio.mode must be copy, opus or smart")
     if cfg.subtitles.mode not in {"copy", "none", "text-only"}:

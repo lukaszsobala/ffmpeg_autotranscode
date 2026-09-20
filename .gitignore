@@ -6,6 +6,8 @@ dist/
 .venv/
 *.tbl
 *.log
+# Av1an writes logs/av1an.log.<date> into whatever directory it is run from.
+logs/
 state.json
 
 # Local handoff notes, transferred out of band

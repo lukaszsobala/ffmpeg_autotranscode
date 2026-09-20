@@ -34,6 +34,10 @@ nice = 10
 ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
 av1an = "av1an"
+# The standalone SVT-AV1 encoder binary, which Av1an drives directly. A source
+# build installs it under the prefix you chose (~/.local/bin by default), which
+# is not always on PATH -- give the full path here if `doctor` cannot find it.
+svtav1encapp = "SvtAv1EncApp"
 grav1synth = "grav1synth"
 mkvmerge = "mkvmerge"
 
@@ -51,8 +55,13 @@ variance_boost_strength = 2  # 1 mild .. 4 aggressive; helps dark and flat areas
 ac_bias = 0.0       # 0..8. Above 0 preserves texture and residual grain. Try 0.5-1.0.
 keyint_sec = 10.0   # Keyframe interval in seconds.
 
-# "hybrid" is the right choice without VapourSynth. lsmash/ffms2/bestsource are more
-# accurate but need VapourSynth plugins installed.
+# "hybrid" is the right choice here. lsmash/ffms2/bestsource are more accurate but
+# each needs its own VapourSynth *plugin* (L-SMASH-Works, ffms2, BestSource).
+#
+# Note that the bootstrap script does install VapourSynth, so `doctor` will report
+# `vapoursynth yes` -- but only because Av1an refuses to link without it, not
+# because any source plugin is present. `doctor` cannot tell the difference, so if
+# you switch away from "hybrid", install the matching plugin yourself first.
 chunk_method = "hybrid"
 concat = "mkvmerge"          # mkvmerge avoids ffmpeg's occasional audio-seek breakage.
 sc_method = "standard"       # "fast" is cheaper but cuts scenes worse.
@@ -98,8 +107,72 @@ denoise_strength = "auto"    # "auto" picks from the measured score; or set e.g.
 # be clean and a handful you know to be grainy, and put the threshold between them.
 threshold_db = 44.0
 
-chroma = false               # also synthesise grain on chroma planes
 keep_table = true            # keep the generated .tbl next to the work dir for inspection
+
+[staging]
+# Copy each source to local storage before reading it, and work from the copy.
+#
+# An encode reads its source many times over many hours: scene detection, every
+# chunk, the grain samples, the final mux. If the library lives on a NAS or a
+# spinning disk, that is hours of constant activity and the drive never idles.
+#
+# Both directions are staged. Reads come from the local copy, and the finished
+# file is written locally too, moving to its destination only once it has passed
+# the output.min_saving_percent check -- writing straight into a folder on that
+# disk would keep it busy just as reading did. The net effect is one read at the
+# start, one write at the end, and an idle disk in between.
+#
+# Worth turning on when the library is on different (slower) storage than
+# paths.work_dir. Pointless when they are the same device.
+enabled = false
+
+# Where to put the copies. Empty means <work_dir>/staging. Point this at fast
+# local storage with room for your largest single file.
+directory = ""
+
+# Refuse to stage unless this multiple of the source size is free. It covers the
+# copy itself plus the encoded output, which is staged alongside it and is
+# normally a small fraction of the source. Staging is only an optimisation: when
+# there is not enough room, or the copy fails, the file is read and written in
+# place instead and the run continues.
+min_free_multiple = 1.5
+
+# Leave the copy behind afterwards. Only useful for debugging; a 4K remux is
+# tens of GiB. An interrupted run keeps its copy regardless, and the next run
+# reuses it if the size still matches.
+keep = false
+
+[dolby_vision]
+# Dolby Vision carries an RPU alongside a base layer. The RPU cannot come with us:
+# Av1an's chunked pipeline does not carry it through, and it would not survive the
+# re-encode regardless. The base layer, however, usually can.
+#
+#   "base-layer"  encode the base layer, drop the RPU (default)
+#   "skip"        leave every Dolby Vision title alone
+#
+# For profiles 7, 8.1, 8.2, 8.4 and 10.x the base layer is a complete, correctly
+# tagged HDR10, HLG or SDR picture -- the same thing Jellyfin serves when it
+# transcodes these titles on the fly. You lose the dynamic per-shot metadata and
+# keep everything else, including the HDR10 static metadata below.
+mode = "base-layer"
+
+# Profile 5 is the exception: it has no cross-compatible base layer, so without the
+# RPU it decodes to badly skewed colour.
+#
+#   "skip"         leave profile 5 titles alone (default)
+#   "tonemap-sdr"  reshape them with ffmpeg's tonemapx filter, which reads the RPU
+#                  on the CPU -- but only writes BT.709, so this converts an HDR
+#                  master to SDR. A real downgrade, hence opt-in.
+#
+# There is no CPU path from profile 5 to HDR10. libplacebo could do it but needs a
+# working Vulkan device, which the RK3588's Mali GPU does not provide.
+profile5 = "skip"
+
+# Tonemapping controls, used only by profile5 = "tonemap-sdr". Defaults match
+# Jellyfin's. peak = 0 lets the filter detect the signal peak itself.
+tonemap_algorithm = "bt2390"
+tonemap_desat = 0.0
+tonemap_peak = 0.0
 
 [audio]
 # "smart" copies already-efficient tracks and re-encodes wasteful ones (TrueHD, DTS,

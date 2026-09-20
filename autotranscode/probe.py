@@ -13,6 +13,116 @@ from .util import run
 # Transfer characteristics that mean "this is HDR"; we must preserve their signalling.
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 
+# Dolby Vision handling follows Jellyfin's classifier
+# (MediaBrowser.Model/Entities/MediaStream.cs, GetVideoColorRange), because Jellyfin
+# is the thing that will ultimately play these files and it has already settled which
+# DV variants have a usable base layer. The RPU itself cannot be carried into AV1
+# through Av1an's chunked pipeline, so what we keep is the base layer -- which for
+# every profile except 5 (and 10 with compatibility 0) is a complete, correctly
+# tagged HDR10, HLG or SDR picture. That is the same trade Jellyfin makes when it
+# transcodes these titles on the fly.
+
+# Profiles that carry an RPU at all.
+DOVI_PROFILES = {5, 7, 8, 10}
+
+# Codec tags that signal Dolby Vision even when the configuration record is absent.
+DOVI_CODEC_TAGS = {"dovi", "dvh1", "dvhe", "dav1"}
+
+# dv_bl_signal_compatibility_id -> what the base layer is on its own, per profile.
+# Profile 8 is defined as always having a cross-compatible base layer, so an id of 0
+# there is out of spec rather than meaningful; profile 10 (DV in AV1) may legitimately
+# signal 0. Anything outside these is malformed, and handled as "invalid".
+BL_COMPATIBILITY = {
+    8: {1: "hdr10", 2: "sdr", 4: "hlg"},
+    10: {0: "none", 1: "hdr10", 2: "sdr", 4: "hlg"},
+}
+
+# The colour signalling each usable base layer must actually carry. A file that
+# claims HDR10 compatibility but is not tagged for it is out of spec, and we trust
+# the tags rather than the claim.
+EXPECTED_SIGNALLING = {
+    "hdr10": ("bt2020", "smpte2084", "bt2020nc"),
+    "hlg": ("bt2020", "arib-std-b67", "bt2020nc"),
+}
+
+
+@dataclass(slots=True)
+class DolbyVision:
+    """The DOVI configuration record, as ffprobe reports it in stream side data."""
+
+    profile: int = 0
+    level: int = 0
+    compatibility_id: int = 0
+    rpu_present: bool = False
+    el_present: bool = False
+    bl_present: bool = False
+
+    @property
+    def name(self) -> str:
+        # "8.1" / "8.2" / "8.4" is the conventional notation; other profiles are bare.
+        if not self.profile:
+            return "unknown"
+        return (
+            f"{self.profile}.{self.compatibility_id}"
+            if self.profile in {8, 10}
+            else str(self.profile)
+        )
+
+    def claimed_base_layer(self) -> str:
+        """What the signalling says the base layer is, before checking the tags."""
+        if self.profile == 5:
+            # IPT-PQ-C2. The stream is usually tagged bt2020/smpte2084 anyway, which
+            # is a lie: without the RPU it decodes to badly skewed colour.
+            return "none"
+        if self.profile == 7:
+            # Dual layer. Enhancement layer and RPU aside, the base layer is HDR10,
+            # whatever the compatibility id says (muxers usually write 6).
+            return "hdr10"
+        if (by_id := BL_COMPATIBILITY.get(self.profile)) is not None:
+            return by_id.get(self.compatibility_id, "invalid")
+        return "invalid"
+
+    def describe(self) -> str:
+        layers = "dual-layer" if self.el_present else "single-layer"
+        return f"DV profile {self.name} ({layers})"
+
+
+@dataclass(slots=True)
+class MasteringDisplay:
+    """SMPTE ST 2086 mastering display colour volume: CIE xy primaries and nits."""
+
+    green_x: float
+    green_y: float
+    blue_x: float
+    blue_y: float
+    red_x: float
+    red_y: float
+    white_x: float
+    white_y: float
+    max_luminance: float
+    min_luminance: float
+
+    def svt_argument(self) -> str:
+        """The "G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)" string SvtAv1EncApp expects."""
+        return (
+            f"G({self.green_x:.4f},{self.green_y:.4f})"
+            f"B({self.blue_x:.4f},{self.blue_y:.4f})"
+            f"R({self.red_x:.4f},{self.red_y:.4f})"
+            f"WP({self.white_x:.4f},{self.white_y:.4f})"
+            f"L({self.max_luminance:.4f},{self.min_luminance:.4f})"
+        )
+
+
+@dataclass(slots=True)
+class ContentLight:
+    """CEA-861.3 content light level: MaxCLL and MaxFALL, in nits."""
+
+    max_cll: int
+    max_fall: int
+
+    def svt_argument(self) -> str:
+        return f"{self.max_cll},{self.max_fall}"
+
 
 @dataclass(slots=True)
 class Stream:
@@ -47,7 +157,9 @@ class MediaInfo:
     color_transfer: str = ""
     color_space: str = ""
     color_range: str = ""
-    has_dolby_vision: bool = False
+    dolby_vision: DolbyVision | None = None
+    mastering_display: MasteringDisplay | None = None
+    content_light: ContentLight | None = None
 
     audio: list[Stream] = field(default_factory=list)
     subtitles: list[Stream] = field(default_factory=list)
@@ -55,6 +167,39 @@ class MediaInfo:
     @property
     def is_hdr(self) -> bool:
         return self.color_transfer in HDR_TRANSFERS
+
+    @property
+    def has_dolby_vision(self) -> bool:
+        return self.dolby_vision is not None
+
+    @property
+    def base_layer(self) -> str:
+        """What we can actually encode: hdr10 | hlg | sdr | none | invalid.
+
+        For a non-DV source this is just what the colour tags say. For a DV source
+        it is the base layer, cross-checked against those tags: a file claiming
+        HDR10 compatibility while tagged bt709 is out of spec, and the tags are what
+        the decoder will hand us, so they win.
+        """
+        if self.dolby_vision is None:
+            return self._signalled_range()
+
+        claimed = self.dolby_vision.claimed_base_layer()
+        if claimed in {"none", "invalid"}:
+            return claimed
+        expected = EXPECTED_SIGNALLING.get(claimed)
+        if expected is not None and (
+            self.color_primaries, self.color_transfer, self.color_space
+        ) != expected:
+            return "invalid"
+        return claimed
+
+    def _signalled_range(self) -> str:
+        if self.color_transfer == "smpte2084":
+            return "hdr10"
+        if self.color_transfer == "arib-std-b67":
+            return "hlg"
+        return "sdr"
 
     @property
     def pixels_per_second(self) -> float:
@@ -69,9 +214,10 @@ class MediaInfo:
 
     def describe(self) -> str:
         hdr = f" HDR({self.color_transfer})" if self.is_hdr else ""
+        dv = f" {self.dolby_vision.describe()}" if self.dolby_vision else ""
         return (
             f"{self.width}x{self.height} {self.codec} {self.bit_depth}-bit "
-            f"{self.fps:.3f}fps{hdr}, {self.duration / 60:.1f} min, "
+            f"{self.fps:.3f}fps{hdr}{dv}, {self.duration / 60:.1f} min, "
             f"{len(self.audio)} audio / {len(self.subtitles)} sub"
         )
 
@@ -118,10 +264,101 @@ def _stream(raw: dict) -> Stream:
     )
 
 
+def _rational(value: object, default: float = 0.0) -> float:
+    """ffprobe reports ST 2086 values as rationals, e.g. "34000/50000"."""
+    try:
+        return float(Fraction(str(value)))
+    except (ValueError, ZeroDivisionError, TypeError):
+        return default
+
+
+def _side_data(entries: list[dict], name: str) -> dict | None:
+    return next(
+        (sd for sd in entries
+         if str(sd.get("side_data_type", "")).lower() == name.lower()),
+        None,
+    )
+
+
+def _dolby_vision(video: dict) -> DolbyVision | None:
+    """Parse the DOVI configuration record, if this stream carries one."""
+    record = _side_data(video.get("side_data_list") or [], "DOVI configuration record")
+    if record is None:
+        # Some muxes carry no configuration record but still tag the codec as DV.
+        # Report it so the caller can decline rather than encode unknown colour.
+        if str(video.get("codec_tag_string", "")).lower() in DOVI_CODEC_TAGS:
+            return DolbyVision(profile=0, compatibility_id=-1)
+        return None
+
+    dv = DolbyVision(
+        profile=_int(record.get("dv_profile")),
+        level=_int(record.get("dv_level")),
+        compatibility_id=_int(record.get("dv_bl_signal_compatibility_id")),
+        rpu_present=bool(_int(record.get("rpu_present_flag"))),
+        el_present=bool(_int(record.get("el_present_flag"))),
+        bl_present=bool(_int(record.get("bl_present_flag"))),
+    )
+    # A record describing neither an RPU nor a base layer is not a DV stream.
+    return dv if (dv.rpu_present or dv.profile in DOVI_PROFILES) else None
+
+
+def _hdr10_metadata(
+    path: Path, chain: Toolchain, video: dict
+) -> tuple[MasteringDisplay | None, ContentLight | None]:
+    """Read ST 2086 and CEA-861.3 metadata, which HEVC carries per frame.
+
+    These do not appear in -show_streams, so this costs one extra ffprobe that
+    decodes a single frame. Only PQ sources carry them, so only PQ sources pay.
+    """
+    if video.get("color_transfer") != "smpte2084":
+        return None, None
+
+    result = run([
+        chain.ffprobe, "-v", "error", "-select_streams", "v:0",
+        "-read_intervals", "%+#1", "-show_frames",
+        "-show_entries",
+        "frame_side_data=side_data_type,red_x,red_y,green_x,green_y,blue_x,blue_y,"
+        "white_point_x,white_point_y,min_luminance,max_luminance,max_content,max_average",
+        "-of", "json", str(path),
+    ], check=False)
+    if result.returncode != 0:
+        return None, None
+
+    try:
+        frames = json.loads(result.stdout).get("frames") or []
+    except json.JSONDecodeError:
+        return None, None
+    entries = frames[0].get("side_data_list") or [] if frames else []
+
+    mastering = None
+    if (raw := _side_data(entries, "Mastering display metadata")) is not None:
+        mastering = MasteringDisplay(
+            green_x=_rational(raw.get("green_x")), green_y=_rational(raw.get("green_y")),
+            blue_x=_rational(raw.get("blue_x")), blue_y=_rational(raw.get("blue_y")),
+            red_x=_rational(raw.get("red_x")), red_y=_rational(raw.get("red_y")),
+            white_x=_rational(raw.get("white_point_x")),
+            white_y=_rational(raw.get("white_point_y")),
+            max_luminance=_rational(raw.get("max_luminance")),
+            min_luminance=_rational(raw.get("min_luminance")),
+        )
+
+    content_light = None
+    if (raw := _side_data(entries, "Content light level metadata")) is not None:
+        content_light = ContentLight(
+            max_cll=_int(raw.get("max_content")),
+            max_fall=_int(raw.get("max_average")),
+        )
+    return mastering, content_light
+
+
 def probe(path: Path, chain: Toolchain) -> MediaInfo:
+    # -show_streams already carries stream-level side_data_list, which is where the
+    # DOVI configuration record lives. Do not ask for the "side_data" section on top
+    # of it: that turns on packet side data, so ffprobe demuxes the entire file --
+    # many minutes per title on a 4K remux, for information already in hand.
     result = run([
         chain.ffprobe, "-v", "error",
-        "-show_format", "-show_streams", "-show_entries", "side_data",
+        "-show_format", "-show_streams",
         "-of", "json", str(path),
     ])
     data = json.loads(result.stdout)
@@ -155,8 +392,8 @@ def probe(path: Path, chain: Toolchain) -> MediaInfo:
             s for s in streams if s.get("codec_type") == "audio"
         ])))
 
-    side_data = video.get("side_data_list") or []
-    has_dv = any("Dolby Vision" in str(sd.get("side_data_type", "")) for sd in side_data)
+    dolby_vision = _dolby_vision(video)
+    mastering, content_light = _hdr10_metadata(path, chain, video)
 
     return MediaInfo(
         path=path,
@@ -175,7 +412,9 @@ def probe(path: Path, chain: Toolchain) -> MediaInfo:
         color_transfer=video.get("color_transfer", ""),
         color_space=video.get("color_space", ""),
         color_range=video.get("color_range", ""),
-        has_dolby_vision=has_dv,
+        dolby_vision=dolby_vision,
+        mastering_display=mastering,
+        content_light=content_light,
         audio=[_stream(s) for s in streams if s.get("codec_type") == "audio"],
         subtitles=[_stream(s) for s in streams if s.get("codec_type") == "subtitle"],
     )

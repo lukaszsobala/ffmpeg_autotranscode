@@ -7,12 +7,25 @@
 #   ./scripts/bootstrap-rk3588.sh            # everything
 #   ./scripts/bootstrap-rk3588.sh ffmpeg     # just one stage
 #
-# Stages: deps ffmpeg svtav1 av1an grav1synth verify
+# Stages: deps ffmpeg svtav1 vapoursynth av1an grav1synth verify
+#
+# Only the `deps` and `ffmpeg` stages use sudo, and only to run apt-get. Everything
+# built from source installs into a user-owned prefix ($HOME/.local by default), so
+# the long stages need no privileges and leave nothing behind outside your home
+# directory. Set PREFIX=/usr/local if you deliberately want a system-wide install;
+# the script will then use sudo for that one `cmake --install`.
 
 set -euo pipefail
 
 SVT_AV1_VERSION="${SVT_AV1_VERSION:-v4.0.0}"
-PREFIX="${PREFIX:-/usr/local}"
+ZIMG_VERSION="${ZIMG_VERSION:-release-3.0.6}"
+# Pinned deliberately, not lazily. R73 onward added Vulkan GPU filters whose
+# gpufilter.h does not compile against Debian 13's Vulkan headers
+# ("invalid conversion from 'const void*' to 'void*'"), and switched to a Meson
+# build that makes Cython mandatory. R72 is the last autotools release without
+# that code, and since nothing here ever calls VapourSynth, newer buys us nothing.
+VAPOURSYNTH_VERSION="${VAPOURSYNTH_VERSION:-R72}"
+PREFIX="${PREFIX:-$HOME/.local}"
 BUILD_DIR="${BUILD_DIR:-$HOME/.cache/autotranscode-build}"
 JOBS="${JOBS:-$(nproc)}"
 
@@ -27,6 +40,7 @@ stage_deps() {
   sudo apt-get update
   sudo apt-get install -y --no-install-recommends \
     build-essential cmake git yasm nasm pkg-config ca-certificates curl gnupg \
+    autoconf automake libtool \
     clang libclang-dev llvm-dev \
     libavformat-dev libavfilter-dev libavdevice-dev libavutil-dev libswscale-dev \
     mkvtoolnix python3 python3-venv
@@ -85,10 +99,67 @@ stage_svtav1() {
     -DBUILD_SHARED_LIBS=OFF \
     -DBUILD_TESTING=OFF
   cmake --build "$src/Build" -j "$JOBS"
-  sudo cmake --install "$src/Build"
-  sudo ldconfig
-  command -v SvtAv1EncApp >/dev/null || die "SvtAv1EncApp not on PATH after install"
-  SvtAv1EncApp --version | head -1
+
+  # Install without privileges when the prefix is ours, which is the default.
+  if [[ -w ${PREFIX} || ! -e ${PREFIX} ]]; then
+    cmake --install "$src/Build"
+  else
+    warn "${PREFIX} is not writable; installing with sudo"
+    sudo cmake --install "$src/Build"
+    sudo ldconfig
+  fi
+
+  local svt="$PREFIX/bin/SvtAv1EncApp"
+  [[ -x $svt ]] || die "SvtAv1EncApp not found at ${svt} after install"
+  "$svt" --version | head -1
+  if ! command -v SvtAv1EncApp >/dev/null; then
+    warn "${PREFIX}/bin is not on PATH. Either add it:"
+    warn "    echo 'export PATH=\"${PREFIX}/bin:\$PATH\"' >> ~/.profile"
+    warn "  or point the config at it: paths.svtav1encapp = \"${svt}\""
+  fi
+}
+
+stage_vapoursynth() {
+  log "Building zimg and VapourSynth into ${PREFIX}"
+  # This is not optional and not about chunk methods. Av1an links -lvapoursynth
+  # unconditionally: no published version and no upstream branch gates it behind a
+  # cargo feature, so the library must exist even though this tool never uses it
+  # (encode.chunk_method 'hybrid' is FFmpeg-only). Debian ships no VapourSynth
+  # packages at all, hence a source build.
+  mkdir -p "$BUILD_DIR"
+
+  local zimg="$BUILD_DIR/zimg"
+  if [[ ! -d $zimg/.git ]]; then
+    git clone --depth 1 --branch "$ZIMG_VERSION" \
+      https://github.com/sekrit-twc/zimg.git "$zimg"
+  fi
+  ( cd "$zimg" && ./autogen.sh && ./configure --prefix="$PREFIX" && make -j "$JOBS" \
+    && make install )
+
+  local vs="$BUILD_DIR/vapoursynth"
+  if [[ ! -d $vs/.git ]]; then
+    git clone --depth 1 --branch "$VAPOURSYNTH_VERSION" \
+      https://github.com/vapoursynth/vapoursynth.git "$vs"
+  fi
+  # The Python module is not optional, however unused VapourSynth is here: Av1an
+  # links -lvapoursynth-script, and VSScript's API initialises by importing the
+  # Python `vapoursynth` module. Without it every av1an invocation, `--version`
+  # included, dies with "Failed to get VSScript API".
+  #
+  # Cython goes into a throwaway venv rather than system-wide, so this stays
+  # privilege-free. With PREFIX=$HOME/.local the module lands in
+  # ~/.local/lib/pythonX.Y/site-packages, which is Python's user site and already
+  # on sys.path -- no PYTHONPATH needed.
+  local venv="$BUILD_DIR/buildenv"
+  [[ -d $venv ]] || python3 -m venv "$venv"
+  "$venv/bin/pip" install --quiet --upgrade cython
+  ( cd "$vs" && ./autogen.sh \
+    && PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
+         --prefix="$PREFIX" --with-cython="$venv/bin/cython" \
+    && make -j "$JOBS" && make install )
+
+  PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion vapoursynth \
+    || die "vapoursynth.pc not found under ${PREFIX}"
 }
 
 ensure_cargo() {
@@ -103,8 +174,14 @@ ensure_cargo() {
 stage_av1an() {
   log "Installing Av1an (scene detection, chunking, parallelism, resume)"
   ensure_cargo
-  # No VapourSynth here, so the FFmpeg-only 'hybrid' chunk method is what we use.
-  cargo install av1an --locked
+  [[ -f $PREFIX/lib/pkgconfig/vapoursynth.pc ]] \
+    || die "VapourSynth not found under ${PREFIX}; run the 'vapoursynth' stage first"
+  # The vapoursynth crate emits `cargo:rustc-link-lib` without a search path, so
+  # -L is required for a prefix the linker does not already know about. The rpath
+  # then lets the finished binary find the libraries without LD_LIBRARY_PATH.
+  PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+  RUSTFLAGS="-L $PREFIX/lib -C link-arg=-Wl,-rpath,$PREFIX/lib" \
+    cargo install av1an --locked
   av1an --version | head -1
 }
 
@@ -117,7 +194,7 @@ stage_grav1synth() {
 
 stage_verify() {
   log "Verifying with autotranscode doctor"
-  export PATH="$HOME/.cargo/bin:$PATH"
+  export PATH="$HOME/.cargo/bin:$PREFIX/bin:$PATH"
   # Run from the repo root so `python3 -m autotranscode` resolves the package.
   local root
   root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -126,6 +203,8 @@ stage_verify() {
   cat <<'EOF'
 
 Next steps:
+  # Put the user prefix on PATH for future shells, if it is not already:
+  #   echo 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"' >> ~/.profile
   cp config.example.toml ~/.config/autotranscode.toml   # then set machine.profile = "rk3588"
   autotranscode -c ~/.config/autotranscode.toml measure /path/to/a/few/films
   # calibrate grain.threshold_db from those numbers, then:
@@ -136,13 +215,14 @@ EOF
 main() {
   local stages=("$@")
   if [[ ${#stages[@]} -eq 0 ]]; then
-    stages=(deps ffmpeg svtav1 av1an grav1synth verify)
+    stages=(deps ffmpeg svtav1 vapoursynth av1an grav1synth verify)
   fi
   for stage in "${stages[@]}"; do
     case "$stage" in
       deps)       stage_deps ;;
       ffmpeg)     stage_ffmpeg ;;
       svtav1)     stage_svtav1 ;;
+      vapoursynth) stage_vapoursynth ;;
       av1an)      stage_av1an ;;
       grav1synth) stage_grav1synth ;;
       verify)     stage_verify ;;
