@@ -1,0 +1,126 @@
+# autotranscode configuration.
+#
+# Every value below is a default; delete anything you do not want to change.
+# Start from a machine profile, then override only what differs.
+#
+#   autotranscode -c ~/.config/autotranscode.toml doctor
+#   autotranscode -c ~/.config/autotranscode.toml measure /media/films/*.mkv
+#   autotranscode -c ~/.config/autotranscode.toml run /media/films
+
+[machine]
+# "rk3588"      Rockchip boards. No AV1 hardware encoder exists, so SVT-AV1 runs on
+#               the CPU; defaults to preset 8 / crf 32 / 2 workers.
+# "workstation" many fast cores; preset 4 / crf 28.
+# "generic"     conservative middle ground.
+profile = "rk3588"
+
+# Av1an parallel workers. 0 lets Av1an choose from core count. On RK3588 more than
+# 2 usually thrashes memory bandwidth and makes throughput worse, not better.
+workers = 2
+
+# Hardware-accelerated *decoding* for the analysis and muxing passes.
+# "auto" | "rkmpp" | "vaapi" | "qsv" | "none".
+# NOTE: this does not speed up the encode. Av1an decodes chunks itself and gives us
+# no hook to inject hwaccel flags, so this only helps the passes we run directly.
+hwaccel_decode = "rkmpp"
+
+# Scheduling priority, so an unattended crawl leaves the board usable.
+nice = 10
+
+[paths]
+# Leave as "ffmpeg"/"ffprobe" to auto-detect jellyfin-ffmpeg in its usual locations
+# before falling back to PATH. jellyfin-ffmpeg is strongly preferred: it ships
+# libvmaf and rkmpp/rkrga, which distribution builds generally do not.
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+av1an = "av1an"
+grav1synth = "grav1synth"
+mkvmerge = "mkvmerge"
+
+# Scratch space. The grain analysis writes short lossless excerpts here, which are
+# large for their duration; allow a few GiB (more for 4K).
+work_dir = "~/.cache/autotranscode"
+state_file = "~/.cache/autotranscode/state.json"
+
+[encode]
+preset = 8          # SVT-AV1 preset, -1 (slowest) .. 13. Each step is ~1.5-2x speed.
+crf = 32            # 1..70. Lower is higher quality and bigger.
+pix_format = "yuv420p10le"   # 10-bit even from 8-bit sources: cheap, and avoids banding.
+tune = 0            # 0 = VQ (subjective quality), 2 = SSIM. Use 0 for watching.
+variance_boost_strength = 2  # 1 mild .. 4 aggressive; helps dark and flat areas.
+ac_bias = 0.0       # 0..8. Above 0 preserves texture and residual grain. Try 0.5-1.0.
+keyint_sec = 10.0   # Keyframe interval in seconds.
+
+# "hybrid" is the right choice without VapourSynth. lsmash/ffms2/bestsource are more
+# accurate but need VapourSynth plugins installed.
+chunk_method = "hybrid"
+concat = "mkvmerge"          # mkvmerge avoids ffmpeg's occasional audio-seek breakage.
+sc_method = "standard"       # "fast" is cheaper but cuts scenes worse.
+extra_split_sec = 10
+min_scene_len = 24
+
+# Anything extra handed straight to SvtAv1EncApp, e.g. ["--enable-overlays", "1"].
+extra_svt_params = []
+
+[target_quality]
+# Let Av1an search per-chunk for the CRF that hits a quality score. Much more
+# consistent than a fixed CRF, but multiplies encode time by the probe count.
+# On RK3588 this is usually not worth it; leave it off and tune crf instead.
+enabled = false
+metric = "vmaf"              # vmaf | ssimulacra2 | butteraugli-inf | xpsnr
+score = 94.0
+min_q = 18
+max_q = 48
+probes = 4
+probing_speed = "veryfast"
+
+[grain]
+# "auto"   measure each file and take the grain route only when it is grainy
+# "always" force the grain route
+# "never"  plain encode, no denoising and no synthesis
+mode = "auto"
+
+# "sampled" analyses a few short excerpts (fast, modest disk use).
+# "full" analyses the entire film: more faithful, but needs lossless scratch space
+# proportional to the whole runtime. Expect tens of GiB.
+analysis = "sampled"
+samples = 4
+sample_seconds = 2
+
+denoise_filter = "hqdn3d"
+denoise_strength = "auto"    # "auto" picks from the measured score; or set e.g. "hqdn3d=1.4:1.0:6:6"
+
+# Mean PSNR in dB between a file and a reference-denoised copy of itself. Lower means
+# more grain. Files scoring BELOW this take the denoise + grain-synthesis route.
+#
+# CALIBRATE THIS. The default came from synthetic test patterns, which score higher
+# than real footage. Run `autotranscode measure` over a handful of titles you know to
+# be clean and a handful you know to be grainy, and put the threshold between them.
+threshold_db = 44.0
+
+chroma = false               # also synthesise grain on chroma planes
+keep_table = true            # keep the generated .tbl next to the work dir for inspection
+
+[audio]
+# "smart" copies already-efficient tracks and re-encodes wasteful ones (TrueHD, DTS,
+# PCM) to Opus. "copy" never re-encodes. "opus" always re-encodes.
+mode = "smart"
+opus_kbps_per_channel = 64   # 5.1 -> 384k
+passthrough_codecs = ["opus", "aac", "ac3", "eac3", "flac", "mp3"]
+max_channels = 0             # 0 keeps the source layout; 2 forces a stereo downmix
+
+[subtitles]
+mode = "copy"                # copy | none | text-only (drops PGS/VobSub bitmaps)
+
+[output]
+suffix = ".av1"              # movie.mkv -> movie.av1.mkv
+container = "mkv"
+directory = ""               # empty writes next to the source
+min_saving_percent = 10.0    # discard the result if it saves less than this
+replace_source = false       # true deletes the original after a successful encode
+
+[library]
+extensions = [".mkv", ".mp4", ".m4v", ".avi", ".ts", ".mov", ".webm", ".wmv"]
+skip_codecs = ["av1"]        # do not re-encode what is already AV1
+min_duration_sec = 60.0      # ignore clips and samples
+recursive = true

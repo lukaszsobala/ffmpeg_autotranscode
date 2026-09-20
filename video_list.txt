@@ -1,7 +1,0 @@
-# List of video files to transcode
-# One file path per line, absolute paths recommended
-# Lines starting with # are ignored
-
-# Example:
-# /path/to/video1.mkv
-# /path/to/video2.mp4

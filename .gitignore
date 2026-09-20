@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+*.tbl
+*.log
+state.json
+
+# Local handoff notes, transferred out of band
+HANDOFF-RK3588.md

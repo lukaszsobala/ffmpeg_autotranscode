@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autotranscode"
+version = "0.1.0"
+description = "AV1 library transcoder built on Av1an, SVT-AV1, grav1synth and jellyfin-ffmpeg"
+readme = "README.md"
+requires-python = ">=3.11"          # tomllib
+license = "MIT"
+dependencies = []                    # stdlib only; the heavy lifting is external binaries
+
+[project.scripts]
+autotranscode = "autotranscode.cli:main"
+
+[tool.setuptools]
+packages = ["autotranscode"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
