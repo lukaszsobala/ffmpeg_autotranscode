@@ -16,7 +16,7 @@ from typing import Any
 # RK3588 has no AV1 encoder at all (decode only), so SVT-AV1 runs on 4xA76 + 4xA55.
 PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     "rk3588": {
-        "machine": {"workers": 2, "hwaccel_decode": "rkmpp"},
+        "machine": {"workers": 2},
         # Measured on a ROCK 5B, 1080p, 150 frames, these settings: preset 8 = 30.6 fps,
         # 6 = 13.7, 4 = 6.6, 3 = 4.4, 2 = 2.6. Bitstream against preset 8: -17.3% at 6,
         # -29.0% at 4, -30.4% at 3, -34.9% at 2. Preset 4 takes 83% of the total
@@ -30,7 +30,7 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     },
     "generic": {},
     "workstation": {
-        "machine": {"workers": 0, "hwaccel_decode": "auto"},
+        "machine": {"workers": 0},
         "encode": {"preset": 4, "crf": 28, "chunk_method": "hybrid"},
         "grain": {"samples": 6, "sample_seconds": 3},
     },
@@ -53,7 +53,6 @@ class Paths:
 class Machine:
     profile: str = "generic"
     workers: int = 0  # 0 => let Av1an decide
-    hwaccel_decode: str = "auto"  # auto | rkmpp | vaapi | qsv | none
     nice: int = 10
 
 

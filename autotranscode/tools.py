@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Config
-from .util import CommandError, log, run
+from .util import CommandError, run
 
 # Preferred locations for jellyfin-ffmpeg, in order. Falls back to PATH.
 JELLYFIN_FFMPEG_DIRS = (
@@ -39,6 +39,8 @@ class Toolchain:
     svtav1_version: str = ""
     av1an_version: str = ""
 
+    # Reported by `doctor` to identify the ffmpeg build; nothing here consumes it.
+    # See "Why there is no hardware acceleration" in the README before wiring it up.
     hwaccels: set[str] = field(default_factory=set)
     filters: set[str] = field(default_factory=set)
     encoders: set[str] = field(default_factory=set)
@@ -78,34 +80,6 @@ class Toolchain:
     def has_dovi_tonemap(self) -> bool:
         """tonemapx reshapes Dolby Vision profile 5 on the CPU; libplacebo needs a GPU."""
         return "tonemapx" in self.filters
-
-    def hwaccel_args(self, requested: str) -> list[str]:
-        """FFmpeg flags for hardware-accelerated *decode*.
-
-        Decode only, deliberately: no Rockchip SoC can encode AV1, and even on Intel
-        the hardware AV1 encoder is well below SVT-AV1 at these bitrates.
-        """
-        if requested == "none":
-            return []
-        if requested == "auto":
-            for candidate in ("rkmpp", "vaapi", "qsv"):
-                if candidate in self.hwaccels:
-                    requested = candidate
-                    break
-            else:
-                return []
-        if requested not in self.hwaccels:
-            log.warning("hwaccel %r not available in this ffmpeg; decoding on CPU", requested)
-            return []
-        if requested == "rkmpp":
-            # Download frames back to system memory: our filters are all CPU-side.
-            return ["-init_hw_device", "rkmpp=rk", "-hwaccel", "rkmpp",
-                    "-hwaccel_output_format", "drm_prime"]
-        if requested == "vaapi":
-            return ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-        if requested == "qsv":
-            return ["-hwaccel", "qsv"]
-        return []
 
 
 def _which(candidate: str) -> str | None:
@@ -244,6 +218,7 @@ def describe(chain: Toolchain) -> str:
         f"ac-bias     {'yes' if '--ac-bias' in chain.svt_options else 'no'}",
         f"dovi p5     {'yes' if chain.has_dovi_tonemap else 'no'}  "
         "(tonemapx, for profile 5 -> SDR)",
-        f"hwaccels    {', '.join(sorted(chain.hwaccels)) or 'none'}",
+        f"hwaccels    {', '.join(sorted(chain.hwaccels)) or 'none'}  "
+        "(this build's decoders; unused -- the encode is CPU-only)",
     ]
     return "\n".join(lines)

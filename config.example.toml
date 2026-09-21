@@ -18,12 +18,6 @@ profile = "rk3588"
 # 2 usually thrashes memory bandwidth and makes throughput worse, not better.
 workers = 2
 
-# Hardware-accelerated *decoding* for the analysis and muxing passes.
-# "auto" | "rkmpp" | "vaapi" | "qsv" | "none".
-# NOTE: this does not speed up the encode. Av1an decodes chunks itself and gives us
-# no hook to inject hwaccel flags, so this only helps the passes we run directly.
-hwaccel_decode = "rkmpp"
-
 # Scheduling priority, so an unattended crawl leaves the board usable.
 nice = 10
 

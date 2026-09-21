@@ -8,7 +8,7 @@ tools that already do the hard parts well:
 | [Av1an](https://github.com/rust-av/Av1an) | Scene detection, chunking, parallel workers, resume, optional target-quality search |
 | [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) 4.x | The encoder (`SvtAv1EncApp`) |
 | [grav1synth](https://github.com/rust-av/grav1synth) | Derives a film grain table from the source and writes it into the AV1 bitstream |
-| [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) 8 | Probing, denoising, muxing; brings `libvmaf` and Rockchip `rkmpp`/`rkrga` |
+| [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) 8 | Probing, denoising, muxing, and `tonemapx` — the only CPU path from Dolby Vision profile 5 to SDR |
 
 This repository contributes only the policy layer: what to encode, how grainy it is,
 which audio to keep, and what to do when a step fails.
@@ -64,6 +64,37 @@ source.mkv
 
 Denoising happens *inside* Av1an's chunk pipeline, so no full-size intermediate is
 ever written. Only the short analysis excerpts touch the disk as lossless files.
+
+## Why there is no hardware acceleration
+
+Worth stating plainly, because the hardware looks like it should help and does not.
+
+**The RK3588 cannot encode AV1.** Its video engine encodes H.264, HEVC and MJPEG;
+AV1 is decode-only. The ten-hour part of this job therefore has no hardware path on
+this silicon, through any software. SVT-AV1 on the A76 cores is the only option.
+
+That leaves decode, which the hardware does superbly — 60s of 1080p H.264 on a
+ROCK 5B:
+
+| | wall | CPU time | throughput |
+|---|---|---|---|
+| CPU, all cores | 3.45s | 20.1s | 417 fps |
+| CPU, one thread | 12.5s | 12.8s | 115 fps |
+| `rkmpp` | 1.65s | 0.37s | 876 fps |
+
+It is not worth reaching for. At preset 4 the encoder spends 151 ms per frame
+against 8.7 ms for single-threaded CPU decode, so decode is about 6% of the work,
+and Av1an offers no way to claim it: the string `hwaccel` does not appear anywhere
+in av1an-core 0.5.2. The only ffmpeg passes this project runs itself are the grain
+probe and table build, which decode about eight seconds of video per film.
+
+A `machine.hwaccel_decode` option used to exist here. It was never read by
+anything, and its removal changed no behaviour. `doctor` still lists the build's
+decoders, because that is a useful way to confirm you have a Rockchip-enabled
+ffmpeg — not because they are used.
+
+jellyfin-ffmpeg still earns its place: `tonemapx` is in Jellyfin's fork and not
+upstream, and it is what makes Dolby Vision profile 5 transcodable at all here.
 
 ## Install
 
