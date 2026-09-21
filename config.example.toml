@@ -183,7 +183,11 @@ mode = "copy"                # copy | none | text-only (drops PGS/VobSub bitmaps
 suffix = ".av1"              # movie.mkv -> movie.av1.mkv
 container = "mkv"
 directory = ""               # empty writes next to the source
-min_saving_percent = 10.0    # discard the result if it saves less than this
+# Percent, not a fraction: 10.0 means "must be at least 10% smaller than the
+# source". Below it the encode is deleted and the file recorded as skipped, on the
+# grounds that a marginal saving is not worth a re-encode generation. Set 0.0 to
+# keep every result.
+min_saving_percent = 10.0
 replace_source = false       # true deletes the original after a successful encode
 
 [library]
