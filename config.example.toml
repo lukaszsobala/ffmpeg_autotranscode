@@ -9,14 +9,18 @@
 
 [machine]
 # "rk3588"      Rockchip boards. No AV1 hardware encoder exists, so SVT-AV1 runs on
-#               the CPU; defaults to preset 4 / crf 32 / 2 workers.
+#               the CPU; defaults to preset 4 / crf 32 / 1 worker.
 # "workstation" many fast cores; preset 4 / crf 28.
 # "generic"     conservative middle ground.
 profile = "rk3588"
 
-# Av1an parallel workers. 0 lets Av1an choose from core count. On RK3588 more than
-# 2 usually thrashes memory bandwidth and makes throughput worse, not better.
-workers = 2
+# Av1an parallel workers. 0 lets Av1an choose from core count.
+#
+# On RK3588 use 1. The binding constraint is memory, not cores: at 4K 10-bit a
+# single SVT-AV1 instance is already several GB, and two of them drive a 16 GB
+# board into swap. What you see then is not an out-of-memory message but a chunk
+# failing with "Failed to read y4m frame delimeter" as its source pipe dies.
+workers = 1
 
 # Scheduling priority, so an unattended crawl leaves the board usable.
 nice = 10

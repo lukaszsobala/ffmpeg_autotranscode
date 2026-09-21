@@ -16,7 +16,11 @@ from typing import Any
 # RK3588 has no AV1 encoder at all (decode only), so SVT-AV1 runs on 4xA76 + 4xA55.
 PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     "rk3588": {
-        "machine": {"workers": 2},
+        # One worker, not two. The limit is memory, not cores: two SVT-AV1
+        # instances on a 4K 10-bit source exhaust a 16 GB board and push it into
+        # swap, where a chunk's source pipe dies and Av1an reports only "Failed to
+        # read y4m frame delimeter". Four A76 cores keep one worker busy anyway.
+        "machine": {"workers": 1},
         # Measured on a ROCK 5B, 1080p, 150 frames, these settings: preset 8 = 30.6 fps,
         # 6 = 13.7, 4 = 6.6, 3 = 4.4, 2 = 2.6. Bitstream against preset 8: -17.3% at 6,
         # -29.0% at 4, -30.4% at 3, -34.9% at 2. Preset 4 takes 83% of the total

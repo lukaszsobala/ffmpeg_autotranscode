@@ -96,7 +96,7 @@ class TestConfig(unittest.TestCase):
             cfg = config.load(path)
             self.assertEqual(cfg.encode.preset, 4)   # from the rk3588 profile
             self.assertEqual(cfg.encode.crf, 25)     # overridden by the file
-            self.assertEqual(cfg.machine.workers, 2)
+            self.assertEqual(cfg.machine.workers, 1)
 
     def test_unknown_keys_and_sections_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
