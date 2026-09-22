@@ -17,9 +17,9 @@ from typing import Any
 PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     "rk3588": {
         # One worker, not two. The limit is memory, not cores: two SVT-AV1
-        # instances on a 4K 10-bit source exhaust a 16 GB board and push it into
-        # swap, where a chunk's source pipe dies and Av1an reports only "Failed to
-        # read y4m frame delimeter". Four A76 cores keep one worker busy anyway.
+        # instances on a 4K 10-bit source push a 16 GB board into swap. SVT-AV1
+        # already spreads one 4K encode across the cores, so a second worker
+        # buys nothing: one managed 3.6-4.3 fps, two 1.4-1.9 fps each.
         "machine": {"workers": 1},
         # Measured on a ROCK 5B, 1080p, 150 frames, these settings: preset 8 = 30.6 fps,
         # 6 = 13.7, 4 = 6.6, 3 = 4.4, 2 = 2.6. Bitstream against preset 8: -17.3% at 6,

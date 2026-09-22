@@ -787,3 +787,29 @@ class TestLocaleGuard(unittest.TestCase):
             locale.setlocale(locale.LC_ALL, forced)
         finally:
             locale.setlocale(locale.LC_ALL, previous)
+
+
+class TestFfmpegShim(unittest.TestCase):
+    """Av1an's chunk pipes must get exactly the frames it counted, no CFR padding."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        # A stand-in "real ffmpeg" that prints the argv it was given, one per line.
+        self.fake = self.dir / "real ffmpeg"
+        self.fake.write_text('#!/bin/sh\nfor a do printf "%s\\n" "$a"; done\n')
+        self.fake.chmod(0o755)
+        encode.write_ffmpeg_shim(self.dir / "bin", str(self.fake))
+
+    def argv_seen(self, *args: str) -> list[str]:
+        return util.run([str(self.dir / "bin" / "ffmpeg"), *args]).stdout.splitlines()
+
+    def test_y4m_pipe_gets_passthrough_just_before_the_output(self):
+        chunk = ["-y", "-i", "seg 0.mkv", "-vf", r"select=between(n\,210\,446)",
+                 "-pix_fmt", "yuv420p10le", "-strict", "-1", "-f", "yuv4mpegpipe", "-"]
+        self.assertEqual(self.argv_seen(*chunk), [*chunk[:-1], "-fps_mode", "passthrough", "-"])
+
+    def test_anything_else_passes_through_untouched(self):
+        other = ["-hide_banner", "-i", "a b.mkv", "-map", "0:v", "-c", "copy", "out.mkv"]
+        self.assertEqual(self.argv_seen(*other), other)

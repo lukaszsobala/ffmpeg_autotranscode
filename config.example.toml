@@ -18,8 +18,7 @@ profile = "rk3588"
 #
 # On RK3588 use 1. The binding constraint is memory, not cores: at 4K 10-bit a
 # single SVT-AV1 instance is already several GB, and two of them drive a 16 GB
-# board into swap. What you see then is not an out-of-memory message but a chunk
-# failing with "Failed to read y4m frame delimeter" as its source pipe dies.
+# board into swap, while one worker already keeps the cores busy.
 workers = 1
 
 # Scheduling priority, so an unattended crawl leaves the board usable.

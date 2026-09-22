@@ -7,6 +7,8 @@ source properties into correct flags for Av1an and SvtAv1EncApp.
 
 from __future__ import annotations
 
+import os
+import shlex
 from pathlib import Path
 
 from .config import Config
@@ -192,5 +194,49 @@ def run_encode(argv: list[str], cfg: Config, chain: Toolchain, dry_run: bool = F
     """
     if cfg.machine.nice > 0:
         argv = ["nice", "-n", str(cfg.machine.nice), *argv]
+    shim_dir = [] if dry_run else [str(write_ffmpeg_shim(cfg.work_dir / "bin", chain.ffmpeg))]
     log.info("encoding (this is the long part)")
-    run(argv, capture=False, dry_run=dry_run, extra_path=chain.bin_dirs)
+    run(argv, capture=False, dry_run=dry_run, extra_path=[*shim_dir, *chain.bin_dirs])
+
+
+# Av1an 0.5.2 (and master as of 2026-09) cuts each chunk out of a split segment
+# with `ffmpeg -vf select=between(n,a,b) -f yuv4mpegpipe -` and no -fps_mode, so
+# ffmpeg converts the selection to constant frame rate. On a 23.976 fps Matroska
+# source with millisecond timestamps that conversion duplicates a frame: the
+# encoder receives 238 frames for a 237-frame chunk, and Av1an rejects the chunk
+# with "FRAME MISMATCH" -- three times, then gives up on the whole file.
+# Passthrough hands over exactly the decoded frames, which is how Av1an counts.
+FFMPEG_SHIM = """\
+#!/bin/sh
+# Written by autotranscode; see FFMPEG_SHIM in autotranscode/encode.py.
+real={real}
+case " $* " in
+  *" yuv4mpegpipe "*) ;;
+  *) exec "$real" "$@" ;;
+esac
+# Insert "-fps_mode passthrough" just before the output, the last argument.
+last=$#
+i=0
+for arg do
+  i=$((i + 1))
+  [ "$i" -eq 1 ] && set --
+  [ "$i" -eq "$last" ] && set -- "$@" -fps_mode passthrough
+  set -- "$@" "$arg"
+done
+exec "$real" "$@"
+"""
+
+
+def write_ffmpeg_shim(directory: Path, real_ffmpeg: str) -> Path:
+    """Write an `ffmpeg` wrapper into `directory` and return the directory.
+
+    Put first on Av1an's PATH, it stands in for ffmpeg in every y4m pipe Av1an
+    opens and execs the real binary for everything else.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    shim = directory / "ffmpeg"
+    part = directory / "ffmpeg.part"
+    part.write_text(FFMPEG_SHIM.format(real=shlex.quote(str(Path(real_ffmpeg).resolve()))))
+    part.chmod(0o755)
+    os.replace(part, shim)
+    return directory

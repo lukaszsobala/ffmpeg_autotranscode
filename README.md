@@ -132,6 +132,18 @@ importing the locales of whatever machine you are connecting *from*, so unsettin
 them on the client is the tidiest fix; `sudo dpkg-reconfigure locales` on the board
 works too.
 
+### Why Av1an's `ffmpeg` is a wrapper script
+
+Av1an cuts each chunk with `ffmpeg -vf select=between(n,a,b) -f yuv4mpegpipe -`
+and no `-fps_mode`, so ffmpeg pads the selection to constant frame rate. On a
+23.976 fps Matroska source that duplicates a frame, and Av1an rejects the chunk
+with `FRAME MISMATCH: chunk 1: 238/237` — three times, then the whole file fails.
+The encode therefore runs with `<work_dir>/bin/ffmpeg` first on Av1an's PATH: a
+few lines of shell that add `-fps_mode passthrough` to y4m pipes and hand
+everything else to the real ffmpeg unchanged. The `Failed to read y4m frame
+delimeter` line printed alongside is not an error; it is SVT-AV1 reaching the end
+of its input while it is still encoding the frames it has read ahead.
+
 ## Use
 
 ```bash
