@@ -305,12 +305,41 @@ Set `dolby_vision.mode = "skip"` to leave every DV title alone.
 read from the source and passed to the encoder, so what a DV title loses is the
 per-shot dynamic metadata, not the whole HDR grade.
 
+## Quality scales with resolution
+
+CRF is a quality target per *coded pixel*, and a pixel is not a fixed amount of
+screen: at 576p each one is magnified several times more than at 2160p. Hold CRF
+constant across a mixed library and the small files come out looking the worst,
+which is the usual reason people conclude AV1 is weak at low resolution.
+
+`encode.crf` is therefore the value for a 1080p source, and `encode.crf_by_width`
+shifts it per band. With the default ladder and the rk3588 profile's anchor of 30:
+
+| source | CRF |
+|---|---|
+| 4K | 32 |
+| 1080p | 30 |
+| 720p | 27 |
+| 576p and below | 24 |
+
+`--crf` still moves everything at once, because it sets the anchor the ladder
+shifts from. Bands are keyed by **width**: a scope film is cropped to its picture,
+so a 4K print can be 3840x1600 or 3836x2072, and keying on height would file it as
+1080p and under-encode it. Empty the table to go back to one CRF for everything.
+
 ## What it refuses to do
 
 - **Dolby Vision profile 5**, unless you opt into SDR conversion (above).
 - Files already in AV1, clips shorter than `library.min_duration_sec`, and any result
   that saves less than `output.min_saving_percent` (the output is deleted and the file
   is marked skipped).
+- **Sources already below `library.min_bits_per_pixel`** (bitrate / (width x height x
+  fps)). These are close to what AV1 itself would spend, so an encode costs hours and
+  saves little — and `min_saving_percent` only finds that out afterwards, having spent
+  the time. The default of 0.03 is deliberately low, so it rejects the hopeless rather
+  than the merely unattractive: a 4K HDR remux measures ~0.15, a 1080p web release
+  ~0.08, a good 4K AV1 encode ~0.01. A source whose bitrate cannot be read is never
+  skipped on this rule.
 - `output.replace_source` deletes originals and is **off** by default.
 
 ## Testing

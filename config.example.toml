@@ -9,7 +9,7 @@
 
 [machine]
 # "rk3588"      Rockchip boards. No AV1 hardware encoder exists, so SVT-AV1 runs on
-#               the CPU; defaults to preset 4 / crf 32 / 1 worker.
+#               the CPU; defaults to preset 4 / crf 30 / 1 worker.
 # "workstation" many fast cores; preset 4 / crf 28.
 # "generic"     conservative middle ground.
 profile = "rk3588"
@@ -45,7 +45,8 @@ state_file = "~/.cache/autotranscode/state.json"
 
 [encode]
 preset = 4          # SVT-AV1 preset, -1 (slowest) .. 13. Each step is ~1.5-2.2x speed.
-crf = 32            # 1..70. Lower is higher quality and bigger.
+crf = 30            # 1..70. Lower is higher quality and bigger. This is the
+                    # value for a 1080p source; crf_by_width shifts it elsewhere.
 pix_format = "yuv420p10le"   # 10-bit even from 8-bit sources: cheap, and avoids banding.
 tune = 0            # 0 = VQ (subjective quality), 2 = SSIM. Use 0 for watching.
 variance_boost_strength = 2  # 1 mild .. 4 aggressive; helps dark and flat areas.
@@ -67,6 +68,21 @@ min_scene_len = 24
 
 # Anything extra handed straight to SvtAv1EncApp, e.g. ["--enable-overlays", "1"].
 extra_svt_params = []
+
+# CRF is a quality target per coded pixel, and it is not resolution-neutral: a
+# pixel at 576p is magnified far more on the same screen than one at 2160p, so a
+# single CRF across a mixed library makes the small files look the worst. These
+# are shifts applied to `crf` above, keyed by the smallest width in each band.
+# Delete the table to encode everything at one CRF.
+#
+# Keyed by width, with slack, because a scope film is cropped to its picture: a
+# 4K print can be 3840x1600 or 3836x2072, and keying on height would file it as
+# 1080p and under-encode it. Cropping removes bars top and bottom, not the sides.
+[encode.crf_by_width]
+3000 = 2            # 4K. crf 32 with the default anchor; measured transparent on 4K HDR.
+1700 = 0            # 1080p
+1100 = -3           # 720p
+0 = -6              # 576p and below
 
 [target_quality]
 # Let Av1an search per-chunk for the CRF that hits a quality score. Much more
@@ -197,4 +213,11 @@ replace_source = false       # true deletes the original after a successful enco
 extensions = [".mkv", ".mp4", ".m4v", ".avi", ".ts", ".mov", ".webm", ".wmv"]
 skip_codecs = ["av1"]        # do not re-encode what is already AV1
 min_duration_sec = 60.0      # ignore clips and samples
+
+# Skip sources that are already efficient, measured in bits per pixel per second
+# (bitrate / (width * height * fps)). Re-encoding these costs hours and saves
+# little, and min_saving_percent only discovers that after the encode. For scale:
+# a 4K HDR remux is ~0.15, a 1080p web release ~0.08, a good 4K AV1 encode ~0.01.
+# Set 0 to check nothing. A source whose bitrate cannot be read is never skipped.
+min_bits_per_pixel = 0.03
 recursive = true

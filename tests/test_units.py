@@ -813,3 +813,77 @@ class TestFfmpegShim(unittest.TestCase):
     def test_anything_else_passes_through_untouched(self):
         other = ["-hide_banner", "-i", "a b.mkv", "-map", "0:v", "-c", "copy", "out.mkv"]
         self.assertEqual(self.argv_seen(*other), other)
+
+
+class TestCrfLadder(unittest.TestCase):
+    """CRF is per coded pixel, so the same number means less quality as size drops."""
+
+    def setUp(self):
+        self.cfg = config.Config()
+        self.cfg.encode.crf = 30
+
+    def crf_at(self, width: int, height: int = 1080) -> int:
+        return encode.effective_crf(make_info(width=width, height=height), self.cfg)
+
+    def test_each_band_shifts_from_the_1080p_anchor(self):
+        widths = (3840, 2560, 1920, 1280, 854, 640)
+        self.assertEqual([self.crf_at(w) for w in widths], [32, 30, 30, 27, 24, 24])
+
+    def test_a_cropped_scope_print_is_still_its_real_resolution(self):
+        # The case that motivated keying on width: both of these are 4K sources
+        # cropped to the picture, and their heights would file them as 1080p.
+        self.assertEqual(self.crf_at(3836, height=2072), 32)
+        self.assertEqual(self.crf_at(3840, height=1600), 32)
+        # And the same crop one rung down stays 1080p rather than dropping to 720p.
+        self.assertEqual(self.crf_at(1920, height=800), 30)
+
+    def test_the_anchor_moves_the_whole_ladder(self):
+        # One knob still controls the library: --crf 28 lowers every band by 2.
+        self.cfg.encode.crf = 28
+        self.assertEqual([self.crf_at(w) for w in (3840, 1920, 1280)], [30, 28, 25])
+
+    def test_an_empty_ladder_uses_the_plain_crf(self):
+        self.cfg.encode.crf_by_width = {}
+        self.assertEqual([self.crf_at(w) for w in (3840, 854)], [30, 30])
+
+    def test_rk3588_profile_still_puts_4k_at_the_measured_32(self):
+        cfg = config.Config()
+        config._merge_profile(cfg, "rk3588")
+        self.assertEqual(encode.effective_crf(make_info(width=3836, height=2072), cfg), 32)
+
+    def test_a_ladder_that_leaves_the_valid_range_is_rejected(self):
+        self.cfg.encode.crf = 68
+        self.cfg.encode.crf_by_width = {"0": 5}
+        with self.assertRaises(config.ConfigError):
+            config.validate(self.cfg)
+
+    def test_ladder_keys_must_be_widths(self):
+        self.cfg.encode.crf_by_width = {"wide": 1}
+        with self.assertRaises(config.ConfigError):
+            config.validate(self.cfg)
+
+
+class TestEfficiencyPrefilter(unittest.TestCase):
+    """Reject the hopeless before the encode, not after it burns an evening."""
+
+    def setUp(self):
+        self.cfg = config.Config()
+
+    def check(self, **overrides) -> None:
+        pipeline.check_skip(make_info(**overrides), Path("/out/x.mkv"), self.cfg)
+
+    def test_an_already_efficient_source_is_skipped(self):
+        # 720p at 500 kbps: 0.023 bits/pixel, near what AV1 itself would spend.
+        with self.assertRaisesRegex(pipeline.SkipFile, "bits/pixel"):
+            self.check(width=1280, height=720, video_bitrate=500_000)
+
+    def test_a_fat_source_passes(self):
+        self.check(width=1280, height=720, video_bitrate=4_000_000)
+
+    def test_an_unreadable_bitrate_is_not_evidence(self):
+        # 0 means ffprobe gave us nothing, which must not be read as "efficient".
+        self.check(video_bitrate=0)
+
+    def test_the_check_can_be_turned_off(self):
+        self.cfg.library.min_bits_per_pixel = 0.0
+        self.check(width=1280, height=720, video_bitrate=500_000)

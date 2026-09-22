@@ -214,9 +214,10 @@ def main(argv: list[str] | None = None) -> int:
         log.error("no media files found")
         return 1
 
-    log.info("%d file(s) queued, profile=%s preset=%d crf=%d grain=%s",
-             len(sources), cfg.machine.profile, cfg.encode.preset,
-             cfg.encode.crf, cfg.grain.mode)
+    crf = f"{cfg.encode.crf} at 1080p, by resolution" if cfg.encode.crf_by_width \
+        else str(cfg.encode.crf)
+    log.info("%d file(s) queued, profile=%s preset=%d crf=%s grain=%s",
+             len(sources), cfg.machine.profile, cfg.encode.preset, crf, cfg.grain.mode)
 
     ledger = Ledger(cfg.state_path)
     try:

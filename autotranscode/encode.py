@@ -69,6 +69,26 @@ def effective_color(info: MediaInfo, cfg: Config) -> tuple[str, str, str]:
     return info.color_primaries, info.color_transfer, info.color_space
 
 
+def effective_crf(info: MediaInfo, cfg: Config) -> int:
+    """`encode.crf` shifted for the source's resolution.
+
+    A CRF is a quality target per coded pixel, and a pixel at 576p is magnified
+    several times more on the same screen than one at 2160p, so holding CRF
+    constant across a library means the small files look the worst. The ladder in
+    `encode.crf_by_width` corrects for that; `encode.crf` remains the one knob
+    that moves everything, and the 1080p band is what it means literally.
+
+    Bands are keyed by width because a scope film arrives cropped to its picture:
+    3836x2072 is a 4K source whose height would file it as 1080p.
+    """
+    ladder = cfg.encode.crf_by_width
+    if not ladder:
+        return cfg.encode.crf
+    bands = sorted((int(width) for width in ladder), reverse=True)
+    band = next((width for width in bands if info.width >= width), bands[-1])
+    return max(1, min(70, cfg.encode.crf + ladder[str(band)]))
+
+
 def svt_params(
     info: MediaInfo, cfg: Config, chain: Toolchain, crf: int | None = None
 ) -> list[str]:
@@ -76,7 +96,7 @@ def svt_params(
     enc = cfg.encode
     params: list[str] = [
         "--preset", str(enc.preset),
-        "--crf", str(crf if crf is not None else enc.crf),
+        "--crf", str(crf if crf is not None else effective_crf(info, cfg)),
         "--tune", str(enc.tune),
         "--variance-boost-strength", str(enc.variance_boost_strength),
     ]

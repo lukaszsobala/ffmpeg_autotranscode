@@ -28,7 +28,9 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         # it costs 1.5x preset 4 for 1.9%, because the only tools it adds are the
         # self-guided restoration filter and the full PD0 path. Preset 2 is the next
         # real step (4x4 blocks and compound inter prediction), at ~22h per 2h film.
-        "encode": {"preset": 4, "crf": 32, "chunk_method": "hybrid"},
+        # crf 30 is the 1080p anchor; the resolution ladder puts 4K at 32, which is
+        # the value measured transparent on a 4K HDR source (50.8 dB luma PSNR).
+        "encode": {"preset": 4, "crf": 30, "chunk_method": "hybrid"},
         "grain": {"samples": 4, "sample_seconds": 2},
         "target_quality": {"enabled": False},
     },
@@ -63,7 +65,21 @@ class Machine:
 @dataclass(slots=True)
 class Encode:
     preset: int = 6
+    # The CRF for a 1080p source. Other resolutions shift from it by crf_by_width,
+    # so this one number still moves the whole library's quality.
     crf: int = 30
+    # CRF is not resolution-neutral: a coded pixel at 576p covers far more of the
+    # screen than one at 2160p, so the same CRF looks progressively worse the
+    # smaller the source. Keys are the smallest width in each band, values the
+    # shift applied to `crf` there. An empty table disables the ladder.
+    #
+    # Width, not height, and with slack below each nominal size: a scope film is
+    # cropped to its picture, so a 4K print is 3840x1600 or even 3836x2072, and a
+    # height-keyed ladder would file it as 1080p and under-encode it. Cropping
+    # takes the bars off the top and bottom, so width is what stays put.
+    crf_by_width: dict[str, int] = field(
+        default_factory=lambda: {"3000": 2, "1700": 0, "1100": -3, "0": -6}
+    )
     pix_format: str = "yuv420p10le"
     tune: int = 0  # 0=VQ (subjective), 2=SSIM
     variance_boost_strength: int = 2
@@ -174,6 +190,13 @@ class Library:
     )
     skip_codecs: list[str] = field(default_factory=lambda: ["av1"])
     min_duration_sec: float = 60.0
+    # Bits per pixel per second: bitrate / (width * height * fps). A source already
+    # below this is close to what AV1 would spend anyway, so an encode would cost
+    # hours to save little -- and `min_saving_percent` only notices that afterwards.
+    # Deliberately low: it rejects the hopeless, not the merely unattractive.
+    # 0 disables the check. For scale, a 4K HDR remux is ~0.15, a 1080p web
+    # release ~0.08, and a good 4K AV1 encode ~0.01.
+    min_bits_per_pixel: float = 0.03
     recursive: bool = True
 
 
@@ -275,6 +298,16 @@ def validate(cfg: Config) -> None:
         raise ConfigError("encode.preset must be between -1 and 13")
     if not 1 <= cfg.encode.crf <= 70:
         raise ConfigError("encode.crf must be between 1 and 70 (SVT-AV1 range)")
+    for width, shift in cfg.encode.crf_by_width.items():
+        if not str(width).isdigit():
+            raise ConfigError(f"encode.crf_by_width keys must be widths; got '{width}'")
+        if not 1 <= cfg.encode.crf + shift <= 70:
+            raise ConfigError(
+                f"encode.crf_by_width['{width}'] puts CRF outside 1-70 "
+                f"(encode.crf {cfg.encode.crf} {shift:+d})"
+            )
+    if cfg.library.min_bits_per_pixel < 0:
+        raise ConfigError("library.min_bits_per_pixel cannot be negative")
     if cfg.grain.mode not in {"auto", "always", "never"}:
         raise ConfigError("grain.mode must be auto, always or never")
     if cfg.grain.analysis not in {"sampled", "full"}:

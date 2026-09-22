@@ -122,6 +122,14 @@ def check_skip(info: MediaInfo, output: Path, cfg: Config) -> None:
         raise SkipFile(f"already {info.codec}")
     if info.duration and info.duration < cfg.library.min_duration_sec:
         raise SkipFile(f"shorter than {cfg.library.min_duration_sec:.0f}s")
+    floor = cfg.library.min_bits_per_pixel
+    if floor > 0 and 0 < info.bits_per_pixel < floor:
+        # Zero means the bitrate could not be read, which is not evidence of
+        # anything, so only a positive measurement can skip a file.
+        raise SkipFile(
+            f"already {info.bits_per_pixel:.3f} bits/pixel, below {floor:.3f}: "
+            "too efficient to be worth re-encoding"
+        )
     if info.pix_fmt in {"", "unknown"}:
         # Av1an probes the source itself and aborts with "missing field `pix_fmt`"
         # when ffprobe cannot name the pixel format. Catching it here costs nothing
@@ -259,6 +267,8 @@ def process_one(
     info = probe(source, chain)
     log.info("%s", source.name)
     log.info("  %s, %s", info.describe(), human_size(info.size_bytes))
+    log.info("  %.3f bits/pixel, encoding at crf %d",
+             info.bits_per_pixel, encode.effective_crf(info, cfg))
 
     final = output_path(info, cfg)
     check_skip(info, final, cfg)
