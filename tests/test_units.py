@@ -14,7 +14,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from autotranscode import config, encode, mux, pipeline, util
+from autotranscode import config, encode, estimate, mux, pipeline, probe, util
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
 from autotranscode.state import Ledger, Record
@@ -887,3 +887,82 @@ class TestEfficiencyPrefilter(unittest.TestCase):
     def test_the_check_can_be_turned_off(self):
         self.cfg.library.min_bits_per_pixel = 0.0
         self.check(width=1280, height=720, video_bitrate=500_000)
+
+
+class TestEstimate(unittest.TestCase):
+    """Sampling a file to rank it, without spending the hours a real encode costs."""
+
+    def setUp(self):
+        self.cfg = config.Config()
+
+    def sampled(self, **overrides) -> estimate.Estimate:
+        """An Estimate as if sampling had already happened, with the numbers given."""
+        info = overrides.pop("info", None) or make_info(
+            size_bytes=1_000_000_000, video_bytes=900_000_000, duration=7200.0,
+        )
+        result = estimate.Estimate(info=info, crf=30, denoise="")
+        for name, value in overrides.items():
+            setattr(result, name, value)
+        return result
+
+    def test_projection_scales_video_and_keeps_everything_else(self):
+        # Video a tenth of its size, the 100 MB of audio and subtitles untouched.
+        result = self.sampled(source_sampled=10_000_000, encoded_sampled=1_000_000)
+        self.assertAlmostEqual(result.ratio, 0.1)
+        self.assertEqual(result.projected_bytes, 90_000_000 + 100_000_000)
+        self.assertEqual(result.saved_bytes, 810_000_000)
+        self.assertAlmostEqual(result.saving_percent, 81.0)
+
+    def test_a_file_the_encode_would_inflate_reports_a_loss(self):
+        result = self.sampled(source_sampled=1_000_000, encoded_sampled=1_500_000)
+        self.assertLess(result.saved_bytes, 0)
+        self.assertLess(result.saving_percent, 0)
+
+    def test_ranking_prefers_the_better_use_of_an_encoding_hour(self):
+        # A big file saving 40% in 10 hours loses to a small one saving 40% in one.
+        slow = self.sampled(
+            info=make_info(size_bytes=40_000_000_000, video_bytes=40_000_000_000,
+                           duration=7200.0),
+            source_sampled=100, encoded_sampled=60, sample_seconds=60.0, encode_seconds=360.0)
+        fast = self.sampled(
+            info=make_info(size_bytes=8_000_000_000, video_bytes=8_000_000_000,
+                           duration=1800.0),
+            source_sampled=100, encoded_sampled=60, sample_seconds=60.0, encode_seconds=36.0)
+        self.assertGreater(slow.saved_bytes, fast.saved_bytes)
+        self.assertGreater(fast.saved_per_hour, slow.saved_per_hour)
+
+    def test_without_container_byte_tags_the_whole_file_is_treated_as_video(self):
+        # No NUMBER_OF_BYTES and no usable bitrate: assume the file is its video,
+        # which is what an mp4 without tags effectively is.
+        result = self.sampled(
+            info=make_info(size_bytes=1_000_000_000, video_bytes=0, video_bitrate=0),
+            source_sampled=10, encoded_sampled=5)
+        self.assertEqual(result.projected_bytes, 500_000_000)
+
+    def test_unsampled_files_report_nothing_rather_than_zero(self):
+        self.assertFalse(self.sampled().ok)
+        self.assertEqual(self.sampled().ratio, 0.0)
+        self.assertEqual(self.sampled().fps, 0.0)
+        self.assertEqual(self.sampled().projected_encode_seconds, 0.0)
+
+    def test_sample_count_scales_with_runtime_within_bounds(self):
+        counts = [estimate.sample_count(d, self.cfg) for d in (600, 3600, 7200, 36000)]
+        self.assertEqual(counts, [3, 3, 6, 6])
+
+    def test_an_explicit_sample_count_wins(self):
+        self.cfg.estimate.samples = 2
+        self.assertEqual(estimate.sample_count(7200, self.cfg), 2)
+
+
+class TestContainerByteTags(unittest.TestCase):
+    """Matroska carries exact per-track sizes; reading them beats demuxing a remux."""
+
+    def test_plain_and_language_suffixed_tags_are_both_read(self):
+        self.assertEqual(probe._tag_int({"tags": {"NUMBER_OF_BYTES": "778544518"}},
+                                        "NUMBER_OF_BYTES"), 778544518)
+        self.assertEqual(probe._tag_int({"tags": {"NUMBER_OF_BYTES-eng": "42"}},
+                                        "NUMBER_OF_BYTES"), 42)
+
+    def test_a_missing_tag_is_zero_not_a_guess(self):
+        self.assertEqual(probe._tag_int({}, "BPS"), 0)
+        self.assertEqual(probe._tag_int({"tags": {"TITLE": "x"}}, "BPS"), 0)

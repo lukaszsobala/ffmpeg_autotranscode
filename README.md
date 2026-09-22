@@ -184,12 +184,56 @@ first step, not an optional one.
 |---|---|
 | `doctor` | Check tools and capabilities; explain what is missing |
 | `measure` | Grain scores only, for calibration |
+| `estimate` | Encode a few short excerpts per file and rank a library by what is worth transcoding |
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
 | `run` | Transcode (`--dry-run` probes and measures but does not encode) |
 | `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
 
 Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
 `-w/--workers`, `-o/--output-dir`, `--grain {auto,always,never}`.
+
+### Deciding what to transcode first
+
+A 4K feature costs the better part of a day on this board, so picking titles by
+eye is expensive guesswork. `estimate` samples instead:
+
+```bash
+autotranscode estimate /media/films        # a file, a directory or a .txt list
+```
+
+For each file it cuts several short excerpts spread across the runtime, encodes
+them with the settings a real run would use — same CRF ladder, same SVT
+parameters, same denoise decision — and compares them against the bytes the
+source spends on exactly those moments, summed from packet sizes rather than
+taken from an average bitrate.
+
+```
+file                                 size   estimate   saving    encode   saved/h  crf
+--------------------------------------------------------------------------------------
+Some Film                       764.6 MiB   48.1 MiB      94%    34m21s   1.2 GiB  32
+```
+
+The ranking is by **saved/h**, bytes saved per hour of encoding, not by bytes
+saved: the useful question is not which file is biggest but which hour of
+encoding is best spent. `+grain` after the CRF means the grain route was chosen,
+which is where the largest savings usually come from.
+
+Costs roughly a minute per file, mostly the excerpt encodes. `--samples` and
+`--seconds` trade accuracy for time, and `--no-grain-probe` skips the grain check
+— faster, and wrong on exactly the films where grain matters most.
+
+**It is an extrapolation.** Checked against a full encode of the same 4K HDR
+source, six 10-second excerpts projected 48.1 MiB against an actual 52.7 MiB —
+9% under, or **93.7% saving predicted against 93.1% achieved**. A handful of
+excerpts cannot know that the third act is one long dark scene, and the encoder
+sees each excerpt cold, without the lookahead a full run gives it.
+
+The time column is the sampled encode rate over the runtime, and it is
+*optimistic*: it counts neither scene detection, nor the grain table, nor the
+mux. On the same file it said 34m against an actual 51m. That understates every
+file by roughly the same factor, so the ranking survives it.
+
+Rank a library with this; do not quote its byte counts.
 
 ## Stopping and resuming
 

@@ -105,6 +105,20 @@ class TargetQuality:
 
 
 @dataclass(slots=True)
+class Estimate:
+    """Sampling settings for `estimate`, which ranks a library by what it would save."""
+
+    samples: int = 0        # 0 => scale with runtime, between min and max below
+    min_samples: int = 3
+    max_samples: int = 6
+    sample_seconds: int = 10
+    # Probe grain first, so a grainy film is sampled on the denoise route it would
+    # really take. Costs a few seconds per file and changes the answer a lot on the
+    # files where grain synthesis is the whole point.
+    grain_probe: bool = True
+
+
+@dataclass(slots=True)
 class Grain:
     mode: str = "auto"  # auto | always | never
     analysis: str = "sampled"  # sampled | full
@@ -206,6 +220,7 @@ class Config:
     machine: Machine = field(default_factory=Machine)
     encode: Encode = field(default_factory=Encode)
     target_quality: TargetQuality = field(default_factory=TargetQuality)
+    estimate: Estimate = field(default_factory=Estimate)
     grain: Grain = field(default_factory=Grain)
     staging: Staging = field(default_factory=Staging)
     dolby_vision: DolbyVision = field(default_factory=DolbyVision)

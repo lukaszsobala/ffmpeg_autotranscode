@@ -90,7 +90,7 @@ class GrainReport:
         )
 
 
-def _sample_times(duration: float, count: int, sample_seconds: int) -> list[float]:
+def sample_times(duration: float, count: int, sample_seconds: int) -> list[float]:
     """Evenly spread sample points, avoiding logos at the head and credits at the tail."""
     usable_start = duration * 0.05
     usable_end = max(usable_start, duration * 0.95 - sample_seconds)
@@ -131,7 +131,7 @@ def measure(info: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> Grain
 
     This replaces guesswork with a number in dB that you can log, compare and tune.
     """
-    times = _sample_times(info.duration, cfg.grain.samples, cfg.grain.sample_seconds)
+    times = sample_times(info.duration, cfg.grain.samples, cfg.grain.sample_seconds)
     scores: list[float] = []
 
     for index, start in enumerate(times):
@@ -300,7 +300,7 @@ def build_table(
         log.info("grain analysis: full file (this needs a lot of scratch space)")
         sample_cfg_seconds = seconds
     else:
-        times = _sample_times(info.duration, cfg.grain.samples, cfg.grain.sample_seconds)
+        times = sample_times(info.duration, cfg.grain.samples, cfg.grain.sample_seconds)
         sample_cfg_seconds = cfg.grain.sample_seconds
         log.info(
             "grain analysis: %d samples x %ds at %s",

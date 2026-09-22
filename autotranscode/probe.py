@@ -152,6 +152,7 @@ class MediaInfo:
     fps: float
     frames: int
     video_bitrate: int
+    video_bytes: int = 0   # exact, from container tags; 0 when unknown
 
     color_primaries: str = ""
     color_transfer: str = ""
@@ -236,6 +237,21 @@ def _int(value: object, default: int = 0) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
+
+
+def _tag_int(stream: dict, name: str) -> int:
+    """A Matroska statistics tag, e.g. NUMBER_OF_BYTES or BPS.
+
+    mkvmerge writes these per track, and they are exact -- the video tag matches a
+    full packet sum to the byte. Worth preferring, because the alternative is
+    demuxing the whole file. Language-suffixed spellings (NUMBER_OF_BYTES-eng) are
+    equally common, so match on the prefix.
+    """
+    tags = stream.get("tags") or {}
+    for key, value in tags.items():
+        if key.upper() == name or key.upper().startswith(f"{name}-"):
+            return _int(value)
+    return 0
 
 
 def _bit_depth(pix_fmt: str, stream: dict) -> int:
@@ -383,7 +399,12 @@ def probe(path: Path, chain: Toolchain) -> MediaInfo:
     if not frames and duration and fps:
         frames = int(duration * fps)
 
-    video_bitrate = _int(video.get("bit_rate"))
+    # Exact if the container says so, and Matroska usually does.
+    video_bytes = _tag_int(video, "NUMBER_OF_BYTES")
+
+    video_bitrate = _int(video.get("bit_rate")) or _tag_int(video, "BPS")
+    if not video_bitrate and video_bytes and duration:
+        video_bitrate = int(video_bytes * 8 / duration)
     if not video_bitrate:
         # Containers often omit per-stream bitrate; approximate from total minus a
         # nominal audio allowance. Only used for heuristics, never for encoding.
@@ -397,6 +418,7 @@ def probe(path: Path, chain: Toolchain) -> MediaInfo:
 
     return MediaInfo(
         path=path,
+        video_bytes=video_bytes,
         size_bytes=_int(fmt.get("size")) or path.stat().st_size,
         duration=duration,
         container=fmt.get("format_name", ""),

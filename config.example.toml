@@ -84,6 +84,17 @@ extra_svt_params = []
 1100 = -3           # 720p
 0 = -6              # 576p and below
 
+# Sampling for `estimate`, which ranks a library by what a real encode would save.
+[estimate]
+samples = 0          # excerpts per file. 0 scales with runtime, within the bounds below.
+min_samples = 3
+max_samples = 6
+sample_seconds = 10
+# Probe grain first, so a grainy film is estimated on the denoise + grain-synthesis
+# route it would really take. Costs a few seconds per file and changes the answer
+# most on the files where the savings are largest.
+grain_probe = true
+
 [target_quality]
 # Let Av1an search per-chunk for the CRF that hits a quality score. Much more
 # consistent than a fixed CRF, but multiplies encode time by the probe count.

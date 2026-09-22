@@ -7,11 +7,12 @@ import shlex
 import sys
 from pathlib import Path
 
-from . import __version__, config, encode, grain, pipeline, probe, tools
+from . import __version__, config, encode, estimate, grain, pipeline, probe, tools
 from .state import Ledger
 from .util import (
     CommandError,
     child_locale,
+    human_duration,
     human_size,
     log,
     setup_logging,
@@ -58,6 +59,17 @@ def build_parser() -> argparse.ArgumentParser:
         "measure", help="report grain scores only, for calibrating grain.threshold_db"
     )
     measure_cmd.add_argument("inputs", nargs="+", type=Path)
+
+    estimate_cmd = sub.add_parser(
+        "estimate",
+        help="encode a few short excerpts of each file and rank what is worth transcoding",
+    )
+    estimate_cmd.add_argument("inputs", nargs="+", type=Path)
+    estimate_cmd.add_argument("--samples", type=int,
+                              help="excerpts per file (default: 3-6, by runtime)")
+    estimate_cmd.add_argument("--seconds", type=int, help="seconds per excerpt")
+    estimate_cmd.add_argument("--no-grain-probe", action="store_true",
+                              help="skip the grain check; faster, and wrong on grainy films")
 
     sub.add_parser("doctor", help="check that the required tools are present and capable")
     sub.add_parser("status", help="summarise the state ledger")
@@ -139,6 +151,73 @@ def cmd_measure(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) 
     return 0
 
 
+def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> int:
+    """Sample each file, then rank by what a full encode would buy.
+
+    Ordered by bytes saved per hour of encoding rather than by bytes saved: on a
+    board where a 4K feature costs a day, the question is not which file is
+    biggest but which hour of encoding is best spent.
+    """
+    sources = pipeline.discover(inputs, cfg)
+    if not sources:
+        log.error("no media files found")
+        return 1
+
+    work = cfg.work_dir / "estimate"
+    results: list[estimate.Estimate] = []
+    skipped = 0
+    for index, source in enumerate(sources, start=1):
+        log.info("[%d/%d] %s", index, len(sources), source.name)
+        try:
+            info = probe.probe(source, chain)
+            # The same rules `run` applies, so an estimate over a library does not
+            # spend minutes sampling files that would never be transcoded.
+            pipeline.check_skip(info, pipeline.output_path(info, cfg), cfg)
+            result = estimate.estimate(info, chain, cfg, work)
+        except pipeline.SkipFile as exc:
+            log.info("  skip: %s", exc)
+            skipped += 1
+            continue
+        except (CommandError, OSError, ValueError) as exc:
+            log.warning("  cannot estimate: %s", str(exc)[:200])
+            continue
+        if not result.ok:
+            log.warning("  no usable samples; skipping")
+            continue
+        results.append(result)
+        log.info("  %s -> %s (%+.0f%%), %.1f fps, about %s to encode",
+                 human_size(info.size_bytes), human_size(result.projected_bytes),
+                 -result.saving_percent, result.fps,
+                 human_duration(result.projected_encode_seconds))
+
+    if not results:
+        log.error("nothing could be estimated")
+        return 1
+
+    results.sort(key=lambda r: r.saved_per_hour, reverse=True)
+    print(f"\n{'file':<40} {'size':>10} {'estimate':>10} {'saving':>8} "
+          f"{'encode':>9} {'saved/h':>9}  crf")
+    print("-" * 94)
+    for result in results:
+        name = result.info.path.name
+        name = name if len(name) <= 40 else name[:37] + "..."
+        print(f"{name:<40} {human_size(result.info.size_bytes):>10} "
+              f"{human_size(result.projected_bytes):>10} {result.saving_percent:>7.0f}% "
+              f"{human_duration(result.projected_encode_seconds):>9} "
+              f"{human_size(int(result.saved_per_hour)):>9}  {result.crf}"
+              f"{' +grain' if result.denoise else ''}")
+
+    saved = sum(r.saved_bytes for r in results)
+    hours = sum(r.projected_encode_seconds for r in results) / 3600
+    if skipped:
+        print(f"\n{skipped} file(s) skipped by the same rules `run` uses.")
+    print(f"\n{len(results)} file(s): {human_size(sum(r.info.size_bytes for r in results))} "
+          f"-> {human_size(sum(r.projected_bytes for r in results))}, "
+          f"saving {human_size(saved)} for about {hours:.0f}h of encoding.")
+    print("Sampled, not encoded: good for ranking, a few percent out on any one file.")
+    return 0
+
+
 def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> int:
     sources = pipeline.discover(inputs, cfg)
     if not sources:
@@ -197,6 +276,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "measure":
         return cmd_measure(args.inputs, cfg, chain)
+
+    if args.command == "estimate":
+        if args.samples is not None:
+            cfg.estimate.samples = args.samples
+        if args.seconds is not None:
+            cfg.estimate.sample_seconds = args.seconds
+        if args.no_grain_probe:
+            cfg.estimate.grain_probe = False
+        return cmd_estimate(args.inputs, cfg, chain)
 
     if args.command == "plan":
         return cmd_plan(args.inputs, cfg, chain)
