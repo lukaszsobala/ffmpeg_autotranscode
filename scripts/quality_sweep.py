@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import shlex
 import shutil
 import subprocess
 import sys
@@ -67,6 +68,14 @@ VARIANTS = [
                  "--variance-boost-strength", "3", "--film-grain", "10",
                  "--film-grain-denoise", "0"]),
 ]
+
+
+def parse_variant(spec: str) -> Variant:
+    """'NAME CRF GRAIN [SVT PARAMS...]' -> Variant, for --variant."""
+    words = shlex.split(spec)
+    if len(words) < 3 or not words[1].isdigit() or words[2] not in {"auto", "always", "never"}:
+        raise SystemExit(f"--variant wants 'NAME CRF GRAIN [SVT PARAMS...]', got {spec!r}")
+    return Variant(words[0], "given on the command line", int(words[1]), words[2], words[3:])
 
 
 @dataclass(slots=True)
@@ -305,6 +314,13 @@ def main() -> int:
     parser.add_argument("--windows", type=int, default=3, help="stretches to sample")
     parser.add_argument("--seconds", type=float, default=10.0, help="length of each")
     parser.add_argument("--only", nargs="*", help="variant names to run (default: all)")
+    parser.add_argument("--excerpt", type=Path,
+                        help="reuse the excerpt.mkv of an earlier sweep: skips stage 1 and "
+                             "the cutting, for another round of variants on the same footage")
+    parser.add_argument("--variant", action="append", default=[], metavar="SPEC",
+                        help="an extra variant, as one quoted string: "
+                             "'NAME CRF GRAIN [SVT PARAMS...]', e.g. "
+                             "'H-crf30-qm 30 never --enable-qm 1'. Repeatable.")
     parser.add_argument("--smoke", action="store_true",
                         help="plumbing check: 2 s stretches, preset 12, no stage 1 metrics")
     args = parser.parse_args()
@@ -325,7 +341,9 @@ def main() -> int:
         # Stage 1: where is the existing encode worst?
         report.status = "stage 1: scoring the existing encode frame by frame"
         report.write()
-        if args.smoke:
+        if args.excerpt:
+            starts = []
+        elif args.smoke:
             starts = [info.duration * f for f in (0.3, 0.6)][: args.windows]
         else:
             stage1 = verify.compare(chain, args.source, args.encoded, root / "stage1")
@@ -347,12 +365,18 @@ def main() -> int:
             starts = [frame / fps for frame in frames]
         report.windows, report.window_seconds = starts, seconds
 
-        report.status = "cutting the sampled stretches"
-        report.write()
-        excerpt = cut_excerpt(chain, base, args.source, starts, seconds, root)
+        if args.excerpt:
+            excerpt = args.excerpt.expanduser().resolve()
+            report.notes.append(f"Stage 1 skipped: reusing the excerpt `{excerpt}`.")
+        else:
+            report.status = "cutting the sampled stretches"
+            report.write()
+            excerpt = cut_excerpt(chain, base, args.source, starts, seconds, root)
 
         # Stage 2: each variant through the real pipeline.
-        chosen = [v for v in VARIANTS if not args.only or v.name in args.only]
+        extra = [parse_variant(spec) for spec in args.variant]
+        chosen = [v for v in VARIANTS + extra
+                  if not args.only or v.name in args.only or v in extra]
         if args.smoke:
             chosen = [v for v in chosen if v.name.startswith(("A-", "D-", "E-"))]
         preset = 12 if args.smoke else None

@@ -179,6 +179,10 @@ def measure(info: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> Grain
 # --- grain table generation -------------------------------------------------
 
 
+# See _extract_lossless: grav1synth needs rows that are a multiple of 32 bytes.
+ANALYSIS_CROP = "crop=trunc(iw/32)*32:ih:0:0"
+
+
 def _extract_lossless(
     info: MediaInfo, chain: Toolchain, cfg: Config, times: list[float], work: Path
 ) -> Path:
@@ -186,6 +190,15 @@ def _extract_lossless(
 
     Lossless matters: any compression artefact in the intermediate would be solved
     for as if it were grain.
+
+    The width is cropped to a multiple of 32. grav1synth reads each row with a
+    stride padded to 32 bytes and then rejects a frame whose size differs from
+    width x height -- "data length mismatch, expected 15896384, found 15912960"
+    on a 3836-wide 10-bit source. That rules out 720-wide DVDs, 854, and cropped
+    releases such as 1916 or 3836, measured failing at both bit depths: 32 bytes
+    is 16 samples at 10-bit and 32 at 8-bit, so a multiple of 32 suits both.
+    Grain parameters are statistics of the noise, so the columns lost (at most
+    31) cannot change them.
     """
     parts: list[Path] = []
     for index, start in enumerate(times):
@@ -195,6 +208,7 @@ def _extract_lossless(
             "-ss", f"{start:.3f}", "-t", str(cfg.grain.sample_seconds),
             "-i", str(info.path),
             "-an", "-sn", "-dn", "-map", "0:v:0",
+            "-vf", ANALYSIS_CROP,
             "-c:v", "ffv1", "-level", "3", "-g", "1",
             str(part),
         ])

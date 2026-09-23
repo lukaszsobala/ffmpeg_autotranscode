@@ -15,7 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
-from autotranscode import config, encode, estimate, mux, pipeline, probe, util, verify
+from autotranscode import config, encode, estimate, grain, mux, pipeline, probe, util, verify
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
 from autotranscode.state import Ledger, Record
@@ -1048,3 +1048,26 @@ class TestGrainRetention(unittest.TestCase):
         first = verify.worst_windows(scores, window=50, count=1)
         second = verify.worst_windows(scores, window=50, count=1, avoid=first)
         self.assertEqual((first, second), ([0], [150]))
+
+
+class TestGrainAnalysisClip(unittest.TestCase):
+    """grav1synth rejects rows that are not a multiple of 32 bytes."""
+
+    def test_analysis_clips_are_cropped_to_a_width_grav1synth_accepts(self):
+        seen: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            seen.append(argv)
+            Path(argv[-1]).write_bytes(b"x")
+            return util.Completed(argv, 0, "", "", 0.0)
+
+        original = grain.run
+        grain.run = fake_run
+        self.addCleanup(setattr, grain, "run", original)
+        with tempfile.TemporaryDirectory() as tmp:
+            info = make_info(width=3836, height=2072)
+            grain._extract_lossless(info, make_chain(), config.Config(), [10.0], Path(tmp))
+        self.assertIn("-vf", seen[0])
+        self.assertEqual(seen[0][seen[0].index("-vf") + 1], grain.ANALYSIS_CROP)
+        # 3836 -> 3808 at 10-bit and 8-bit alike; nothing is cropped from the height.
+        self.assertEqual(grain.ANALYSIS_CROP, "crop=trunc(iw/32)*32:ih:0:0")
