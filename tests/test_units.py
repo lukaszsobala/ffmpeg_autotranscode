@@ -1071,3 +1071,27 @@ class TestGrainAnalysisClip(unittest.TestCase):
         self.assertEqual(seen[0][seen[0].index("-vf") + 1], grain.ANALYSIS_CROP)
         # 3836 -> 3808 at 10-bit and 8-bit alike; nothing is cropped from the height.
         self.assertEqual(grain.ANALYSIS_CROP, "crop=trunc(iw/32)*32:ih:0:0")
+
+
+class TestXpsnrAlignment(unittest.TestCase):
+    """ffmpeg pairs frames by timestamp; Matroska rounds them to milliseconds."""
+
+    def test_both_inputs_are_renumbered_so_frames_pair_by_index(self):
+        seen: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            seen.append(argv)
+            Path(argv[argv.index("-lavfi") + 1].split("stats_file=")[1]).write_text(
+                "n:    1  XPSNR y: 40.0000  XPSNR u: 45.0  XPSNR v: 46.0\n")
+            return util.Completed(argv, 0, "", "", 0.0)
+
+        original = verify.run
+        verify.run = fake_run
+        self.addCleanup(setattr, verify, "run", original)
+        with tempfile.TemporaryDirectory() as tmp:
+            scores = verify.xpsnr(make_chain(), Path("/src.mkv"), Path("/enc.mkv"),
+                                  Path(tmp) / "x.log")
+        graph = seen[0][seen[0].index("-lavfi") + 1]
+        self.assertEqual(scores, [40.0])
+        self.assertIn(f"[0:v]{verify.ALIGN},", graph)
+        self.assertIn(f"[1:v]{verify.ALIGN},", graph)

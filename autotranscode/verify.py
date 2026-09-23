@@ -63,6 +63,9 @@ GRAIN_FILTER = "median=radius=1"
 # Treat 'inf' (a frame identical to its reference) as this, so means stay finite.
 IDENTICAL_DB = 100.0
 
+# Pair frames by decode order rather than by timestamp; see xpsnr().
+ALIGN = "settb=1/1000,setpts=N"
+
 # Scores XPSNR as 8-bit; see the module docstring for why.
 XPSNR_FORMAT = "yuv420p"
 
@@ -174,13 +177,22 @@ def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path) -> li
     Synthesised film grain is not applied to `distorted` (see module docstring):
     `-export_side_data film_grain` tells the AV1 decoder to hand the grain
     parameters over as side data instead of adding the grain to the picture.
+
+    Frames are paired by index, not by timestamp. ffmpeg's comparison filters
+    pair by timestamp, and Matroska stores whole milliseconds: two muxers can
+    round a 23.976 fps frame to 41 and 42 ms, and a frame one millisecond late
+    gets compared with its predecessor. That scored an encode 10-25 dB on frames
+    that match at 43.7 dB once paired properly -- and it inflates or deflates
+    plain PSNR the same way. Index pairing is right because the pipeline's
+    output is frame-exact; `ALIGN` renumbers both inputs 0, 1, 2...
     """
     argv = [
         chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y",
         "-i", str(reference),
         "-export_side_data", "film_grain", "-i", str(distorted),
         "-lavfi",
-        f"[0:v]format={XPSNR_FORMAT}[ref];[1:v]format={XPSNR_FORMAT}[dist];"
+        f"[0:v]{ALIGN},format={XPSNR_FORMAT}[ref];"
+        f"[1:v]{ALIGN},format={XPSNR_FORMAT}[dist];"
         f"[ref][dist]xpsnr=stats_file={stats.as_posix()}",
         "-f", "null", "-",
     ]
