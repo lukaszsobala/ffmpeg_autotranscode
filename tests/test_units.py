@@ -13,8 +13,9 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, TypeVar
 
-from autotranscode import config, encode, estimate, mux, pipeline, probe, util
+from autotranscode import config, encode, estimate, mux, pipeline, probe, util, verify
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
 from autotranscode.state import Ledger, Record
@@ -47,8 +48,22 @@ HDR10_TAGS = dict(
 )
 
 
-def make_info(**overrides) -> MediaInfo:
-    base = dict(
+T = TypeVar("T")
+
+
+def present(value: T | None) -> T:
+    """Fail the test on None, and tell the type checker it cannot be None after.
+
+    assertIsNotNone does the first but not the second, so a test that goes on
+    to use the value reads as an error in the editor.
+    """
+    if value is None:
+        raise AssertionError("expected a value, got None")
+    return value
+
+
+def make_info(**overrides: Any) -> MediaInfo:
+    base: dict[str, Any] = dict(
         path=Path("/library/Film (1975).mkv"), size_bytes=20_000_000_000, duration=7200.0,
         container="matroska", codec="h264", width=1920, height=1080, pix_fmt="yuv420p",
         bit_depth=8, fps=23.976, frames=172_600, video_bitrate=20_000_000,
@@ -292,8 +307,7 @@ class TestLedger(unittest.TestCase):
             ))
 
             reloaded = Ledger(state)
-            done = reloaded.already_done(source)
-            self.assertIsNotNone(done)
+            done = present(reloaded.already_done(source))
             self.assertAlmostEqual(done.saving_percent, 60.0)
 
     def test_changed_source_is_not_considered_done(self):
@@ -320,8 +334,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def make_chain(**overrides) -> Toolchain:
-    base = dict(
+def make_chain(**overrides: Any) -> Toolchain:
+    base: dict[str, Any] = dict(
         ffmpeg="ffmpeg", ffprobe="ffprobe", av1an="av1an",
         svtav1encapp="SvtAv1EncApp", grav1synth="grav1synth", mkvmerge="mkvmerge",
         svt_options={"--preset", "--crf", "--mastering-display", "--content-light",
@@ -441,8 +455,7 @@ class TestStaging(unittest.TestCase):
         return make_info(path=self.source, size_bytes=self.source.stat().st_size)
 
     def test_staged_copy_is_byte_identical_and_kept_out_of_the_library(self):
-        staged = pipeline.stage_source(self._info(), self.cfg)
-        self.assertIsNotNone(staged)
+        staged = present(pipeline.stage_source(self._info(), self.cfg))
         self.assertEqual(staged.read_bytes(), self.source.read_bytes())
         self.assertNotEqual(staged.parent, self.source.parent)
         self.assertTrue(self.source.is_file(), "the source must not be moved")
@@ -452,25 +465,25 @@ class TestStaging(unittest.TestCase):
         other.parent.mkdir(parents=True)
         other.write_bytes(b"y" * 4096)
 
-        first = pipeline.stage_source(self._info(), self.cfg)
-        second = pipeline.stage_source(
+        first = present(pipeline.stage_source(self._info(), self.cfg))
+        second = present(pipeline.stage_source(
             make_info(path=other, size_bytes=other.stat().st_size), self.cfg
-        )
+        ))
         self.assertNotEqual(first, second)
         self.assertEqual(second.read_bytes(), b"y" * 4096)
 
     def test_an_interrupted_runs_copy_is_reused_when_the_size_still_matches(self):
-        staged = pipeline.stage_source(self._info(), self.cfg)
+        staged = present(pipeline.stage_source(self._info(), self.cfg))
         # Mark the copy so we can tell a reuse from a fresh copy.
         staged.write_bytes(b"z" * 4096)
-        again = pipeline.stage_source(self._info(), self.cfg)
+        again = present(pipeline.stage_source(self._info(), self.cfg))
         self.assertEqual(again, staged)
         self.assertEqual(again.read_bytes(), b"z" * 4096, "should have been reused")
 
     def test_a_stale_copy_of_the_wrong_size_is_replaced(self):
-        staged = pipeline.stage_source(self._info(), self.cfg)
+        staged = present(pipeline.stage_source(self._info(), self.cfg))
         staged.write_bytes(b"truncated")
-        again = pipeline.stage_source(self._info(), self.cfg)
+        again = present(pipeline.stage_source(self._info(), self.cfg))
         self.assertEqual(again.read_bytes(), self.source.read_bytes())
 
     def test_declines_rather_than_filling_the_disk(self):
@@ -624,7 +637,7 @@ class TestStopAndResume(unittest.TestCase):
 
         self._stub_probe()
         self._stub_encode(interrupt)
-        staged = pipeline.stage_source(self._info(), self.cfg)
+        staged = present(pipeline.stage_source(self._info(), self.cfg))
 
         with self.assertRaises(KeyboardInterrupt):
             pipeline.process_one(self.source, make_chain(), self.cfg)
@@ -633,7 +646,7 @@ class TestStopAndResume(unittest.TestCase):
 
     def test_a_finished_file_drops_its_staged_copy(self):
         self._stub_probe()
-        staged = pipeline.stage_source(self._info(), self.cfg)
+        staged = present(pipeline.stage_source(self._info(), self.cfg))
         work = pipeline._work_dir(self.source, self.cfg)
 
         def encoded(*_args, **_kwargs):
@@ -724,7 +737,7 @@ class TestStopAndResume(unittest.TestCase):
             [self.source], make_chain(), self.cfg, ledger, pipeline.StopRequest()
         )
         self.assertEqual(failures, 1)
-        self.assertEqual(ledger.get(self.source).status, "failed")
+        self.assertEqual(present(ledger.get(self.source)).status, "failed")
 
     def test_sigterm_stops_the_run_the_same_way_ctrl_c_does(self):
         # systemctl stop and a plain kill must checkpoint, not kill outright.
@@ -966,3 +979,72 @@ class TestContainerByteTags(unittest.TestCase):
     def test_a_missing_tag_is_zero_not_a_guess(self):
         self.assertEqual(probe._tag_int({}, "BPS"), 0)
         self.assertEqual(probe._tag_int({"tags": {"TITLE": "x"}}, "BPS"), 0)
+
+
+class TestMuxOutput(unittest.TestCase):
+    """The mux writes to <name>.part and renames it, so the format must be named."""
+
+    def test_the_muxer_is_named_rather_than_inferred_from_the_extension(self):
+        # ffmpeg exits 234 ("unable to choose an output format") on a .part name,
+        # which failed every unstaged encode at the very last step.
+        argv = mux.build_command(Path("/w/encoded.mkv"), make_info(),
+                                 Path("/out/Film.av1.mkv.part"), make_chain(), config.Config())
+        self.assertEqual(argv[-3:], ["-f", "matroska", "/out/Film.av1.mkv.part"])
+
+    def test_webm_output_gets_the_webm_muxer(self):
+        cfg = config.Config()
+        cfg.output.container = "webm"
+        argv = mux.build_command(Path("/w/encoded.mkv"), make_info(),
+                                 Path("/out/Film.av1.webm.part"), make_chain(), cfg)
+        self.assertEqual(argv[-3:-1], ["-f", "webm"])
+
+
+class TestVerify(unittest.TestCase):
+    """The parts of verification that decide something, rather than run ffmpeg."""
+
+    def test_xpsnr_log_is_read_per_frame_and_identical_frames_stay_finite(self):
+        text = ("n:    1  XPSNR y: 42.1000  XPSNR u: 50.0  XPSNR v: 51.0\n"
+                "n:    2  XPSNR y: inf  XPSNR u: inf  XPSNR v: inf\n")
+        self.assertEqual(verify.parse_xpsnr_log(text), [42.1, verify.IDENTICAL_DB])
+
+    def test_mse_log_is_read_per_frame(self):
+        text = "n:1 mse_avg:3.10 mse_y:4.25 mse_u:1.0\nn:2 mse_avg:2.0 mse_y:2.75 mse_u:1.0\n"
+        self.assertEqual(verify.parse_mse_log(text), [4.25, 2.75])
+
+    def test_worst_frames_are_spread_out(self):
+        scores = [50.0] * 100
+        scores[10] = scores[11] = scores[12] = 30.0   # one bad shot
+        scores[80] = 35.0                              # a different, milder one
+        self.assertEqual(verify.worst_frames(scores, 2, spacing=10), [10, 80])
+
+    def test_worst_windows_do_not_overlap_and_skip_the_ends(self):
+        scores = [50.0] * 300
+        for index in range(0, 10):
+            scores[index] = 10.0      # a logo at the head: excluded by the margin
+        for index in range(100, 130):
+            scores[index] = 30.0
+        for index in range(200, 230):
+            scores[index] = 35.0
+        self.assertEqual(verify.worst_windows(scores, window=30, count=2, margin=20),
+                         [100, 200])
+
+    def test_percentile_is_order_independent(self):
+        self.assertEqual(verify.percentile([5.0, 1.0, 3.0, 2.0, 4.0], 0), 1.0)
+        self.assertEqual(verify.percentile([5.0, 1.0, 3.0, 2.0, 4.0], 100), 5.0)
+        self.assertEqual(verify.percentile([], 5), 0.0)
+
+
+class TestGrainRetention(unittest.TestCase):
+    def test_overall_retention_is_a_ratio_of_rms_noise(self):
+        # A quarter of the noise energy left is half the grain amplitude.
+        self.assertAlmostEqual(verify.retention([4.0, 4.0], [1.0, 1.0]), 0.5)
+
+    def test_grainless_source_frames_do_not_read_as_the_worst(self):
+        self.assertEqual(verify.retention_by_frame([0.0, 4.0], [0.0, 1.0]), [1.0, 0.5])
+
+    def test_windows_avoid_ones_already_chosen(self):
+        # Two bad stretches exactly one window wide, the first slightly worse.
+        scores = [1.0] * 50 + [50.0] * 100 + [2.0] * 50
+        first = verify.worst_windows(scores, window=50, count=1)
+        second = verify.worst_windows(scores, window=50, count=1, avoid=first)
+        self.assertEqual((first, second), ([0], [150]))

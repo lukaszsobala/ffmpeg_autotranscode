@@ -7,7 +7,7 @@ import shlex
 import sys
 from pathlib import Path
 
-from . import __version__, config, encode, estimate, grain, pipeline, probe, tools
+from . import __version__, config, encode, estimate, grain, pipeline, probe, tools, verify
 from .state import Ledger
 from .util import (
     CommandError,
@@ -70,6 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
     estimate_cmd.add_argument("--seconds", type=int, help="seconds per excerpt")
     estimate_cmd.add_argument("--no-grain-probe", action="store_true",
                               help="skip the grain check; faster, and wrong on grainy films")
+
+    verify_cmd = sub.add_parser(
+        "verify",
+        help="score an encode against its source where the eye looks: flat areas and grain",
+    )
+    verify_cmd.add_argument("reference", type=Path, help="the source")
+    verify_cmd.add_argument("encoded", type=Path, help="the encode of it")
+    verify_cmd.add_argument("--snapshots", type=Path,
+                            help="write the worst frames of both files here as PNGs")
+    verify_cmd.add_argument("--no-grain", action="store_true",
+                            help="skip the grain retention pass (it decodes both files again)")
 
     sub.add_parser("doctor", help="check that the required tools are present and capable")
     sub.add_parser("status", help="summarise the state ledger")
@@ -148,6 +159,25 @@ def cmd_measure(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) 
         "Files below it take the denoise + grain-synthesis route. Adjust the threshold\n"
         "so it lands between your visibly clean and visibly grainy titles."
     )
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolchain) -> int:
+    try:
+        info = probe.probe(args.reference, chain)
+        work = cfg.work_dir / "verify"
+        result = verify.compare(chain, args.reference, args.encoded, work,
+                                grain=not args.no_grain)
+    except (CommandError, OSError, ValueError) as exc:
+        log.error("cannot verify: %s", str(exc)[:300])
+        return 1
+    print(result.describe())
+    print(f"worst frames: {', '.join(map(str, result.worst))}")
+    if args.snapshots:
+        pq = info.color_transfer == "smpte2084"
+        verify.snapshots(chain, args.reference, result.worst, args.snapshots, "source", pq=pq)
+        verify.snapshots(chain, args.encoded, result.worst, args.snapshots, "encode", pq=pq)
+        print(f"snapshots in {args.snapshots}")
     return 0
 
 
@@ -276,6 +306,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "measure":
         return cmd_measure(args.inputs, cfg, chain)
+
+    if args.command == "verify":
+        return cmd_verify(args, cfg, chain)
 
     if args.command == "estimate":
         if args.samples is not None:

@@ -71,6 +71,10 @@ def _subtitle_maps(info: MediaInfo, cfg: Config) -> tuple[list[str], list[str]]:
     return (maps, ["-c:s", "copy"]) if maps else ([], [])
 
 
+# output.container -> ffmpeg muxer name.
+MUXERS = {"mkv": "matroska", "webm": "webm"}
+
+
 def build_command(
     video: Path, info: MediaInfo, output: Path, chain: Toolchain, cfg: Config
 ) -> list[str]:
@@ -93,6 +97,9 @@ def build_command(
         "-map_metadata", "1",
         # Keep track names and languages, which Jellyfin relies on for selection.
         "-disposition:v:0", "default",
+        # Named, not inferred: the pipeline writes to "<name>.part" and renames it
+        # into place, and ffmpeg cannot pick a muxer from a .part extension.
+        "-f", MUXERS[cfg.output.container],
         str(output),
     ]
     return argv

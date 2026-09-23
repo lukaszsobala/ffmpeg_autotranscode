@@ -185,6 +185,7 @@ first step, not an optional one.
 | `doctor` | Check tools and capabilities; explain what is missing |
 | `measure` | Grain scores only, for calibration |
 | `estimate` | Encode a few short excerpts per file and rank a library by what is worth transcoding |
+| `verify` | Score an encode against its source where the eye looks: XPSNR, grain retained, worst-frame snapshots |
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
 | `run` | Transcode (`--dry-run` probes and measures but does not encode) |
 | `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
@@ -234,6 +235,46 @@ mux. On the same file it said 34m against an actual 51m. That understates every
 file by roughly the same factor, so the ranking survives it.
 
 Rank a library with this; do not quote its byte counts.
+
+### Checking quality: do not trust PSNR
+
+A 4K HDR encode at CRF 32 scored 50.8 dB luma PSNR — "visually lossless" by the
+usual reading — and was visibly blocky in flat areas, with its grain gone.
+PSNR averages squared error over every pixel, so a smooth gradient broken into
+blocks costs almost nothing: each step is a code value or two. On PQ material
+it is worse still, because most of the picture sits in a narrow band of dark
+code values.
+
+```bash
+autotranscode verify SOURCE ENCODED --snapshots /tmp/snaps
+```
+
+reports three things instead:
+
+- **XPSNR** (luma): PSNR weighted by local activity, so an error in a flat patch
+  counts far more than one in texture. Watch the **5th percentile**, not the
+  mean: visible blocking lives in the bad frames.
+- **Grain retained**: the noise a fixed reference denoiser removes from the
+  encode, as a fraction of what it removes from the source. 100% is intact;
+  single digits means the encoder smoothed it away.
+- **Snapshots** of the worst frames from both files, tonemapped identically. A
+  metric earns trust only by agreeing with your eye on its worst frames.
+
+XPSNR is scored at 8-bit on purpose. ffmpeg's `xpsnr` filter is broken for high
+bit depth here: a 10-bit file compared with *itself* scores 9.98 dB instead of
+infinity, in ffmpeg 7.1 and jellyfin-ffmpeg 8.1 alike. Converting both inputs to
+8-bit identically hides only errors below a quarter of an 8-bit step. XPSNR is
+also measured with synthesised film grain switched off in the decoder — random
+synthetic grain never matches the source pixel for pixel, so leaving it on would
+penalise the very feature meant to fix lost grain — while grain retention is
+measured with it on, as a viewer sees it.
+
+To find settings that fix a bad encode rather than just confirm it,
+`scripts/quality-sweep.sh SOURCE ENCODED` finds the encode's three worst
+10-second stretches, cuts them from the source by stream copy, runs the real
+pipeline over them with several candidate settings, and verifies and snapshots
+each. It runs as a user systemd unit, so it survives closing the editor and
+logging out; progress is in the `report.md` it rewrites after every step.
 
 ## Stopping and resuming
 
