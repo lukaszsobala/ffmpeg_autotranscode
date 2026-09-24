@@ -27,11 +27,13 @@ import argparse
 import dataclasses
 import datetime as dt
 import json
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +51,8 @@ class Variant:
     crf: int
     grain: str = "never"           # the pipeline's --grain mode
     svt: list[str] = field(default_factory=list)
+    # Config values for this variant only, e.g. {"encode.variance_boost_strength": 0}.
+    overrides: dict[str, object] = field(default_factory=dict)
 
 
 # Chosen to separate the two complaints -- blocking in flat areas, lost grain --
@@ -72,11 +76,26 @@ VARIANTS = [
 
 
 def parse_variant(spec: str) -> Variant:
-    """'NAME CRF GRAIN [SVT PARAMS...]' -> Variant, for --variant."""
+    """'NAME CRF GRAIN [section.key=value...] [SVT PARAMS...]' -> Variant.
+
+    Config overrides come before the encoder flags, and their values are read as
+    TOML, so `encode.variance_boost_strength=0` is an integer and
+    `grain.denoise_strength=hqdn3d=4:3:0:0` falls back to a plain string.
+    """
     words = shlex.split(spec)
     if len(words) < 3 or not words[1].isdigit() or words[2] not in {"auto", "always", "never"}:
-        raise SystemExit(f"--variant wants 'NAME CRF GRAIN [SVT PARAMS...]', got {spec!r}")
-    return Variant(words[0], "given on the command line", int(words[1]), words[2], words[3:])
+        raise SystemExit(f"--variant wants 'NAME CRF GRAIN [section.key=value...] "
+                         f"[SVT PARAMS...]', got {spec!r}")
+    rest = words[3:]
+    overrides: dict[str, object] = {}
+    while rest and re.match(r"^[a-z_]+\.[a-z_]+=", rest[0]):
+        key, _, raw = rest.pop(0).partition("=")
+        try:
+            overrides[key] = tomllib.loads(f"v = {raw}")["v"]
+        except tomllib.TOMLDecodeError:
+            overrides[key] = raw
+    return Variant(words[0], "given on the command line", int(words[1]), words[2], rest,
+                   overrides)
 
 
 @dataclass(slots=True)
@@ -136,6 +155,12 @@ def variant_config(base: config.Config, variant: Variant, root: Path, preset: in
     if preset is not None:
         cfg.encode.preset = preset
     cfg.grain.mode = variant.grain
+    for key, value in variant.overrides.items():
+        section, _, name = key.partition(".")
+        target = getattr(cfg, section, None)
+        if target is None or not hasattr(target, name):
+            raise SystemExit(f"unknown config option in --variant: {key}")
+        setattr(target, name, value)
     cfg.output.directory = str(here)
     cfg.output.min_saving_percent = -1e9      # keep every result, however it turns out
     cfg.output.replace_source = False
@@ -244,6 +269,7 @@ class Report:
             out += [f"- **{o.variant.name}**: {o.variant.why}"
                     + (f" (`{' '.join(o.variant.svt)}`)" if o.variant.svt else "")
                     + (f", grain mode `{o.variant.grain}`" if o.variant.grain != "never" else "")
+                    + "".join(f", `{k} = {v}`" for k, v in o.variant.overrides.items())
                     for o in self.outcomes]
             out.append("")
         if self.snapshots:
