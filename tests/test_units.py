@@ -1186,3 +1186,43 @@ class TestPerPlaneGrain(unittest.TestCase):
     def test_psnr_stats_are_read_per_plane(self):
         text = "n:1 mse_avg:3.0 mse_y:4.25 mse_u:1.5 mse_v:0.5 psnr_avg:40\n"
         self.assertEqual([verify.parse_mse_log(text, p) for p in "yuv"], [[4.25], [1.5], [0.5]])
+
+
+def svt_frame(shift: int, luma_ar: list[int], seed: int = 7391) -> dict:
+    """ffmpeg's view of one frame's grain parameters, as ffprobe reports them."""
+    chroma = {"uv_points_value": "0 255", "uv_points_scaling": "15 14",
+              "ar_coeffs_uv": " ".join(["1"] * 25), "uv_mult": 0, "uv_mult_luma": 64,
+              "uv_offset": 0}
+    return {
+        "seed": str(seed), "chroma_scaling_from_luma": 0, "scaling_shift": 11,
+        "ar_coeff_lag": 3, "ar_coeff_shift": shift, "grain_scale_shift": 0, "overlap_flag": 1,
+        "components": [
+            {"y_points_value": "0 255", "y_points_scaling": "16 16",
+             "ar_coeffs_y": " ".join(map(str, luma_ar))},
+            chroma, dict(chroma, uv_points_scaling="11 8"),
+        ],
+    }
+
+
+class TestGrainFromSvt(unittest.TestCase):
+    def test_table_matches_the_format_grav1synth_writes_and_keeps_the_real_shift(self):
+        table = grain.table_from_params(svt_frame(8, list(range(24)))).splitlines()
+        self.assertEqual(table[0], "filmgrn1")
+        self.assertEqual(table[1], f"E 0 {grain.WHOLE_VIDEO_END} 1 7391 1")
+        # scaling_shift 11 carried through; chroma multipliers restored to spec values.
+        self.assertEqual(table[2], "\tp 3 8 0 11 0 1 128 192 256 128 192 256")
+        self.assertEqual(table[3], "\tsY 2 0 16 255 16")
+        self.assertEqual(table[5], "\tsCr 2 0 11 255 8")
+        self.assertEqual(table[6], "\tcY " + " ".join(map(str, range(24))))
+        self.assertEqual(len(table[7].split()) - 1, 25)
+        # And it survives the flattening and strength scaling the pipeline applies.
+        self.assertIn("\tsY 2 0 8 255 8", grain.scale_table("\n".join(table) + "\n", 0.5))
+
+    def test_medoid_ignores_an_outlier_and_compares_across_shifts(self):
+        typical = [0] * 22 + [64, 64]
+        frames = [
+            svt_frame(7, typical),                   # 0.5, 0.5 at shift 7
+            svt_frame(8, [c * 2 for c in typical]),   # the same texture at shift 8
+            svt_frame(7, [0] * 22 + [120, 5]),        # a directional one-off
+        ]
+        self.assertIsNot(grain.medoid(frames), frames[2])

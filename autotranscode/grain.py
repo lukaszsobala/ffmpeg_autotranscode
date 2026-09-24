@@ -24,15 +24,18 @@ Two constraints shape the implementation:
 
 from __future__ import annotations
 
+import json
 import re
 import statistics
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import encode
 from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
-from .util import CommandError, human_size, log, run
+from .util import CommandError, child_env, human_size, log, run
 from .verify import GRAIN_FILTER, parse_mse_log
 
 # Fixed reference denoiser used only for *measurement*, so scores are comparable
@@ -298,6 +301,67 @@ def flatten_table(raw: str) -> str:
     return "\n".join([GRAIN_TABLE_HEADER, *body]) + "\n"
 
 
+def frame_grain_params(chain: Toolchain, path: Path) -> list[dict]:
+    """Every frame's AV1 film grain parameters, as ffmpeg's decoder reports them."""
+    result = run([chain.ffprobe, "-v", "error", "-export_side_data", "film_grain",
+                  "-select_streams", "v:0", "-show_frames", "-of", "json", str(path)])
+    frames: list[dict] = []
+    for frame in json.loads(result.stdout or "{}").get("frames", []):
+        for side in frame.get("side_data_list") or []:
+            if side.get("side_data_type") == "Film grain parameters" and side.get("type") == "av1":
+                frames.append(side)
+    return frames
+
+
+def estimate_with_svt(info: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> Path | None:
+    """A grain table from SVT-AV1's own estimate, made on the grain samples alone.
+
+    The samples are encoded with --film-grain, which makes SVT estimate the grain
+    of every frame; ffmpeg reads those parameters back, and the most typical
+    frame's become the table. Only a few seconds are encoded, so the estimate costs
+    minutes where --film-grain on the whole film doubles a day-long encode.
+    """
+    if not chain.svtav1encapp:
+        log.warning("SvtAv1EncApp unavailable; skipping grain table")
+        return None
+    times = sample_times(info.duration, cfg.grain.samples, cfg.grain.sample_seconds)
+    log.info("grain estimate (SVT-AV1): %d samples x %ds", len(times), cfg.grain.sample_seconds)
+    clip = _extract_lossless(info, chain, cfg, times, work)
+    ivf = work / "grain_estimate.ivf"
+    params = encode.svt_params(info, cfg, chain)
+    if "--preset" in params:
+        at = params.index("--preset")
+        params = params[:at] + params[at + 2:]
+    decode = [chain.ffmpeg, "-hide_banner", "-v", "error", "-i", str(clip),
+              "-fps_mode", "passthrough", "-pix_fmt", encode.pix_format(info, cfg),
+              "-strict", "-1", "-f", "yuv4mpegpipe", "-"]
+    compress = [chain.svtav1encapp, "-i", "stdin", "-b", str(ivf), "--progress", "0",
+                "--preset", str(cfg.grain.estimate_preset), *params,
+                "--film-grain", str(cfg.grain.svt_level), "--film-grain-denoise", "0"]
+    env = child_env(chain.bin_dirs)
+    try:
+        with subprocess.Popen(decode, stdout=subprocess.PIPE, env=env) as source:
+            encoder = subprocess.run(compress, stdin=source.stdout, capture_output=True,
+                                     text=True, errors="replace", env=env)
+        if encoder.returncode != 0:
+            log.warning("SVT grain estimate failed: %s", encoder.stderr.strip()[-300:])
+            return None
+        frames = frame_grain_params(chain, ivf)
+    except (CommandError, OSError) as exc:
+        log.warning("SVT grain estimate failed: %s", str(exc)[:300])
+        return None
+    finally:
+        clip.unlink(missing_ok=True)
+    ivf.unlink(missing_ok=True)
+    if not frames:
+        log.warning("SVT found no grain in the samples; no table")
+        return None
+    table = work / "grain.tbl"
+    table.write_text(table_from_params(medoid(frames)), encoding="utf-8")
+    log.info("grain table ready: %s (from %d frames)", table, len(frames))
+    return table
+
+
 def build_table(
     info: MediaInfo,
     chain: Toolchain,
@@ -309,6 +373,8 @@ def build_table(
     if not chain.grav1synth:
         log.warning("grav1synth unavailable; skipping grain table")
         return None
+    if cfg.grain.estimator == "svt":
+        return estimate_with_svt(info, chain, cfg, work)
 
     if cfg.grain.analysis == "full":
         times = [0.0]
@@ -360,6 +426,78 @@ def build_table(
 
     log.info("grain table ready: %s", final_table)
     return final_table
+
+
+def _numbers(value: object) -> list[int]:
+    """ffprobe writes parameter lists as space-separated strings."""
+    return [int(v) for v in str(value).split()] if value not in (None, "") else []
+
+
+def _ar_real(params: dict) -> list[float]:
+    """Every AR coefficient of a frame in real units, so frames coded with
+    different ar_coeff_shift values can be compared."""
+    scale = 2 ** int(params["ar_coeff_shift"])
+    components = params.get("components", [])
+    coeffs = _numbers(components[0].get("ar_coeffs_y")) if components else []
+    for component in components[1:]:
+        coeffs += _numbers(component.get("ar_coeffs_uv"))
+    return [c / scale for c in coeffs]
+
+
+def medoid(frames: list[dict]) -> dict:
+    """The frame whose grain texture is the most typical of all of them.
+
+    An encoder estimates grain afresh per frame, and one-off estimates can carry
+    a directional quirk -- a single SVT-AV1 frame picked by median strength drew
+    faint vertical stripes. The per-coefficient median is typical but is not a
+    parameter set any frame used; the frame closest to it is both.
+    """
+    vectors = [_ar_real(f) for f in frames]
+    width = min(len(v) for v in vectors)
+    centre = [statistics.median(v[i] for v in vectors) for i in range(width)]
+    distances = [sum((v[i] - centre[i]) ** 2 for i in range(width)) for v in vectors]
+    return frames[distances.index(min(distances))]
+
+
+def table_from_params(params: dict) -> str:
+    """A one-segment film grain table, covering the whole video, from the
+    parameters ffmpeg's AV1 decoder reports for one frame.
+
+    Written from the decoder's view rather than taken from `grav1synth inspect`,
+    which writes scaling_shift as 8 whatever the stream says: on SVT-AV1's 11
+    that makes the grain eight times too strong. ffmpeg stores the chroma
+    multipliers less their spec offsets (128, 128, 256), which the table format
+    does not, hence the additions.
+    """
+    components = params.get("components", [])
+    luma = components[0] if components else {}
+    chroma = components[1:3] if len(components) >= 3 else [{}, {}]
+
+    def mults(c: dict) -> list[int]:
+        return [int(c.get("uv_mult", 0)) + 128, int(c.get("uv_mult_luma", 0)) + 128,
+                int(c.get("uv_offset", 0)) + 256]
+
+    def points(values: object, scalings: object) -> list[str]:
+        pairs = list(zip(_numbers(values), _numbers(scalings), strict=False))
+        return [str(len(pairs)), *(str(n) for pair in pairs for n in pair)]
+
+    header = [params["ar_coeff_lag"], params["ar_coeff_shift"], params["grain_scale_shift"],
+              params["scaling_shift"], params["chroma_scaling_from_luma"],
+              params["overlap_flag"], *mults(chroma[0]), *mults(chroma[1])]
+    lines = [
+        GRAIN_TABLE_HEADER,
+        f"E 0 {WHOLE_VIDEO_END} 1 {int(params.get('seed', 0))} 1",
+        "\tp " + " ".join(str(v) for v in header),
+        "\tsY " + " ".join(points(luma.get("y_points_value"), luma.get("y_points_scaling"))),
+        "\tsCb " + " ".join(points(chroma[0].get("uv_points_value"),
+                                   chroma[0].get("uv_points_scaling"))),
+        "\tsCr " + " ".join(points(chroma[1].get("uv_points_value"),
+                                   chroma[1].get("uv_points_scaling"))),
+        "\tcY " + " ".join(map(str, _numbers(luma.get("ar_coeffs_y")))),
+        "\tcCb " + " ".join(map(str, _numbers(chroma[0].get("ar_coeffs_uv")))),
+        "\tcCr " + " ".join(map(str, _numbers(chroma[1].get("ar_coeffs_uv")))),
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def scale_table(raw: str, luma: float, cb: float | None = None, cr: float | None = None) -> str:

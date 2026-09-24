@@ -141,6 +141,16 @@ class Grain:
     # Cheap: the table is rewritten into the finished stream in seconds, with no
     # re-encode, and the measurement reads a few seconds of video.
     calibrate: bool = True
+    # Who estimates the grain. "svt": SVT-AV1's own estimator, run on the grain
+    # samples only -- its tables looked like the source's grain on the test film.
+    # "grav1synth": `grav1synth diff` against a denoised copy, whose tables drew a
+    # visibly repeating, quilted texture whatever denoiser fed it (their AR filters
+    # had a DC gain of 0.9-1.95, against SVT's 0.60-0.77). Either way the table is
+    # applied afterwards with grav1synth, so SVT's grain costs seconds of samples
+    # rather than the doubled encode time of --film-grain on the whole film.
+    estimator: str = "svt"  # svt | grav1synth
+    svt_level: int = 10  # --film-grain for the estimate, 1-50
+    estimate_preset: int = 8
 
 
 @dataclass(slots=True)
@@ -332,6 +342,10 @@ def validate(cfg: Config) -> None:
                 f"encode.crf_by_width['{width}'] puts CRF outside 1-70 "
                 f"(encode.crf {cfg.encode.crf} {shift:+d})"
             )
+    if cfg.grain.estimator not in {"svt", "grav1synth"}:
+        raise ConfigError("grain.estimator must be svt or grav1synth")
+    if not 1 <= cfg.grain.svt_level <= 50:
+        raise ConfigError("grain.svt_level must be between 1 and 50")
     if not 0 <= cfg.encode.variance_boost_strength <= 4:
         raise ConfigError("encode.variance_boost_strength must be 0 (off) to 4")
     if cfg.library.min_bits_per_pixel < 0:
