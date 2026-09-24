@@ -63,6 +63,10 @@ GRAIN_FILTER = "median=radius=1"
 # Treat 'inf' (a frame identical to its reference) as this, so means stay finite.
 IDENTICAL_DB = 100.0
 
+# Removes pixel-scale grain and keeps anything 8 px or larger -- block steps,
+# banding contours, lost detail. See lowpass_psnr().
+LOWPASS = "gblur=sigma=2"
+
 # Pair frames by decode order rather than by timestamp; see xpsnr().
 ALIGN = "settb=1/1000,setpts=N"
 
@@ -83,6 +87,7 @@ class Comparison:
 
     frames: int
     xpsnr: list[float]
+    lowpass: list[float] = field(default_factory=list)
     grain_retention: float | None = None
     grain_by_frame: list[float] = field(default_factory=list)
     worst: list[int] = field(default_factory=list)
@@ -100,11 +105,21 @@ class Comparison:
     def xpsnr_min(self) -> float:
         return min(self.xpsnr) if self.xpsnr else 0.0
 
+    @property
+    def lowpass_mean(self) -> float:
+        return statistics.fmean(self.lowpass) if self.lowpass else 0.0
+
+    @property
+    def lowpass_p5(self) -> float:
+        return percentile(self.lowpass, 5)
+
     def describe(self) -> str:
         grain = (f", grain retained {100 * self.grain_retention:.0f}%"
                  if self.grain_retention is not None else "")
+        lowpass = (f", low-pass PSNR mean {self.lowpass_mean:.2f} dB, "
+                   f"5th pct {self.lowpass_p5:.2f}" if self.lowpass else "")
         return (f"{self.frames} frames: XPSNR mean {self.xpsnr_mean:.2f} dB, "
-                f"5th pct {self.xpsnr_p5:.2f}, worst {self.xpsnr_min:.2f}{grain}")
+                f"5th pct {self.xpsnr_p5:.2f}, worst {self.xpsnr_min:.2f}{lowpass}{grain}")
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -122,6 +137,12 @@ def parse_xpsnr_log(text: str) -> list[float]:
         raw = match.group(1)
         scores.append(IDENTICAL_DB if raw == "inf" else float(raw))
     return scores
+
+
+def parse_psnr_log(text: str) -> list[float]:
+    """Per-frame luma PSNR from the psnr filter's stats file."""
+    return [IDENTICAL_DB if raw == "inf" else float(raw)
+            for raw in re.findall(r"psnr_y:([0-9.]+|inf)", text)]
 
 
 def parse_mse_log(text: str) -> list[float]:
@@ -198,6 +219,37 @@ def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path) -> li
     ]
     run(argv)
     return parse_xpsnr_log(stats.read_text(encoding="utf-8", errors="replace"))
+
+
+def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path) -> list[float]:
+    """Per-frame luma PSNR of both files after a slight blur, at 10-bit.
+
+    Separates the two ways a grainy film gets damaged. An encoder that strips
+    grain leaves an error the size of the grain at every pixel, and in any
+    full-band metric that error swamps the block steps and banding contours
+    left behind -- which are one or two 10-bit code values tall, but span flat
+    areas where the eye finds them at once. XPSNR fares worse still: it reads
+    the source's grain as texture and discounts errors there, so a grainy sky
+    counts as busy and its blocking is forgiven.
+
+    A Gaussian of sigma 2 removes most of the 1-2 pixel grain from both files
+    and keeps structures of 8 pixels and up. What remains of the error is
+    structural damage with the grain factored out; grain retention measures the
+    grain separately. Run at 10-bit, since the steps in question are below one
+    8-bit code value, and paired by index for the reason given in xpsnr().
+    """
+    argv = [
+        chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y",
+        "-i", str(reference),
+        "-export_side_data", "film_grain", "-i", str(distorted),
+        "-lavfi",
+        f"[0:v]{ALIGN},format=yuv420p10le,{LOWPASS}[ref];"
+        f"[1:v]{ALIGN},format=yuv420p10le,{LOWPASS}[dist];"
+        f"[ref][dist]psnr=stats_file={stats.as_posix()}",
+        "-f", "null", "-",
+    ]
+    run(argv)
+    return parse_psnr_log(stats.read_text(encoding="utf-8", errors="replace"))
 
 
 def noise_mse(chain: Toolchain, path: Path, stats: Path) -> list[float]:
@@ -287,7 +339,14 @@ def compare(
     if not scores:
         raise CommandError(["xpsnr"], 1, "XPSNR produced no scores")
     result = Comparison(frames=len(scores), xpsnr=scores)
-    result.worst = worst_frames(scores, worst, spacing=max(24, len(scores) // 20))
+    try:
+        result.lowpass = lowpass_psnr(chain, reference, distorted, work / "lowpass.log")
+    except CommandError as exc:
+        log.warning("low-pass PSNR not measured: %s", exc.stderr.strip()[:200])
+    # Worst frames by the structural measure when there is one: XPSNR is blind to
+    # blocking under grain (see lowpass_psnr), so its worst frames are the wrong ones.
+    ranked = result.lowpass or scores
+    result.worst = worst_frames(ranked, worst, spacing=max(24, len(ranked) // 20))
     if grain:
         try:
             result.grain_retention, result.grain_by_frame = grain_retention(

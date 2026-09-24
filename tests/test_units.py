@@ -1095,3 +1095,15 @@ class TestXpsnrAlignment(unittest.TestCase):
         self.assertEqual(scores, [40.0])
         self.assertIn(f"[0:v]{verify.ALIGN},", graph)
         self.assertIn(f"[1:v]{verify.ALIGN},", graph)
+
+
+class TestLowpassPsnr(unittest.TestCase):
+    def test_psnr_log_is_read_per_frame_and_identical_frames_stay_finite(self):
+        text = ("n:1 mse_avg:0.5 mse_y:0.4 psnr_avg:51.2 psnr_y:52.30 psnr_u:55.0\n"
+                "n:2 mse_avg:0.0 mse_y:0.0 psnr_avg:inf psnr_y:inf psnr_u:inf\n")
+        self.assertEqual(verify.parse_psnr_log(text), [52.3, verify.IDENTICAL_DB])
+
+    def test_worst_frames_come_from_the_structural_measure_when_present(self):
+        result = verify.Comparison(frames=3, xpsnr=[10.0, 50.0, 50.0], lowpass=[50.0, 50.0, 30.0])
+        self.assertEqual(result.lowpass_p5, 30.0)
+        self.assertIn("low-pass PSNR mean", result.describe())

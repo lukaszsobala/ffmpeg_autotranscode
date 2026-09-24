@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import json
 import shlex
 import shutil
 import subprocess
@@ -176,14 +177,17 @@ class Report:
             "",
             "## How to read this",
             "",
-            "- **XPSNR** is PSNR weighted by local activity: an error in a flat patch counts",
-            "  far more than one in texture, which is how visibility works. Plain PSNR scored",
-            "  the blocky encode 50.8 dB. Higher is better; compare variants with each other,",
-            "  not with PSNR. Measured at 8-bit because ffmpeg's XPSNR is broken for 10-bit",
-            "  here (a file against itself scores 9.98 dB), and with synthesised grain *off*,",
-            "  so it scores the encode underneath the grain.",
+            "- **Low-pass PSNR** is the structural measure: PSNR at 10-bit after a slight",
+            "  blur (sigma 2) of both files, which removes the 1-2 pixel grain and keeps",
+            "  block steps and banding. Full-band metrics are swamped by the grain an",
+            "  encoder removes, so they barely see the blocking. Higher is better.",
             "- **5th pct** is how bad the bad frames are. Visible blocking lives here, not in",
             "  the mean.",
+            "- **XPSNR** is kept for reference but does not work on grainy film: it reads the",
+            "  grain as texture and forgives errors there. It is also 8-bit only here,",
+            "  because ffmpeg's 10-bit XPSNR is broken on this machine.",
+            "- All frame pairs are matched by index, not timestamp: Matroska's millisecond",
+            "  rounding otherwise pairs frames one apart and reports garbage.",
             "- **Grain** is the source's pixel-scale grain that survives, with synthesis",
             "  *on*: what a 3x3 median removes from the encode, as a fraction of what it",
             "  removes from the source. 100% is untouched. The encode you saw keeps ~40%.",
@@ -199,8 +203,9 @@ class Report:
             out += [
                 "## Stage 1: the existing encode, whole file",
                 "",
-                f"- {s.frames} frames, XPSNR mean **{s.xpsnr_mean:.2f} dB**, "
-                f"5th percentile **{s.xpsnr_p5:.2f}**, worst {s.xpsnr_min:.2f}",
+                f"- {s.frames} frames, low-pass PSNR mean **{s.lowpass_mean:.2f} dB**, "
+                f"5th percentile **{s.lowpass_p5:.2f}**",
+                f"- XPSNR mean {s.xpsnr_mean:.2f} dB, 5th percentile {s.xpsnr_p5:.2f}",
                 f"- grain retained: **{grain}**",
                 f"- worst frames: {', '.join(map(str, s.worst))} "
                 f"(snapshots in `stage1/`)",
@@ -216,7 +221,8 @@ class Report:
             out += [
                 "## Stage 2: variants over those stretches",
                 "",
-                "| variant | kbps | size vs A | XPSNR mean | 5th pct | worst | grain | time |",
+                "| variant | kbps | size vs A | low-pass mean | 5th pct | XPSNR mean | grain "
+                "| time |",
                 "|---|---:|---:|---:|---:|---:|---:|---:|",
             ]
             base = next((o.bytes for o in self.outcomes if o.ok), 0)
@@ -230,8 +236,8 @@ class Report:
                          else "-")
                 size = f"{100 * o.bytes / base:.0f}%" if base else "-"
                 out.append(
-                    f"| {o.variant.name} | {o.kbps:,.0f} | {size} | {r.xpsnr_mean:.2f} | "
-                    f"{r.xpsnr_p5:.2f} | {r.xpsnr_min:.2f} | {grain} | "
+                    f"| {o.variant.name} | {o.kbps:,.0f} | {size} | {r.lowpass_mean:.2f} | "
+                    f"{r.lowpass_p5:.2f} | {r.xpsnr_mean:.2f} | {grain} | "
                     f"{human_duration(o.seconds)} |"
                 )
             out += ["", "What each variant changes:", ""]
@@ -251,6 +257,27 @@ class Report:
         if self.notes:
             out += ["## Notes", "", *[f"- {note}" for note in self.notes], ""]
         self.path.write_text("\n".join(out), encoding="utf-8")
+        self.path.with_name("results.json").write_text(json.dumps(self.data(), indent=1),
+                                                       encoding="utf-8")
+
+    def data(self) -> dict:
+        """Everything measured, per frame included, for analysis beyond the table."""
+        def comparison(c: verify.Comparison | None) -> dict | None:
+            return None if c is None else {
+                "frames": c.frames, "xpsnr": c.xpsnr, "lowpass": c.lowpass,
+                "grain_retention": c.grain_retention, "grain_by_frame": c.grain_by_frame,
+                "worst": c.worst,
+            }
+        return {
+            "status": self.status,
+            "stage1": comparison(self.stage1),
+            "windows": self.windows,
+            "outcomes": [{
+                "variant": dataclasses.asdict(o.variant), "ok": o.ok, "error": o.error,
+                "seconds": o.seconds, "bytes": o.bytes, "kbps": o.kbps,
+                "result": comparison(o.result),
+            } for o in self.outcomes],
+        }
 
 
 # -------------------------------------------------------------------------- steps
@@ -306,6 +333,83 @@ def run_variant(
     return outcome
 
 
+def log_seconds(log_path: Path) -> float:
+    """Wall time of an earlier variant run, from the first and last log timestamps."""
+    stamps = [dt.datetime.strptime(line[:8], "%H:%M:%S")
+              for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+              if len(line) > 8 and line[2] == ":" and line[5] == ":" and line[:2].isdigit()]
+    if len(stamps) < 2:
+        return 0.0
+    seconds = (stamps[-1] - stamps[0]).total_seconds()
+    return seconds + 86400 if seconds < 0 else seconds   # ran past midnight
+
+
+def rescore(args: argparse.Namespace, root: Path, chain: tools.Toolchain, report: Report) -> int:
+    """Measure an earlier sweep's outputs again, for when verify itself changed.
+
+    The encodes are the expensive part and stay valid; only the numbers are
+    recomputed. The previous report is kept beside the new one.
+    """
+    excerpt = root / "excerpt.mkv"
+    if not excerpt.is_file():
+        raise SystemExit(f"no excerpt.mkv in {root}: not a sweep directory")
+    previous = root / "report.md"
+    if previous.is_file():
+        previous.replace(root / f"report.before-rescore-{dt.datetime.now():%H%M}.md")
+    info = probe.probe(args.source, chain)
+    pq = info.color_transfer == "smpte2084"
+    excerpt_seconds = probe.probe(excerpt, chain).duration or 1.0
+    by_name = {v.name: v for v in VARIANTS}
+
+    try:
+        if not args.skip_stage1:
+            report.status = "rescoring stage 1: the existing encode, whole file"
+            report.write()
+            report.stage1 = verify.compare(chain, args.source, args.encoded, root / "stage1")
+        runs = sorted(d for d in (root / "runs").iterdir() if d.is_dir())
+        for number, run_dir in enumerate(runs, start=1):
+            outputs = sorted(run_dir.glob("*.mkv"))
+            variant = by_name.get(run_dir.name) or Variant(run_dir.name, "from an earlier run", 0)
+            outcome = Outcome(variant)
+            if not outputs:
+                outcome.error = "no output in the earlier run"
+                report.outcomes.append(outcome)
+                continue
+            report.status = f"rescoring variant {number}/{len(runs)} ({run_dir.name})"
+            report.write()
+            outcome.bytes = outputs[0].stat().st_size
+            outcome.kbps = outcome.bytes * 8 / excerpt_seconds / 1000
+            outcome.seconds = log_seconds(run_dir / "run.log")
+            outcome.result = verify.compare(chain, excerpt, outputs[0],
+                                            root / "work" / run_dir.name / "verify")
+            outcome.ok = True
+            report.outcomes.append(outcome)
+            report.write()
+
+        first = next((o for o in report.outcomes if o.ok and o.result), None)
+        if first and first.result:
+            report.status = "writing snapshots"
+            report.write()
+            snaps = root / "snapshots"
+            shutil.rmtree(snaps, ignore_errors=True)
+            frames = first.result.worst
+            verify.snapshots(chain, excerpt, frames, snaps, "source", pq=pq)
+            for o in report.outcomes:
+                if o.ok:
+                    output = sorted((root / "runs" / o.variant.name).glob("*.mkv"))[0]
+                    verify.snapshots(chain, output, frames, snaps, o.variant.name, pq=pq)
+            report.snapshots = frames
+        shutil.rmtree(root / "work", ignore_errors=True)
+        report.status = f"rescored {dt.datetime.now():%Y-%m-%d %H:%M}"
+        report.write()
+        return 0
+    except Exception:
+        report.status = "FAILED -- see the traceback in Notes"
+        report.notes.append("```\n" + traceback.format_exc() + "```")
+        report.write()
+        raise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("source", type=Path)
@@ -321,6 +425,11 @@ def main() -> int:
                         help="an extra variant, as one quoted string: "
                              "'NAME CRF GRAIN [SVT PARAMS...]', e.g. "
                              "'H-crf30-qm 30 never --enable-qm 1'. Repeatable.")
+    parser.add_argument("--rescore", action="store_true",
+                        help="re-measure the outputs of an earlier sweep in --out, without "
+                             "encoding anything: for when the measurements change")
+    parser.add_argument("--skip-stage1", action="store_true",
+                        help="with --rescore: do not re-measure the whole existing encode")
     parser.add_argument("--smoke", action="store_true",
                         help="plumbing check: 2 s stretches, preset 12, no stage 1 metrics")
     args = parser.parse_args()
@@ -330,6 +439,9 @@ def main() -> int:
     base = config.load(config.default_path())
     chain = tools.detect(base)
     report = Report(root / "report.md", args.source, args.encoded)
+
+    if args.rescore:
+        return rescore(args, root, chain, report)
 
     try:
         info = probe.probe(args.source, chain)
