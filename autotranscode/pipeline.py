@@ -195,19 +195,21 @@ def _calibrate_grain(
     strong on the test film -- but the table is applied after encoding, so it can
     be corrected by measuring and rewriting the headers again, with no re-encode.
     """
-    factor = grain.calibrate_strength(read.path, grainy, chain, cfg, work, read.duration)
-    if factor is None:
+    measured = grain.calibrate_strength(read.path, grainy, chain, cfg, work, read.duration)
+    if measured[0] is None:
         log.warning("  grain strength not calibrated: measurements inconclusive")
         return
-    factor = max(0.25, min(2.0, factor))
-    if abs(factor - 1.0) < 0.05:
+    # A plane whose measurement is inconclusive keeps its table strength (1.0).
+    luma, cb, cr = (max(0.25, min(2.0, f)) if f is not None else 1.0 for f in measured)
+    if all(abs(f - 1.0) < 0.05 for f in (luma, cb, cr)):
         log.info("  grain strength already matches the source")
         return
     scaled = table.with_name("grain_calibrated.tbl")
-    scaled.write_text(grain.scale_table(table.read_text(encoding="utf-8"), factor),
+    scaled.write_text(grain.scale_table(table.read_text(encoding="utf-8"), luma, cb, cr),
                       encoding="utf-8")
     grain.apply_table(encoded, scaled, chain, grainy)
-    log.info("  grain strength calibrated to the source: x%.2f", factor)
+    log.info("  grain strength calibrated to the source: luma x%.2f, Cb x%.2f, Cr x%.2f",
+             luma, cb, cr)
 
 
 def _work_dir(source: Path, cfg: Config) -> Path:

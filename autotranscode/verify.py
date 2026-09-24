@@ -145,9 +145,9 @@ def parse_psnr_log(text: str) -> list[float]:
             for raw in re.findall(r"psnr_y:([0-9.]+|inf)", text)]
 
 
-def parse_mse_log(text: str) -> list[float]:
-    """Per-frame luma MSE from the psnr filter's stats file."""
-    return [float(value) for value in re.findall(r"mse_y:([0-9.]+)", text)]
+def parse_mse_log(text: str, plane: str = "y") -> list[float]:
+    """Per-frame MSE of one plane (y, u or v) from the psnr filter's stats file."""
+    return [float(value) for value in re.findall(rf"mse_{plane}:([0-9.]+)", text)]
 
 
 def worst_frames(scores: list[float], count: int, spacing: int) -> list[int]:

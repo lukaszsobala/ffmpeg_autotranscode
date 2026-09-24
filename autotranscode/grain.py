@@ -362,40 +362,44 @@ def build_table(
     return final_table
 
 
-def scale_table(raw: str, factor: float) -> str:
-    """The same grain table with its strength multiplied by `factor`.
+def scale_table(raw: str, luma: float, cb: float | None = None, cr: float | None = None) -> str:
+    """The same grain table with its strength multiplied, per plane.
 
     AV1 grain synthesis adds noise * scaling(pixel value), so scaling the points of
     the piecewise scaling functions -- sY, sCb, sCr, written as a count followed by
     (value, scaling) pairs -- scales the grain's amplitude and nothing else: its
-    texture, set by the AR coefficients, is untouched. Scalings are 8-bit, so they
-    are clamped to 0-255.
+    texture, set by the AR coefficients, is untouched. `cb` and `cr` default to
+    `luma`. Scalings are 8-bit, so they are clamped to 0-255.
     """
+    factors = {"sY": luma, "sCb": luma if cb is None else cb, "sCr": luma if cr is None else cr}
     out: list[str] = []
     for line in raw.splitlines():
         fields = line.split()
-        if fields and fields[0] in {"sY", "sCb", "sCr"} and len(fields) > 1:
+        if fields and fields[0] in factors and len(fields) > 1:
             count = int(fields[1])
             points = [int(v) for v in fields[2:2 + 2 * count]]
             for index in range(1, len(points), 2):
-                points[index] = max(0, min(255, round(points[index] * factor)))
+                points[index] = max(0, min(255, round(points[index] * factors[fields[0]])))
             indent = line[: len(line) - len(line.lstrip())]
             line = indent + " ".join([fields[0], str(count), *map(str, points)])
         out.append(line)
     return "\n".join(out) + ("\n" if raw.endswith("\n") else "")
 
 
+PLANES = ("y", "u", "v")
+
+
 def window_grain(
     path: Path, chain: Toolchain, times: list[float], seconds: float, work: Path,
     *, synthesis: bool = True,
-) -> float:
-    """Mean luma grain energy of `path` over the given windows.
+) -> tuple[float, float, float]:
+    """Mean grain energy of `path` over the given windows, per plane (Y, U, V).
 
     The same measure as verify's grain retention: what a 3x3 median removes. With
     `synthesis` off, the AV1 decoder hands film grain parameters over as side data
     instead of adding the grain, which measures the encode underneath.
     """
-    values: list[float] = []
+    values: dict[str, list[float]] = {plane: [] for plane in PLANES}
     for index, start in enumerate(times):
         stats = work / f"grain_{path.stem}_{index}_{int(synthesis)}.log"
         run([
@@ -408,8 +412,11 @@ def window_grain(
             f"[den][ref]psnr=stats_file={stats.as_posix()}",
             "-f", "null", "-",
         ])
-        values += parse_mse_log(stats.read_text(encoding="utf-8", errors="replace"))
-    return statistics.fmean(values) if values else 0.0
+        text = stats.read_text(encoding="utf-8", errors="replace")
+        for plane in PLANES:
+            values[plane] += parse_mse_log(text, plane)
+    y, u, v = (statistics.fmean(values[plane]) if values[plane] else 0.0 for plane in PLANES)
+    return y, u, v
 
 
 def strength_factor(source: float, underneath: float, with_grain: float) -> float | None:
@@ -430,8 +437,12 @@ def strength_factor(source: float, underneath: float, with_grain: float) -> floa
 
 def calibrate_strength(
     source: Path, grainy: Path, chain: Toolchain, cfg: Config, work: Path, duration: float,
-) -> float | None:
-    """The factor that makes `grainy`'s synthesised grain match `source`'s grain."""
+) -> tuple[float | None, float | None, float | None]:
+    """Per-plane factors that make `grainy`'s synthesised grain match `source`'s.
+
+    Chroma is calibrated on its own: grav1synth's colour grain was far stronger,
+    relative to its luma grain, than the source's, and showed as coloured speckle.
+    """
     times = sample_times(duration, cfg.grain.samples, cfg.grain.sample_seconds)
     seconds = float(cfg.grain.sample_seconds)
     try:
@@ -440,8 +451,10 @@ def calibrate_strength(
         with_grain = window_grain(grainy, chain, times, seconds, work, synthesis=True)
     except CommandError as exc:
         log.warning("grain calibration failed: %s", exc.stderr.strip()[:200])
-        return None
-    return strength_factor(wanted, underneath, with_grain)
+        return None, None, None
+    y, u, v = (strength_factor(w, n, g) for w, n, g in zip(wanted, underneath, with_grain,
+                                                           strict=True))
+    return y, u, v
 
 
 def apply_table(video: Path, table: Path, chain: Toolchain, output: Path) -> Path:

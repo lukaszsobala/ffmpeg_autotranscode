@@ -1172,3 +1172,17 @@ class TestGrainCalibration(unittest.TestCase):
     def test_inconclusive_measurements_give_no_answer(self):
         self.assertIsNone(grain.strength_factor(10.0, 5.0, 5.0))    # nothing synthesised
         self.assertIsNone(grain.strength_factor(4.0, 5.0, 9.0))     # encode already busier
+
+
+class TestPerPlaneGrain(unittest.TestCase):
+    TABLE = TestGrainTableScaling.TABLE
+
+    def test_each_plane_scales_by_its_own_factor(self):
+        scaled = grain.scale_table(self.TABLE, 1.0, cb=0.5, cr=0.1).splitlines()
+        self.assertEqual(scaled[3], "\tsY 3 0 22 81 23 255 24")
+        self.assertEqual(scaled[4], "\tsCb 3 0 8 54 9 255 10")
+        self.assertEqual(scaled[5], "\tsCr 2 0 20 255 25")
+
+    def test_psnr_stats_are_read_per_plane(self):
+        text = "n:1 mse_avg:3.0 mse_y:4.25 mse_u:1.5 mse_v:0.5 psnr_avg:40\n"
+        self.assertEqual([verify.parse_mse_log(text, p) for p in "yuv"], [[4.25], [1.5], [0.5]])
