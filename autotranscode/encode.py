@@ -98,8 +98,17 @@ def svt_params(
         "--preset", str(enc.preset),
         "--crf", str(crf if crf is not None else effective_crf(info, cfg)),
         "--tune", str(enc.tune),
-        "--variance-boost-strength", str(enc.variance_boost_strength),
     ]
+
+    # Variance boost spends extra bits on low-variance blocks: skies, walls, dark
+    # gradients, exactly where blocking shows. It is OFF in SVT-AV1 unless asked
+    # for, and the strength alone does not turn it on -- this project passed
+    # --variance-boost-strength for months without --enable-variance-boost, so the
+    # encoder logged "Variance Boost : 0" and the flat areas blocked up.
+    if enc.variance_boost_strength > 0:
+        if "--enable-variance-boost" in chain.svt_options:
+            params += ["--enable-variance-boost", "1"]
+        params += ["--variance-boost-strength", str(enc.variance_boost_strength)]
 
     if enc.ac_bias > 0 and "--ac-bias" in chain.svt_options:
         # Biases rate-distortion toward high-frequency error; helps texture and

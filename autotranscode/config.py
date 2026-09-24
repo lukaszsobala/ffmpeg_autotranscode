@@ -82,7 +82,7 @@ class Encode:
     )
     pix_format: str = "yuv420p10le"
     tune: int = 0  # 0=VQ (subjective), 2=SSIM
-    variance_boost_strength: int = 2
+    variance_boost_strength: int = 2  # 1-4; 0 turns variance boost off
     ac_bias: float = 0.0
     keyint_sec: float = 10.0
     chunk_method: str = "hybrid"  # hybrid works without VapourSynth
@@ -321,6 +321,8 @@ def validate(cfg: Config) -> None:
                 f"encode.crf_by_width['{width}'] puts CRF outside 1-70 "
                 f"(encode.crf {cfg.encode.crf} {shift:+d})"
             )
+    if not 0 <= cfg.encode.variance_boost_strength <= 4:
+        raise ConfigError("encode.variance_boost_strength must be 0 (off) to 4")
     if cfg.library.min_bits_per_pixel < 0:
         raise ConfigError("library.min_bits_per_pixel cannot be negative")
     if cfg.grain.mode not in {"auto", "always", "never"}:

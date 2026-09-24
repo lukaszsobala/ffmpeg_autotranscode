@@ -1107,3 +1107,29 @@ class TestLowpassPsnr(unittest.TestCase):
         result = verify.Comparison(frames=3, xpsnr=[10.0, 50.0, 50.0], lowpass=[50.0, 50.0, 30.0])
         self.assertEqual(result.lowpass_p5, 30.0)
         self.assertIn("low-pass PSNR mean", result.describe())
+
+
+class TestVarianceBoost(unittest.TestCase):
+    """The strength alone does not turn variance boost on; SVT-AV1 defaults it off."""
+
+    def params(self, strength: int, options: set[str]) -> list[str]:
+        cfg = config.Config()
+        cfg.encode.variance_boost_strength = strength
+        return encode.svt_params(make_info(), cfg, make_chain(svt_options=options))
+
+    def test_it_is_switched_on_not_just_tuned(self):
+        argv = self.params(2, {"--enable-variance-boost", "--variance-boost-strength"})
+        on = argv.index("--enable-variance-boost")
+        self.assertEqual(argv[on + 1], "1")
+        self.assertEqual(argv[argv.index("--variance-boost-strength") + 1], "2")
+
+    def test_zero_turns_it_off(self):
+        argv = self.params(0, {"--enable-variance-boost", "--variance-boost-strength"})
+        self.assertNotIn("--enable-variance-boost", argv)
+        self.assertNotIn("--variance-boost-strength", argv)
+
+    def test_out_of_range_strength_is_rejected(self):
+        cfg = config.Config()
+        cfg.encode.variance_boost_strength = 5
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
