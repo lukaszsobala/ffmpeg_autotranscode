@@ -172,7 +172,6 @@ of its input while it is still encoding the frames it has read ahead.
 cp config.example.toml ~/.config/autotranscode.toml
 
 autotranscode doctor
-autotranscode measure /media/films        # calibrate the grain threshold first
 autotranscode plan    /media/films        # see the commands without running them
 autotranscode run     /media/films
 ```
@@ -182,10 +181,17 @@ honoured). `-c` overrides it; with neither, the built-in defaults apply.
 
 `run` accepts files, directories, or a `.txt` file listing one path per line.
 
-### Calibrate the grain threshold before a real run
+### Deciding which films get grain
 
-`measure` prints, for each file, the mean PSNR between it and a reference-denoised
-copy. Lower means more grain.
+Nothing to set up by default. Every film gets a grain estimate, and calibration
+decides how much to put back — measuring how much fine texture the source has that
+the encode lost. A clean source measures near zero and ships without grain
+(`grain.mode = "auto"`); `"always"` keeps a minimum, `"never"` skips the lot.
+
+The older detector is still there for the configurations that need its denoiser —
+`grain.estimator = "grav1synth"` or `grain.denoise_before_encode` — and only then
+does `grain.threshold_db` matter. `measure` prints its score for each file, the mean
+PSNR between the file and a reference-denoised copy (lower means more grain):
 
 ```
 file                                              PSNR dB  grainy  denoise
@@ -195,17 +201,18 @@ Modern Scope Film (2017).mkv                        41.02  True    hqdn3d=1.4:1.
 Some Clean Film (2019).mkv                          50.44  False   -
 ```
 
-Set `grain.threshold_db` so it falls between titles you consider clean and titles you
-consider grainy. **The shipped default of 44.0 was derived from synthetic test
-patterns and will over-trigger on real footage** — treat calibration as a required
-first step, not an optional one.
+Treat it with suspicion. On the one real film measured end to end, a visibly
+grainy 4K HDR title, it scored 46.0 dB and called the film clean against the
+default 44 threshold: hqdn3d leaves structure that survives any encode, so the score
+barely moves with grain. If you rely on it, set the threshold from titles you have
+looked at, not from the default.
 
 ### Commands
 
 | Command | Purpose |
 |---|---|
 | `doctor` | Check tools and capabilities; explain what is missing |
-| `measure` | Grain scores only, for calibration |
+| `measure` | The old grain detector's scores (only for `grain.estimator = "grav1synth"`) |
 | `estimate` | Encode a few short excerpts per file and rank a library by what is worth transcoding |
 | `verify` | Score an encode against its source where the eye looks: XPSNR, grain retained, worst-frame snapshots |
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
