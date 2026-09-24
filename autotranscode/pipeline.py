@@ -185,6 +185,31 @@ def check_dolby_vision(info: MediaInfo, cfg: Config) -> None:
              dv.describe(), layer)
 
 
+def _calibrate_grain(
+    read: MediaInfo, encoded: Path, grainy: Path, table: Path,
+    chain: Toolchain, cfg: Config, work: Path,
+) -> None:
+    """Rescale the grain table until the synthesised grain matches the source's.
+
+    grav1synth's estimate is not the source's grain strength -- it came out ~40%
+    strong on the test film -- but the table is applied after encoding, so it can
+    be corrected by measuring and rewriting the headers again, with no re-encode.
+    """
+    factor = grain.calibrate_strength(read.path, grainy, chain, cfg, work, read.duration)
+    if factor is None:
+        log.warning("  grain strength not calibrated: measurements inconclusive")
+        return
+    factor = max(0.25, min(2.0, factor))
+    if abs(factor - 1.0) < 0.05:
+        log.info("  grain strength already matches the source")
+        return
+    scaled = table.with_name("grain_calibrated.tbl")
+    scaled.write_text(grain.scale_table(table.read_text(encoding="utf-8"), factor),
+                      encoding="utf-8")
+    grain.apply_table(encoded, scaled, chain, grainy)
+    log.info("  grain strength calibrated to the source: x%.2f", factor)
+
+
 def _work_dir(source: Path, cfg: Config) -> Path:
     """Per-file scratch directory, keyed to the source path.
 
@@ -349,8 +374,10 @@ def _transcode(
             if table is None:
                 log.warning("  no grain table; encoding without denoising to avoid losing grain")
 
-    # Only denoise when we actually have a table to put the grain back with.
-    denoise = report.denoise_filter if (report and table) else ""
+    # Only ever denoise when there is a table to put the grain back with, and by
+    # default not even then: see grain.denoise_before_encode.
+    denoise = (report.denoise_filter
+               if (report and table and cfg.grain.denoise_before_encode) else "")
 
     encoded = work / "encoded.mkv"
     encoded.unlink(missing_ok=True)
@@ -371,11 +398,13 @@ def _transcode(
     video = encoded
     if table:
         grainy = work / "grainy.mkv"
-        # No fallback here on purpose. The encode was denoised precisely because we
-        # had a table to put the grain back with; shipping it without that step
-        # would quietly deliver a smeared picture. Failing keeps the work directory,
-        # so Av1an resumes from its finished chunks once the cause is fixed.
+        # No fallback here on purpose. The encoder strips grain whether or not it
+        # was denoised first, so shipping without this step delivers a grainless,
+        # banded picture. Failing keeps the work directory, so Av1an resumes from
+        # its finished chunks once the cause is fixed.
         grain.apply_table(encoded, table, chain, grainy)
+        if cfg.grain.calibrate:
+            _calibrate_grain(read, encoded, grainy, table, chain, cfg, work)
         video = grainy
         log.info("  film grain applied from table")
 

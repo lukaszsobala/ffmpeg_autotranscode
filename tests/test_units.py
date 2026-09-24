@@ -1133,3 +1133,42 @@ class TestVarianceBoost(unittest.TestCase):
         cfg.encode.variance_boost_strength = 5
         with self.assertRaises(config.ConfigError):
             config.validate(cfg)
+
+
+class TestGrainTableScaling(unittest.TestCase):
+    TABLE = ("filmgrn1\nE 0 9223372036854775807 1 0 1\n"
+             "\tp 3 8 0 11 0 1 128 192 256 128 192 256\n"
+             "\tsY 3  0 22 81 23 255 24\n"
+             "\tsCb 3 0 17 54 18 255 20\n"
+             "\tsCr 2 0 200 255 250\n"
+             "\tcY 6 2 0 0 -1 0 4 1 -3 -2 4 1 -1 0 -1 -2 12 70 35 14 6 3 11 76\n")
+
+    def test_scalings_scale_and_positions_and_texture_do_not(self):
+        scaled = grain.scale_table(self.TABLE, 0.5).splitlines()
+        self.assertEqual(scaled[3], "\tsY 3 0 11 81 12 255 12")
+        self.assertEqual(scaled[4], "\tsCb 3 0 8 54 9 255 10")
+        # AR coefficients (texture) and the parameter line are left exactly as they were.
+        self.assertEqual(scaled[5 + 1], self.TABLE.splitlines()[6])
+        self.assertEqual(scaled[2], self.TABLE.splitlines()[2])
+
+    def test_scalings_are_clamped_to_eight_bits(self):
+        scaled = grain.scale_table(self.TABLE, 1.5).splitlines()
+        self.assertEqual(scaled[5], "\tsCr 2 0 255 255 255")
+
+    def test_scaling_by_one_changes_nothing_but_spacing(self):
+        again = grain.scale_table(self.TABLE, 1.0)
+        self.assertEqual(again.split(), self.TABLE.split())
+
+
+class TestGrainCalibration(unittest.TestCase):
+    def test_factor_matches_the_source_after_what_the_encode_kept(self):
+        # Source energy 10; encode keeps 1 on its own; the table adds 20 more.
+        # Needed: 9 more, so amplitude scales by sqrt(9/20).
+        self.assertAlmostEqual(present(grain.strength_factor(10.0, 1.0, 21.0)), (9 / 20) ** 0.5)
+
+    def test_an_exact_match_needs_no_change(self):
+        self.assertAlmostEqual(present(grain.strength_factor(10.0, 1.0, 10.0)), 1.0)
+
+    def test_inconclusive_measurements_give_no_answer(self):
+        self.assertIsNone(grain.strength_factor(10.0, 5.0, 5.0))    # nothing synthesised
+        self.assertIsNone(grain.strength_factor(4.0, 5.0, 9.0))     # encode already busier

@@ -25,6 +25,7 @@ Two constraints shape the implementation:
 from __future__ import annotations
 
 import re
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
 from .util import CommandError, human_size, log, run
+from .verify import GRAIN_FILTER, parse_mse_log
 
 # Fixed reference denoiser used only for *measurement*, so scores are comparable
 # across files. The strength actually used for encoding is chosen from the score.
@@ -358,6 +360,88 @@ def build_table(
 
     log.info("grain table ready: %s", final_table)
     return final_table
+
+
+def scale_table(raw: str, factor: float) -> str:
+    """The same grain table with its strength multiplied by `factor`.
+
+    AV1 grain synthesis adds noise * scaling(pixel value), so scaling the points of
+    the piecewise scaling functions -- sY, sCb, sCr, written as a count followed by
+    (value, scaling) pairs -- scales the grain's amplitude and nothing else: its
+    texture, set by the AR coefficients, is untouched. Scalings are 8-bit, so they
+    are clamped to 0-255.
+    """
+    out: list[str] = []
+    for line in raw.splitlines():
+        fields = line.split()
+        if fields and fields[0] in {"sY", "sCb", "sCr"} and len(fields) > 1:
+            count = int(fields[1])
+            points = [int(v) for v in fields[2:2 + 2 * count]]
+            for index in range(1, len(points), 2):
+                points[index] = max(0, min(255, round(points[index] * factor)))
+            indent = line[: len(line) - len(line.lstrip())]
+            line = indent + " ".join([fields[0], str(count), *map(str, points)])
+        out.append(line)
+    return "\n".join(out) + ("\n" if raw.endswith("\n") else "")
+
+
+def window_grain(
+    path: Path, chain: Toolchain, times: list[float], seconds: float, work: Path,
+    *, synthesis: bool = True,
+) -> float:
+    """Mean luma grain energy of `path` over the given windows.
+
+    The same measure as verify's grain retention: what a 3x3 median removes. With
+    `synthesis` off, the AV1 decoder hands film grain parameters over as side data
+    instead of adding the grain, which measures the encode underneath.
+    """
+    values: list[float] = []
+    for index, start in enumerate(times):
+        stats = work / f"grain_{path.stem}_{index}_{int(synthesis)}.log"
+        run([
+            chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y",
+            *([] if synthesis else ["-export_side_data", "film_grain"]),
+            "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-i", str(path),
+            "-an", "-sn", "-dn",
+            "-filter_complex",
+            f"[0:v]split=2[ref][pre];[pre]{GRAIN_FILTER}[den];"
+            f"[den][ref]psnr=stats_file={stats.as_posix()}",
+            "-f", "null", "-",
+        ])
+        values += parse_mse_log(stats.read_text(encoding="utf-8", errors="replace"))
+    return statistics.fmean(values) if values else 0.0
+
+
+def strength_factor(source: float, underneath: float, with_grain: float) -> float | None:
+    """How much to scale a grain table so the result matches the source's grain.
+
+    Energies add: the encode keeps some fine texture of its own (`underneath`), and
+    synthesised grain adds (factor * amplitude) squared on top. Matching the source
+    means factor^2 * (with_grain - underneath) = source - underneath. None when the
+    measurements cannot support an answer -- no synthesised grain to scale, or an
+    encode that already carries more texture than the source.
+    """
+    synthesised = with_grain - underneath
+    wanted = source - underneath
+    if synthesised <= 0 or wanted <= 0:
+        return None
+    return (wanted / synthesised) ** 0.5
+
+
+def calibrate_strength(
+    source: Path, grainy: Path, chain: Toolchain, cfg: Config, work: Path, duration: float,
+) -> float | None:
+    """The factor that makes `grainy`'s synthesised grain match `source`'s grain."""
+    times = sample_times(duration, cfg.grain.samples, cfg.grain.sample_seconds)
+    seconds = float(cfg.grain.sample_seconds)
+    try:
+        wanted = window_grain(source, chain, times, seconds, work)
+        underneath = window_grain(grainy, chain, times, seconds, work, synthesis=False)
+        with_grain = window_grain(grainy, chain, times, seconds, work, synthesis=True)
+    except CommandError as exc:
+        log.warning("grain calibration failed: %s", exc.stderr.strip()[:200])
+        return None
+    return strength_factor(wanted, underneath, with_grain)
 
 
 def apply_table(video: Path, table: Path, chain: Toolchain, output: Path) -> Path:

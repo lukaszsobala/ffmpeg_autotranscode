@@ -130,6 +130,17 @@ class Grain:
     # Lower => the denoiser removed more => more grain. Below this we take the grain route.
     threshold_db: float = 44.0
     keep_table: bool = True
+    # Denoise the picture before encoding when a grain table will put grain back.
+    # Off, because measured it bought nothing and cost detail: SVT-AV1 discards
+    # 4K grain by itself at any CRF from 22 to 32, so the denoised encode was no
+    # smaller (101% of the plain one), while the denoiser's temporal smoothing cost
+    # 1.3 dB of low-pass PSNR -- detail the encoder would otherwise have kept.
+    denoise_before_encode: bool = False
+    # Measure the applied grain against the source's and rescale the table to
+    # match. grav1synth's tables came out about 40% too strong on the test film.
+    # Cheap: the table is rewritten into the finished stream in seconds, with no
+    # re-encode, and the measurement reads a few seconds of video.
+    calibrate: bool = True
 
 
 @dataclass(slots=True)
