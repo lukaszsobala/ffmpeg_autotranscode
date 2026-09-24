@@ -1128,6 +1128,12 @@ class TestVarianceBoost(unittest.TestCase):
         self.assertNotIn("--enable-variance-boost", argv)
         self.assertNotIn("--variance-boost-strength", argv)
 
+    def test_it_is_off_unless_asked_for(self):
+        # Measured to cost 2-3x the bits on grainy 4K for no visible gain.
+        argv = encode.svt_params(make_info(), config.Config(),
+                                 make_chain(svt_options={"--enable-variance-boost"}))
+        self.assertNotIn("--enable-variance-boost", argv)
+
     def test_out_of_range_strength_is_rejected(self):
         cfg = config.Config()
         cfg.encode.variance_boost_strength = 5

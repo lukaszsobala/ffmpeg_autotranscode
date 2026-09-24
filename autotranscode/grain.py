@@ -87,11 +87,14 @@ class GrainReport:
     grainy: bool
     denoise_filter: str
 
-    def describe(self) -> str:
-        verdict = "grain route" if self.grainy else "no denoise"
+    def describe(self, denoising: bool = True) -> str:
+        """One log line. `denoising` says whether the filter will actually be used;
+        naming a denoiser that is never applied only misleads."""
+        verdict = "grain route" if self.grainy else "no grain route"
+        detail = f" ({self.denoise_filter or 'none'})" if denoising else ""
         return (
             f"grain probe: mean PSNR {self.mean_psnr:.2f} dB over "
-            f"{len(self.per_sample_psnr)} samples -> {verdict} ({self.denoise_filter or 'none'})"
+            f"{len(self.per_sample_psnr)} samples -> {verdict}{detail}"
         )
 
 

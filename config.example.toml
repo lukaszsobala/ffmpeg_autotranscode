@@ -49,8 +49,9 @@ crf = 30            # 1..70. Lower is higher quality and bigger. This is the
                     # value for a 1080p source; crf_by_width shifts it elsewhere.
 pix_format = "yuv420p10le"   # 10-bit even from 8-bit sources: cheap, and avoids banding.
 tune = 0            # 0 = VQ (subjective quality), 2 = SSIM. Use 0 for watching.
-variance_boost_strength = 2  # 1 mild .. 4 aggressive, 0 off. More bits for flat and
-                             # dark areas, where blocking shows first.
+variance_boost_strength = 0  # 0 off, 1-4 on. Spends more bits on flat and dark areas;
+                             # on a grainy 4K HDR film it cost 2-3x the bits for no
+                             # visible gain. Grain synthesis is what fixes flat areas.
 ac_bias = 0.0       # 0..8. Above 0 preserves texture and residual grain. Try 0.5-1.0.
 keyint_sec = 10.0   # Keyframe interval in seconds.
 

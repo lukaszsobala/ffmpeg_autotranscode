@@ -15,16 +15,40 @@ which audio to keep, and what to do when a step fails.
 
 ## Why film grain gets special treatment
 
-Grain is close to random, so it is close to incompressible: on a grainy film most of
-the bitrate goes into reproducing noise. AV1 can avoid that. The encoder strips the
-grain, carries a compact description of it in the bitstream, and the decoder
-re-synthesises matching grain at playback. The picture still looks like film and the
-file gets dramatically smaller.
+Grain is close to random, so it is close to incompressible. At any bitrate worth
+having, SVT-AV1 simply discards it: on a grainy 4K film, CRF 32, 27 and 22 all left
+the same none of the source's grain, at 1x, 1.4x and 1.9x the bits. What goes with
+it matters more than the grain itself. Grain was dithering the smooth gradients —
+fog, skies, dark walls — and without it they collapse into flat blocks one 10-bit
+code value apart. No CRF fixed that; putting grain back did.
 
-Doing it *well* means describing the grain that is actually there, rather than
-sprinkling on a generic ISO-noise preset. `grav1synth diff` compares the source with
-a denoised copy of itself and solves for the real parameters, which is the route this
-tool takes.
+AV1 can carry a compact description of grain in the bitstream and re-synthesise it
+at playback, so it costs almost nothing: grain added to the test film's encode
+changed its size by under 1%. The work is in describing grain that looks like the
+source's, and that took three attempts to get right:
+
+1. **`grav1synth diff`** against a denoised copy of the source. Its tables drew a
+   visibly repeating, quilted texture, whatever denoiser fed it — their AR filters
+   had a DC gain of 0.9 to 1.95, so the grain template filled with blobs that recur
+   block after block. Still available as `grain.estimator = "grav1synth"`.
+2. **SVT-AV1's own estimator, in the encode** (`--film-grain`). It looked right —
+   AR gains of 0.60-0.77 across 95 frames — but doubled the encode time.
+3. **SVT-AV1's estimator on a few seconds of samples**, applied afterwards. The
+   default. The samples are encoded with `--film-grain`, ffmpeg's decoder reads back
+   every frame's parameters, the most typical frame's become the table (its medoid:
+   one atypical frame drew faint stripes), and grav1synth writes it into the
+   finished stream. About five minutes per film, whatever its length.
+
+The table is then **calibrated**: the grain in the result is measured against the
+source's, plane by plane, and the table rescaled to match — in seconds, since only
+the stream headers are rewritten. SVT's colour grain came out twice as strong as the
+source's and showed as speckle until this step existed.
+
+The picture is **not** denoised before encoding. That was meant to save the bits the
+encoder would spend on grain, but SVT-AV1 spends none on it anyway: the denoised
+encode was 101% the size of the plain one, and the denoiser's temporal smoothing
+cost detail the encoder would have kept. `grain.denoise_before_encode` turns it back
+on.
 
 Two constraints shaped the implementation, and they are worth knowing before you
 change anything:
@@ -44,26 +68,24 @@ source.mkv
    │
    ├── ffprobe ......................... resolution, depth, HDR, streams
    │
-   ├── grain probe ..................... mean PSNR vs a reference-denoised copy
-   │      └── clean? ................... skip straight to encoding
+   ├── grain probe ..................... is there grain worth putting back?
    │
    ├── grain table (if grainy)
    │      ├── extract N short LOSSLESS excerpts
-   │      ├── denoise them
-   │      ├── grav1synth diff .......... solve for grain parameters
-   │      └── flatten .................. one segment spanning the whole runtime
+   │      ├── SvtAv1EncApp --film-grain  estimate grain on those alone
+   │      └── medoid frame ............. one table for the whole runtime
    │
-   ├── av1an -e svt-av1 -f "-vf <denoise>"
+   ├── av1an -e svt-av1
    │      └── scene-split, parallel, resumable → video-only AV1
    │
    ├── grav1synth apply -g grain.tbl ... write grain into the bitstream
+   │      └── calibrate ................ measure against the source, rescale, rewrite
    │
    └── ffmpeg mux ...................... + audio, subtitles, chapters, metadata
           └── output.av1.mkv
 ```
 
-Denoising happens *inside* Av1an's chunk pipeline, so no full-size intermediate is
-ever written. Only the short analysis excerpts touch the disk as lossless files.
+Only the short analysis excerpts ever touch the disk as lossless files.
 
 ## Why there is no hardware acceleration
 

@@ -82,7 +82,13 @@ class Encode:
     )
     pix_format: str = "yuv420p10le"
     tune: int = 0  # 0=VQ (subjective), 2=SSIM
-    variance_boost_strength: int = 2  # 1-4; 0 turns variance boost off
+    # 0 = off, 1-4 = on at that strength. Off by default, measured: on the test
+    # film it raised quality on flat blocks at a price the eye never saw back. At
+    # CRF 32 it cost 2.65x the bits for what CRF 22 alone gives at 1.9x; every
+    # boosted variant sat about 1.3 dB of low-pass PSNR below plain CRF at equal
+    # bits, did nothing for the blocking in fog (grain synthesis fixes that), and
+    # coded stray checkerboard textures into flat areas.
+    variance_boost_strength: int = 0
     ac_bias: float = 0.0
     keyint_sec: float = 10.0
     chunk_method: str = "hybrid"  # hybrid works without VapourSynth

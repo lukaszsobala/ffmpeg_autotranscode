@@ -370,7 +370,7 @@ def _transcode(
 
     if cfg.grain.mode != "never":
         report = grain.measure(read, chain, cfg, work)
-        log.info("  %s", report.describe())
+        log.info("  %s", report.describe(denoising=cfg.grain.denoise_before_encode))
         if report.grainy and not dry_run:
             table = grain.build_table(read, chain, cfg, report, work)
             if table is None:

@@ -188,10 +188,13 @@ def estimate(info: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> Esti
     crf = encode.effective_crf(info, cfg)
     work.mkdir(parents=True, exist_ok=True)   # the grain probe writes its logs here
 
-    # The grain route changes size more than any other decision, so an estimate
-    # that ignored it would be wrong on exactly the files it matters most for.
+    # Of the grain route, only a denoise before the encode changes its size: the
+    # grain table is written into the finished stream afterwards and adds nothing
+    # measurable (101% on the test film). So the probe is only worth its time when
+    # that denoise is on, which by default it is not.
     denoise = ""
-    if cfg.estimate.grain_probe and cfg.grain.mode != "never":
+    if (cfg.grain.denoise_before_encode and cfg.estimate.grain_probe
+            and cfg.grain.mode != "never"):
         report = grain.measure(info, chain, cfg, work)
         if report.grainy:
             denoise = report.denoise_filter
