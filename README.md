@@ -239,42 +239,58 @@ Rank a library with this; do not quote its byte counts.
 ### Checking quality: do not trust PSNR
 
 A 4K HDR encode at CRF 32 scored 50.8 dB luma PSNR — "visually lossless" by the
-usual reading — and was visibly blocky in flat areas, with its grain gone.
-PSNR averages squared error over every pixel, so a smooth gradient broken into
-blocks costs almost nothing: each step is a code value or two. On PQ material
-it is worse still, because most of the picture sits in a narrow band of dark
-code values.
+usual reading — and was visibly blocky in flat areas, with its grain gone. Two
+things fooled PSNR, and both are worth knowing before trusting any number:
+
+- **Grain swamps the error.** An encoder that strips grain leaves an error the
+  size of the grain at every pixel. The block steps and banding it leaves behind
+  are one or two 10-bit code values tall — invisible in that sum, obvious to the
+  eye across a flat sky. XPSNR, which weights flat regions up, fares no better:
+  it reads the source's grain as texture and forgives errors there.
+- **ffmpeg pairs frames by timestamp**, and Matroska rounds timestamps to whole
+  milliseconds. Two muxers can round the same frame to 41 and 42 ms, and a frame
+  one millisecond late is compared with its predecessor. On the test film that
+  produced frames scored at 10 dB that match at 43.7 once paired by index.
 
 ```bash
 autotranscode verify SOURCE ENCODED --snapshots /tmp/snaps
 ```
 
-reports three things instead:
+pairs frames by index and reports:
 
-- **XPSNR** (luma): PSNR weighted by local activity, so an error in a flat patch
-  counts far more than one in texture. Watch the **5th percentile**, not the
-  mean: visible blocking lives in the bad frames.
-- **Grain retained**: the noise a fixed reference denoiser removes from the
-  encode, as a fraction of what it removes from the source. 100% is intact;
-  single digits means the encoder smoothed it away.
-- **Snapshots** of the worst frames from both files, tonemapped identically. A
-  metric earns trust only by agreeing with your eye on its worst frames.
+- **Low-pass PSNR** — the structural measure. Both files get a slight blur
+  (Gaussian, sigma 2), which removes the 1-2 pixel grain and keeps anything 8 px
+  and up, then PSNR at 10-bit. What remains is blocking, banding and lost detail,
+  with the grain factored out. Watch the **5th percentile**: visible damage lives
+  in the bad frames. On the test film, CRF 32 → 27 → 22 moved it 51.2 → 52.4 → 53.6
+  dB, in step with what the eye saw at the worst frame.
+- **Grain retained** — what a 3x3 median removes from the encode, as a fraction of
+  what it removes from the source, with synthesised grain *on*. A median keeps
+  step edges, so block edges do not count as grain. The measure has a floor: the
+  median also removes fine edges and text, which survive, so an encode with no
+  grain left reads well above zero (38% on the test film, at every CRF from 32 to
+  22). Read it as "floor = none, ~100% = source-like".
+- **XPSNR**, for reference only, for the reasons above. It is 8-bit because
+  ffmpeg's `xpsnr` is broken for high bit depth here (a 10-bit file against itself
+  scores 9.98 dB, in ffmpeg 7.1 and jellyfin-ffmpeg 8.1 alike).
+- **Snapshots** of the worst frames of both files, tonemapped identically. A metric
+  earns trust only by agreeing with your eye on its worst frames; crop a flat area
+  and stretch its contrast to see what the numbers mean.
 
-XPSNR is scored at 8-bit on purpose. ffmpeg's `xpsnr` filter is broken for high
-bit depth here: a 10-bit file compared with *itself* scores 9.98 dB instead of
-infinity, in ffmpeg 7.1 and jellyfin-ffmpeg 8.1 alike. Converting both inputs to
-8-bit identically hides only errors below a quarter of an 8-bit step. XPSNR is
-also measured with synthesised film grain switched off in the decoder — random
-synthetic grain never matches the source pixel for pixel, so leaving it on would
-penalise the very feature meant to fix lost grain — while grain retention is
-measured with it on, as a viewer sees it.
+Both PSNRs are measured with synthesised film grain switched off in the decoder,
+so they score the encode underneath; random synthetic grain never matches the
+source pixel for pixel and would otherwise penalise the very fix for lost grain.
 
 To find settings that fix a bad encode rather than just confirm it,
-`scripts/quality-sweep.sh SOURCE ENCODED` finds the encode's three worst
-10-second stretches, cuts them from the source by stream copy, runs the real
-pipeline over them with several candidate settings, and verifies and snapshots
-each. It runs as a user systemd unit, so it survives closing the editor and
-logging out; progress is in the `report.md` it rewrites after every step.
+`scripts/quality-sweep.sh SOURCE ENCODED` finds the encode's worst stretches —
+for structure, and separately for grain loss — cuts them from the source by
+stream copy, runs the real pipeline over them with several candidate settings,
+and verifies and snapshots each. It runs as a user systemd unit, so it survives
+closing the editor and logging out; progress is in the `report.md` it rewrites
+after every step, with every per-frame number in `results.json`. Add
+`-- --excerpt DIR/excerpt.mkv --variant 'NAME CRF GRAIN [SVT...]'` for another
+round on the same footage, or `-- --rescore` to re-measure one after the
+measurements change.
 
 ## Stopping and resuming
 
