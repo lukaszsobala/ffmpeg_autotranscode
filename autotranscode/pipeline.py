@@ -188,28 +188,31 @@ def check_dolby_vision(info: MediaInfo, cfg: Config) -> None:
 def _calibrate_grain(
     read: MediaInfo, encoded: Path, grainy: Path, table: Path,
     chain: Toolchain, cfg: Config, work: Path,
-) -> None:
+) -> bool:
     """Rescale the grain table until the synthesised grain matches the source's.
 
-    grav1synth's estimate is not the source's grain strength -- it came out ~40%
-    strong on the test film -- but the table is applied after encoding, so it can
-    be corrected by measuring and rewriting the headers again, with no re-encode.
+    Returns whether to keep grain at all: calibration doubles as the grain
+    detector, and a source with nothing to put back measures near zero (see
+    grain.decide_strength). The table is applied after encoding, so all of this
+    rewrites stream headers; nothing is re-encoded.
     """
     measured = grain.calibrate_strength(read.path, grainy, chain, cfg, work, read.duration)
     if measured[0] is None:
         log.warning("  grain strength not calibrated: measurements inconclusive")
-        return
-    # A plane whose measurement is inconclusive keeps its table strength (1.0).
-    luma, cb, cr = (max(0.25, min(2.0, f)) if f is not None else 1.0 for f in measured)
+        return True
+    keep, luma, cb, cr = grain.decide_strength(measured, cfg.grain.mode)
+    if not keep:
+        return False
     if all(abs(f - 1.0) < 0.05 for f in (luma, cb, cr)):
         log.info("  grain strength already matches the source")
-        return
+        return True
     scaled = table.with_name("grain_calibrated.tbl")
     scaled.write_text(grain.scale_table(table.read_text(encoding="utf-8"), luma, cb, cr),
                       encoding="utf-8")
     grain.apply_table(encoded, scaled, chain, grainy)
     log.info("  grain strength calibrated to the source: luma x%.2f, Cb x%.2f, Cr x%.2f",
              luma, cb, cr)
+    return True
 
 
 def _work_dir(source: Path, cfg: Config) -> Path:
@@ -369,9 +372,12 @@ def _transcode(
     table: Path | None = None
 
     if cfg.grain.mode != "never":
-        report = grain.measure(read, chain, cfg, work)
-        log.info("  %s", report.describe(denoising=cfg.grain.denoise_before_encode))
-        if report.grainy and not dry_run:
+        wanted = True
+        if grain.needs_probe(cfg):
+            report = grain.measure(read, chain, cfg, work)
+            log.info("  %s", report.describe(denoising=cfg.grain.denoise_before_encode))
+            wanted = report.grainy
+        if wanted and not dry_run:
             table = grain.build_table(read, chain, cfg, report, work)
             if table is None:
                 log.warning("  no grain table; encoding without denoising to avoid losing grain")
@@ -405,10 +411,14 @@ def _transcode(
         # banded picture. Failing keeps the work directory, so Av1an resumes from
         # its finished chunks once the cause is fixed.
         grain.apply_table(encoded, table, chain, grainy)
+        keep = True
         if cfg.grain.calibrate:
-            _calibrate_grain(read, encoded, grainy, table, chain, cfg, work)
-        video = grainy
-        log.info("  film grain applied from table")
+            keep = _calibrate_grain(read, encoded, grainy, table, chain, cfg, work)
+        if keep:
+            video = grainy
+            log.info("  film grain applied from table")
+        else:
+            log.info("  the encode kept all the source's fine texture; no grain added")
 
     # When staging, mux locally rather than onto the destination disk. The result
     # only moves once it has earned its place, so an encode that fails the size

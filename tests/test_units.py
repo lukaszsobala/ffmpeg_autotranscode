@@ -1175,9 +1175,28 @@ class TestGrainCalibration(unittest.TestCase):
     def test_an_exact_match_needs_no_change(self):
         self.assertAlmostEqual(present(grain.strength_factor(10.0, 1.0, 10.0)), 1.0)
 
-    def test_inconclusive_measurements_give_no_answer(self):
-        self.assertIsNone(grain.strength_factor(10.0, 5.0, 5.0))    # nothing synthesised
-        self.assertIsNone(grain.strength_factor(4.0, 5.0, 9.0))     # encode already busier
+    def test_nothing_synthesised_gives_no_answer(self):
+        self.assertIsNone(grain.strength_factor(10.0, 5.0, 5.0))
+
+    def test_an_encode_that_kept_everything_needs_no_grain(self):
+        # A clean source: the encode has all its fine texture already.
+        self.assertEqual(grain.strength_factor(4.0, 5.0, 9.0), 0.0)
+
+    def test_auto_drops_grain_a_clean_source_does_not_need(self):
+        self.assertEqual(grain.decide_strength((0.05, 0.0, 0.0), "auto")[0], False)
+        keep, luma, *_ = grain.decide_strength((0.05, 0.0, 0.0), "always")
+        self.assertEqual((keep, luma), (True, grain.NEGLIGIBLE))
+
+    def test_measured_factors_pass_through_within_bounds(self):
+        measured = (1.12, 0.74, 0.45)   # the test film, as round 3 calibrated it
+        self.assertEqual(grain.decide_strength(measured, "auto"), (True, *measured))
+        self.assertEqual(grain.decide_strength((3.0, None, 0.0), "auto"), (True, 2.0, 1.0, 0.0))
+
+    def test_the_old_probe_only_runs_where_its_denoiser_still_matters(self):
+        cfg = config.Config()
+        self.assertFalse(grain.needs_probe(cfg))
+        cfg.grain.estimator = "grav1synth"
+        self.assertTrue(grain.needs_probe(cfg))
 
 
 class TestPerPlaneGrain(unittest.TestCase):

@@ -369,15 +369,21 @@ def build_table(
     info: MediaInfo,
     chain: Toolchain,
     cfg: Config,
-    report: GrainReport,
+    report: GrainReport | None,
     work: Path,
 ) -> Path | None:
-    """Derive a film grain table from the source. Returns None if it could not be made."""
+    """Derive a film grain table from the source. Returns None if it could not be made.
+
+    `report` is the grain probe's, needed only by the grav1synth estimator, which
+    diffs the source against the denoiser the probe chose.
+    """
     if not chain.grav1synth:
         log.warning("grav1synth unavailable; skipping grain table")
         return None
     if cfg.grain.estimator == "svt":
         return estimate_with_svt(info, chain, cfg, work)
+    if report is None:
+        raise ValueError("the grav1synth estimator needs the grain probe's report")
 
     if cfg.grain.analysis == "full":
         times = [0.0]
@@ -565,15 +571,55 @@ def strength_factor(source: float, underneath: float, with_grain: float) -> floa
 
     Energies add: the encode keeps some fine texture of its own (`underneath`), and
     synthesised grain adds (factor * amplitude) squared on top. Matching the source
-    means factor^2 * (with_grain - underneath) = source - underneath. None when the
-    measurements cannot support an answer -- no synthesised grain to scale, or an
-    encode that already carries more texture than the source.
+    means factor^2 * (with_grain - underneath) = source - underneath.
+
+    0.0 when the encode already has all the source's fine texture: there is no
+    grain to put back, which is the right answer for a clean source. None only
+    when nothing was synthesised, so there is nothing to scale.
     """
     synthesised = with_grain - underneath
-    wanted = source - underneath
-    if synthesised <= 0 or wanted <= 0:
+    if synthesised <= 0:
         return None
+    wanted = source - underneath
+    if wanted <= 0:
+        return 0.0
     return (wanted / synthesised) ** 0.5
+
+
+# Below this luma factor the synthesised grain would be a faint fraction of the
+# table's -- too little to see, so in "auto" the film ships without any.
+NEGLIGIBLE = 0.15
+
+
+def decide_strength(
+    measured: tuple[float | None, float | None, float | None], mode: str,
+) -> tuple[bool, float, float, float]:
+    """(keep grain?, luma, Cb, Cr factors) from calibration's measurements.
+
+    This is also the grain *detector*. The old one compared the source with an
+    hqdn3d-denoised copy and called the grainy test film clean (46 dB against a
+    44 dB threshold), so the grain route never ran on it. Calibration measures
+    exactly what matters instead -- how much fine texture the source has that the
+    encode lost -- and a clean source simply comes out near zero. "always" keeps
+    grain regardless, at no less than NEGLIGIBLE.
+
+    A plane that could not be measured keeps the table's strength (1.0).
+    """
+    luma, cb, cr = (1.0 if f is None else f for f in measured)
+    if mode == "auto" and measured[0] is not None and luma < NEGLIGIBLE:
+        return False, luma, cb, cr
+    luma = max(NEGLIGIBLE, min(2.0, luma))
+    return True, luma, min(2.0, cb), min(2.0, cr)
+
+
+def needs_probe(cfg: Config) -> bool:
+    """Whether the hqdn3d grain probe still decides anything.
+
+    With SVT estimating and nothing denoised before the encode, calibration is
+    the detector (see decide_strength). The probe's denoiser choice still matters
+    to the grav1synth estimator and to a pre-encode denoise.
+    """
+    return cfg.grain.estimator == "grav1synth" or cfg.grain.denoise_before_encode
 
 
 def calibrate_strength(
