@@ -49,6 +49,7 @@ and grain retention is measured with it on.
 
 from __future__ import annotations
 
+import functools
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -198,6 +199,50 @@ def worst_windows(
     return sorted(picked)
 
 
+def ffmpeg_argv(chain: Toolchain) -> list[str]:
+    """ffmpeg for the measurement passes, on the big cores when the CPU has them.
+
+    The kernel's energy-aware scheduler keeps a filter graph's threads on the
+    little cores, since no single one looks busy: on an RK3588 the low-pass
+    pass ran on the A55s at 2.4x the time it takes pinned to the A76s. The
+    blur and PSNR filters are the bottleneck once decoding is on the video
+    engine, so they get a thread per big core as well.
+    """
+    if not chain.big_cores:
+        return [chain.ffmpeg]
+    threads = str(len(chain.big_cores.split(",")))
+    return ["taskset", "-c", chain.big_cores, chain.ffmpeg, "-filter_complex_threads", threads]
+
+
+@functools.cache
+def _video_codec(ffprobe: str, path: Path) -> str:
+    try:
+        return run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name", "-of", "csv=p=0",
+                    str(path)]).stdout.strip()
+    except CommandError:
+        return ""
+
+
+def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
+    """Input options that decode `path` on the Rockchip video engine when that is exact.
+
+    Measured against software on this project's files: H.264 decodes
+    bit-identically, and AV1 matches too -- but without its film grain, which
+    av1_rkmpp never applies. So an AV1 file whose grain is wanted (`grain`)
+    stays on the CPU, while every pass that measures the picture underneath
+    the grain is free to use the hardware. Deinterlacing is on by default in
+    these decoders and would alter the frames, so it is turned off.
+    """
+    if not chain.rkmpp_decoders:
+        return []
+    codec = _video_codec(chain.ffprobe, path)
+    decoder = f"{codec}_rkmpp"
+    if decoder not in chain.rkmpp_decoders or (grain and codec == "av1"):
+        return []
+    return ["-c:v", decoder, "-deint", "0"]
+
+
 def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path) -> list[float]:
     """Per-frame luma XPSNR of `distorted` against `reference`.
 
@@ -214,8 +259,9 @@ def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path) -> li
     output is frame-exact; `ALIGN` renumbers both inputs 0, 1, 2...
     """
     argv = [
-        chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y",
-        "-i", str(reference),
+        *ffmpeg_argv(chain), "-hide_banner", "-nostats", "-v", "error", "-y",
+        *decode_args(chain, reference, grain=True), "-i", str(reference),
+        *decode_args(chain, distorted, grain=False),
         "-export_side_data", "film_grain", "-i", str(distorted),
         "-lavfi",
         f"[0:v]{ALIGN},format={XPSNR_FORMAT}[ref];"
@@ -245,8 +291,9 @@ def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path
     8-bit code value, and paired by index for the reason given in xpsnr().
     """
     argv = [
-        chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y",
-        "-i", str(reference),
+        *ffmpeg_argv(chain), "-hide_banner", "-nostats", "-v", "error", "-y",
+        *decode_args(chain, reference, grain=True), "-i", str(reference),
+        *decode_args(chain, distorted, grain=False),
         "-export_side_data", "film_grain", "-i", str(distorted),
         "-lavfi",
         f"[0:v]{ALIGN},format=yuv420p10le,{LOWPASS}[ref];"
@@ -261,8 +308,8 @@ def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path
 def noise_mse(chain: Toolchain, path: Path, stats: Path) -> list[float]:
     """Per-frame luma MSE between `path` and its median-filtered self: its grain."""
     argv = [
-        chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y",
-        "-i", str(path),
+        *ffmpeg_argv(chain), "-hide_banner", "-nostats", "-v", "error", "-y",
+        *decode_args(chain, path, grain=True), "-i", str(path),
         "-an", "-sn", "-dn",
         "-filter_complex",
         f"{GRAIN_GRAPH}psnr=stats_file={stats.as_posix()}",
@@ -318,7 +365,7 @@ def snapshots(
     view = PQ_TO_SDR if pq else "format=rgb24"
     pattern = out_dir / f".{label}_%03d.png"
     run([
-        chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y",
+        *ffmpeg_argv(chain), "-hide_banner", "-nostats", "-v", "error", "-y",
         "-i", str(path),
         "-vf", f"select='{chosen}',{view}",
         "-fps_mode", "passthrough",

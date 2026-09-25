@@ -42,6 +42,12 @@ class Toolchain:
     # Reported by `doctor` to identify the ffmpeg build; nothing here consumes it.
     # See "Why there is no hardware acceleration" in the README before wiring it up.
     hwaccels: set[str] = field(default_factory=set)
+    # Rockchip MPP decoders ("h264_rkmpp", "av1_rkmpp"...). verify decodes with
+    # them where they give the same frames as software; see verify.decode_args.
+    rkmpp_decoders: set[str] = field(default_factory=set)
+    # The fastest cores, as a taskset list ("4-7" on an RK3588), when the CPU
+    # mixes big and little ones. Empty on a uniform CPU. See verify.ffmpeg_argv.
+    big_cores: str = ""
     filters: set[str] = field(default_factory=set)
     encoders: set[str] = field(default_factory=set)
     # Long options SvtAv1EncApp actually accepts. Flags come and go between
@@ -109,6 +115,20 @@ def _capture(argv: list[str]) -> str:
     return (result.stdout or "") + (result.stderr or "")
 
 
+def _big_cores() -> str:
+    """The highest-capacity cores as "a,b,c", or "" when all cores are alike."""
+    capacity: dict[int, int] = {}
+    for path in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpu_capacity"):
+        try:
+            capacity[int(path.parent.name[3:])] = int(path.read_text())
+        except (OSError, ValueError):
+            continue
+    if len(set(capacity.values())) < 2:
+        return ""
+    top = max(capacity.values())
+    return ",".join(str(cpu) for cpu in sorted(capacity) if capacity[cpu] == top)
+
+
 def detect(cfg: Config) -> Toolchain:
     ffmpeg = _find_ffmpeg(cfg.paths.ffmpeg, "ffmpeg")
     ffprobe = _find_ffmpeg(cfg.paths.ffprobe, "ffprobe")
@@ -136,6 +156,11 @@ def detect(cfg: Config) -> Toolchain:
         for line in _capture([ffmpeg, "-hide_banner", "-hwaccels"]).splitlines()[1:]
         if line.strip()
     }
+    chain.rkmpp_decoders = {
+        parts[1]
+        for line in _capture([ffmpeg, "-hide_banner", "-decoders"]).splitlines()
+        if len(parts := line.split()) > 2 and parts[1].endswith("_rkmpp")
+    }
     chain.filters = {
         parts[1]
         for line in _capture([ffmpeg, "-hide_banner", "-filters"]).splitlines()
@@ -158,6 +183,7 @@ def detect(cfg: Config) -> Toolchain:
         chain.svt_options = set(re.findall(r"--[a-z0-9][a-z0-9-]+", _capture([svt, "--help"])))
 
     chain.has_vapoursynth = shutil.which("vspipe") is not None
+    chain.big_cores = _big_cores() if shutil.which("taskset") else ""
     return chain
 
 

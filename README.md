@@ -115,9 +115,22 @@ in av1an-core 0.5.2. The only ffmpeg passes this project runs itself are the gra
 probe and table build, which decode about eight seconds of video per film.
 
 A `machine.hwaccel_decode` option used to exist here. It was never read by
-anything, and its removal changed no behaviour. `doctor` still lists the build's
-decoders, because that is a useful way to confirm you have a Rockchip-enabled
-ffmpeg — not because they are used.
+anything, and its removal changed no behaviour.
+
+**`verify` is the exception.** It decodes a whole film and its encode several
+times over, so it uses the `*_rkmpp` decoders wherever they return the same
+frames as software. H.264 decodes bit-identically. AV1 matches too, but
+**without its film grain: `av1_rkmpp` never applies it.** So the grain measure
+decodes the encode on the CPU, and the passes that measure the picture under
+the grain use the hardware. Those passes are held back by their blur and PSNR
+filters, not by decoding, and the kernel keeps those threads on the A55 cores.
+Pinned to the A76s with a thread each, 3,000 SD frames took 52 s instead of
+144 s. Hardware decoding contributed only about 8% of that.
+
+That grain finding also matters for playback. **A player that decodes AV1 on the
+RK3588's video engine shows none of the synthesised grain**, which puts back the
+flat, grain-free look the grain was added to hide. Judge these encodes in a
+player that decodes AV1 in software (dav1d: mpv, VLC, most desktop browsers).
 
 jellyfin-ffmpeg still earns its place: `tonemapx` is in Jellyfin's fork and not
 upstream, and it is what makes Dolby Vision profile 5 transcodable at all here.
