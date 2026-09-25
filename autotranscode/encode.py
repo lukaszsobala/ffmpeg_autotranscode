@@ -89,6 +89,19 @@ def effective_crf(info: MediaInfo, cfg: Config) -> int:
     return max(1, min(70, cfg.encode.crf + ladder[str(band)]))
 
 
+def variance_boost_curve(info: MediaInfo, cfg: Config) -> str:
+    """The curve SVT-AV1 should judge flatness by: its PQ curve for HDR10 output.
+
+    PQ packs the shadows into few code values, so the default curve under-boosts
+    the dark flat areas of an HDR film. Decided on the output, not the source, so
+    a profile 5 tonemapped to SDR gets the SDR curve.
+    """
+    curve = str(cfg.encode.variance_boost_curve)
+    if curve != "auto":
+        return curve
+    return "2" if effective_color(info, cfg)[1] == "smpte2084" else "0"
+
+
 def svt_params(
     info: MediaInfo, cfg: Config, chain: Toolchain, crf: int | None = None
 ) -> list[str]:
@@ -109,6 +122,8 @@ def svt_params(
         if "--enable-variance-boost" in chain.svt_options:
             params += ["--enable-variance-boost", "1"]
         params += ["--variance-boost-strength", str(enc.variance_boost_strength)]
+        if "--variance-boost-curve" in chain.svt_options:
+            params += ["--variance-boost-curve", variance_boost_curve(info, cfg)]
 
     if enc.ac_bias > 0 and "--ac-bias" in chain.svt_options:
         # Biases rate-distortion toward high-frequency error; helps texture and

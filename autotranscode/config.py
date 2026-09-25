@@ -28,8 +28,9 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         # it costs 1.5x preset 4 for 1.9%, because the only tools it adds are the
         # self-guided restoration filter and the full PD0 path. Preset 2 is the next
         # real step (4x4 blocks and compound inter prediction), at ~22h per 2h film.
-        # crf 30 is the 1080p anchor; the resolution ladder puts 4K at 32, which is
-        # the value measured transparent on a 4K HDR source (50.8 dB luma PSNR).
+        # crf 30 is the 1080p anchor, and the resolution ladder keeps 4K there: with
+        # variance boost on, CRF 30 was the highest that kept a grainy 4K HDR film's
+        # fog and flat paper free of blocks (34 and 38 brought them back).
         "encode": {"preset": 4, "crf": 30, "chunk_method": "hybrid"},
         "grain": {"samples": 4, "sample_seconds": 2},
         "target_quality": {"enabled": False},
@@ -78,17 +79,19 @@ class Encode:
     # height-keyed ladder would file it as 1080p and under-encode it. Cropping
     # takes the bars off the top and bottom, so width is what stays put.
     crf_by_width: dict[str, int] = field(
-        default_factory=lambda: {"3000": 2, "1700": 0, "1100": -3, "0": -6}
+        default_factory=lambda: {"3000": 0, "1700": 0, "1100": -3, "0": -6}
     )
     pix_format: str = "yuv420p10le"
     tune: int = 0  # 0=VQ (subjective), 2=SSIM
-    # 0 = off, 1-4 = on at that strength. Off by default, measured: on the test
-    # film it raised quality on flat blocks at a price the eye never saw back. At
-    # CRF 32 it cost 2.65x the bits for what CRF 22 alone gives at 1.9x; every
-    # boosted variant sat about 1.3 dB of low-pass PSNR below plain CRF at equal
-    # bits, did nothing for the blocking in fog (grain synthesis fixes that), and
-    # coded stray checkerboard textures into flat areas.
-    variance_boost_strength: int = 0
+    # 0 = off, 1-4 = on at that strength. The only setting that removed the flat
+    # 64px blocks in fog and on paper on the grainy 4K test film: CRF 18 without
+    # it was as blocky as CRF 22, and synthesised grain is too faint to hide steps
+    # of 1-2 code values. Strength 2 at CRF 30 cost 1.4x the bits of plain CRF 22
+    # (85% saving instead of 89%) and was judged clean by eye.
+    variance_boost_strength: int = 2
+    # Which variance boost curve: 0 default, 1 low-medium contrast, 2 tuned for
+    # PQ. "auto" takes 2 for PQ (HDR10) output and 0 otherwise.
+    variance_boost_curve: str = "auto"
     ac_bias: float = 0.0
     keyint_sec: float = 10.0
     chunk_method: str = "hybrid"  # hybrid works without VapourSynth
@@ -354,6 +357,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("grain.svt_level must be between 1 and 50")
     if not 0 <= cfg.encode.variance_boost_strength <= 4:
         raise ConfigError("encode.variance_boost_strength must be 0 (off) to 4")
+    if str(cfg.encode.variance_boost_curve) not in {"auto", "0", "1", "2"}:
+        raise ConfigError("encode.variance_boost_curve must be auto, 0, 1 or 2")
     if cfg.library.min_bits_per_pixel < 0:
         raise ConfigError("library.min_bits_per_pixel cannot be negative")
     if cfg.grain.mode not in {"auto", "always", "never"}:

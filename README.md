@@ -20,7 +20,11 @@ having, SVT-AV1 simply discards it: on a grainy 4K film, CRF 32, 27 and 22 all l
 the same none of the source's grain, at 1x, 1.4x and 1.9x the bits. What goes with
 it matters more than the grain itself. Grain was dithering the smooth gradients —
 fog, skies, dark walls — and without it they collapse into flat blocks one 10-bit
-code value apart. No CRF fixed that; putting grain back did.
+code value apart. No CRF fixed that, and putting grain back only half did: the
+synthesised grain is too faint to hide steps that size. What removed them was
+SVT-AV1's variance boost, which spends bits on exactly those flat blocks. On by
+default at strength 2, with its PQ curve for HDR10, at CRF 30 for 4K: 1.4x the bits
+of plain CRF 22, still an 85% saving on the test film.
 
 AV1 can carry a compact description of grain in the bitstream and re-synthesise it
 at playback, so it costs almost nothing: grain added to the test film's encode
@@ -447,7 +451,7 @@ shifts it per band. With the default ladder and the rk3588 profile's anchor of 3
 
 | source | CRF |
 |---|---|
-| 4K | 32 |
+| 4K | 30 |
 | 1080p | 30 |
 | 720p | 27 |
 | 576p and below | 24 |

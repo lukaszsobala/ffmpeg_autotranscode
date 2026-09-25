@@ -840,11 +840,12 @@ class TestCrfLadder(unittest.TestCase):
 
     def test_each_band_shifts_from_the_1080p_anchor(self):
         widths = (3840, 2560, 1920, 1280, 854, 640)
-        self.assertEqual([self.crf_at(w) for w in widths], [32, 30, 30, 27, 24, 24])
+        self.assertEqual([self.crf_at(w) for w in widths], [30, 30, 30, 27, 24, 24])
 
     def test_a_cropped_scope_print_is_still_its_real_resolution(self):
         # The case that motivated keying on width: both of these are 4K sources
         # cropped to the picture, and their heights would file them as 1080p.
+        self.cfg.encode.crf_by_width["3000"] = 2
         self.assertEqual(self.crf_at(3836, height=2072), 32)
         self.assertEqual(self.crf_at(3840, height=1600), 32)
         # And the same crop one rung down stays 1080p rather than dropping to 720p.
@@ -853,16 +854,16 @@ class TestCrfLadder(unittest.TestCase):
     def test_the_anchor_moves_the_whole_ladder(self):
         # One knob still controls the library: --crf 28 lowers every band by 2.
         self.cfg.encode.crf = 28
-        self.assertEqual([self.crf_at(w) for w in (3840, 1920, 1280)], [30, 28, 25])
+        self.assertEqual([self.crf_at(w) for w in (3840, 1920, 1280)], [28, 28, 25])
 
     def test_an_empty_ladder_uses_the_plain_crf(self):
         self.cfg.encode.crf_by_width = {}
         self.assertEqual([self.crf_at(w) for w in (3840, 854)], [30, 30])
 
-    def test_rk3588_profile_still_puts_4k_at_the_measured_32(self):
+    def test_rk3588_profile_puts_4k_at_the_measured_30(self):
         cfg = config.Config()
         config._merge_profile(cfg, "rk3588")
-        self.assertEqual(encode.effective_crf(make_info(width=3836, height=2072), cfg), 32)
+        self.assertEqual(encode.effective_crf(make_info(width=3836, height=2072), cfg), 30)
 
     def test_a_ladder_that_leaves_the_valid_range_is_rejected(self):
         self.cfg.encode.crf = 68
@@ -1128,11 +1129,36 @@ class TestVarianceBoost(unittest.TestCase):
         self.assertNotIn("--enable-variance-boost", argv)
         self.assertNotIn("--variance-boost-strength", argv)
 
-    def test_it_is_off_unless_asked_for(self):
-        # Measured to cost 2-3x the bits on grainy 4K for no visible gain.
+    def test_it_is_on_by_default(self):
+        # The only setting that removed the flat-area blocks on the 4K test film.
         argv = encode.svt_params(make_info(), config.Config(),
                                  make_chain(svt_options={"--enable-variance-boost"}))
-        self.assertNotIn("--enable-variance-boost", argv)
+        self.assertEqual(argv[argv.index("--variance-boost-strength") + 1], "2")
+
+    def curve(self, cfg: config.Config | None = None, **info: Any) -> str:
+        argv = encode.svt_params(make_info(**info), cfg or config.Config(),
+                                 make_chain(svt_options={"--variance-boost-curve"}))
+        return argv[argv.index("--variance-boost-curve") + 1]
+
+    def test_pq_output_gets_the_pq_curve(self):
+        self.assertEqual(self.curve(color_transfer="smpte2084"), "2")
+        self.assertEqual(self.curve(color_transfer="bt709"), "0")
+
+    def test_an_explicit_curve_wins(self):
+        cfg = config.Config()
+        cfg.encode.variance_boost_curve = 1
+        self.assertEqual(self.curve(cfg, color_transfer="smpte2084"), "1")
+
+    def test_an_encoder_without_the_curve_is_not_asked_for_it(self):
+        argv = encode.svt_params(make_info(color_transfer="smpte2084"), config.Config(),
+                                 make_chain(svt_options={"--enable-variance-boost"}))
+        self.assertNotIn("--variance-boost-curve", argv)
+
+    def test_an_unknown_curve_is_rejected(self):
+        cfg = config.Config()
+        cfg.encode.variance_boost_curve = "hdr"
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
 
     def test_out_of_range_strength_is_rejected(self):
         cfg = config.Config()

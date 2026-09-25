@@ -49,9 +49,10 @@ crf = 30            # 1..70. Lower is higher quality and bigger. This is the
                     # value for a 1080p source; crf_by_width shifts it elsewhere.
 pix_format = "yuv420p10le"   # 10-bit even from 8-bit sources: cheap, and avoids banding.
 tune = 0            # 0 = VQ (subjective quality), 2 = SSIM. Use 0 for watching.
-variance_boost_strength = 0  # 0 off, 1-4 on. Spends more bits on flat and dark areas;
-                             # on a grainy 4K HDR film it cost 2-3x the bits for no
-                             # visible gain. Grain synthesis is what fixes flat areas.
+variance_boost_strength = 2  # 0 off, 1-4 on. Spends more bits on flat and dark areas.
+                             # The only setting that removed blocking in fog and flat
+                             # areas on a grainy 4K HDR film; more bits alone did not.
+variance_boost_curve = "auto" # "auto" uses SVT-AV1's PQ curve (2) for HDR10, else 0.
 ac_bias = 0.0       # 0..8. Above 0 preserves texture and residual grain. Try 0.5-1.0.
 keyint_sec = 10.0   # Keyframe interval in seconds.
 
@@ -81,7 +82,7 @@ extra_svt_params = []
 # 4K print can be 3840x1600 or 3836x2072, and keying on height would file it as
 # 1080p and under-encode it. Cropping removes bars top and bottom, not the sides.
 [encode.crf_by_width]
-3000 = 2            # 4K. crf 32 with the default anchor; measured transparent on 4K HDR.
+3000 = 0            # 4K. crf 30 with variance boost: the highest free of blocks on 4K HDR.
 1700 = 0            # 1080p
 1100 = -3           # 720p
 0 = -6              # 576p and below
