@@ -59,6 +59,12 @@ from .util import CommandError, log, run
 
 # Separates grain from structure for the retention measure; see the docstring.
 GRAIN_FILTER = "median=radius=1"
+# The grain measure as a filter graph: input [0:v], output to a psnr filter.
+# Everything is lifted to 10-bit first, because psnr reports MSE in the input's
+# own units: an 8-bit source measured against its 10-bit encode came out 16x
+# weaker, so verify read 200-390% retained and calibration, seeing the encode
+# already "had" all the grain, shipped every 8-bit film without any.
+GRAIN_GRAPH = f"[0:v]format=yuv420p10le,split=2[ref][pre];[pre]{GRAIN_FILTER}[den];[den][ref]"
 
 # Treat 'inf' (a frame identical to its reference) as this, so means stay finite.
 IDENTICAL_DB = 100.0
@@ -259,8 +265,7 @@ def noise_mse(chain: Toolchain, path: Path, stats: Path) -> list[float]:
         "-i", str(path),
         "-an", "-sn", "-dn",
         "-filter_complex",
-        f"[0:v]split=2[ref][pre];[pre]{GRAIN_FILTER}[den];"
-        f"[den][ref]psnr=stats_file={stats.as_posix()}",
+        f"{GRAIN_GRAPH}psnr=stats_file={stats.as_posix()}",
         "-f", "null", "-",
     ]
     run(argv)

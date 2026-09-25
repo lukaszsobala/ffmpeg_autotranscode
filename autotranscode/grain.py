@@ -36,7 +36,7 @@ from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
 from .util import CommandError, child_env, human_size, log, run
-from .verify import GRAIN_FILTER, parse_mse_log
+from .verify import GRAIN_GRAPH, parse_mse_log
 
 # Fixed reference denoiser used only for *measurement*, so scores are comparable
 # across files. The strength actually used for encoding is chosen from the score.
@@ -555,8 +555,7 @@ def window_grain(
             "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-i", str(path),
             "-an", "-sn", "-dn",
             "-filter_complex",
-            f"[0:v]split=2[ref][pre];[pre]{GRAIN_FILTER}[den];"
-            f"[den][ref]psnr=stats_file={stats.as_posix()}",
+            f"{GRAIN_GRAPH}psnr=stats_file={stats.as_posix()}",
             "-f", "null", "-",
         ])
         text = stats.read_text(encoding="utf-8", errors="replace")

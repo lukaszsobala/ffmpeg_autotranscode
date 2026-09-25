@@ -1040,6 +1040,11 @@ class TestGrainRetention(unittest.TestCase):
         # A quarter of the noise energy left is half the grain amplitude.
         self.assertAlmostEqual(verify.retention([4.0, 4.0], [1.0, 1.0]), 0.5)
 
+    def test_grain_is_measured_at_one_bit_depth(self):
+        # psnr reports MSE in the input's units, so an 8-bit source against its
+        # 10-bit encode read 16x weaker and calibration added no grain at all.
+        self.assertTrue(verify.GRAIN_GRAPH.startswith("[0:v]format=yuv420p10le,"))
+
     def test_grainless_source_frames_do_not_read_as_the_worst(self):
         self.assertEqual(verify.retention_by_frame([0.0, 4.0], [0.0, 1.0]), [1.0, 0.5])
 
