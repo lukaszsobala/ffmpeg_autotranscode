@@ -1000,6 +1000,26 @@ class TestMuxOutput(unittest.TestCase):
         self.assertEqual(argv[-3:-1], ["-f", "webm"])
 
 
+class TestPixelAspect(unittest.TestCase):
+    """AV1 carries no pixel shape, so a DVD's must be put back at the mux."""
+
+    def aspect(self, **info: Any) -> list[str]:
+        argv = mux.build_command(Path("/w/encoded.mkv"), make_info(**info),
+                                 Path("/out/Film.av1.mkv.part"), make_chain(), config.Config())
+        return argv[argv.index("-aspect") + 1:argv.index("-aspect") + 2] if "-aspect" in argv else []
+
+    def test_pal_dvds_keep_their_shape(self):
+        self.assertEqual(self.aspect(width=720, height=576, sample_aspect="16:15"), ["4:3"])
+        self.assertEqual(self.aspect(width=720, height=576, sample_aspect="64:45"), ["16:9"])
+
+    def test_square_pixels_add_nothing(self):
+        self.assertEqual(self.aspect(), [])
+
+    def test_probe_ignores_square_and_unknown_pixels(self):
+        self.assertEqual([probe._sample_aspect(v) for v in ("1:1", "0:1", "N/A", "", "16:15")],
+                         ["", "", "", "", "16:15"])
+
+
 class TestVerify(unittest.TestCase):
     """The parts of verification that decide something, rather than run ffmpeg."""
 

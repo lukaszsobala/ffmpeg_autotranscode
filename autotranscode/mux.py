@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from .config import Config
@@ -75,6 +76,16 @@ def _subtitle_maps(info: MediaInfo, cfg: Config) -> tuple[list[str], list[str]]:
 MUXERS = {"mkv": "matroska", "webm": "webm"}
 
 
+def display_aspect(info: MediaInfo) -> str:
+    """The picture's display aspect as "W:H" when its pixels are not square."""
+    if not info.sample_aspect or not info.width or not info.height:
+        return ""
+    num, den = (int(part) for part in info.sample_aspect.split(":"))
+    width, height = info.width * num, info.height * den
+    common = math.gcd(width, height)
+    return f"{width // common}:{height // common}"
+
+
 def build_command(
     video: Path, info: MediaInfo, output: Path, chain: Toolchain, cfg: Config
 ) -> list[str]:
@@ -90,6 +101,10 @@ def build_command(
         argv += ["-map", "1:a?"]
     argv += sub_maps
     argv += ["-c:v", "copy"]
+    if aspect := display_aspect(info):
+        # AV1 has no pixel-shape field for ffmpeg to copy, so without this a 4:3
+        # PAL DVD plays at 5:4 and a 16:9 one at nearly 4:3.
+        argv += ["-aspect", aspect]
     argv += _audio_args(info, cfg)
     argv += sub_codec
     argv += [

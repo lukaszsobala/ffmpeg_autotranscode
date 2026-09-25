@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -153,6 +154,9 @@ class MediaInfo:
     frames: int
     video_bitrate: int
     video_bytes: int = 0   # exact, from container tags; 0 when unknown
+    # Pixel shape, "16:15" for 4:3 PAL, "64:45" for a 16:9 DVD. Empty when the
+    # pixels are square. The encode carries none of it, so the mux restores it.
+    sample_aspect: str = ""
 
     color_primaries: str = ""
     color_transfer: str = ""
@@ -367,6 +371,14 @@ def _hdr10_metadata(
     return mastering, content_light
 
 
+def _sample_aspect(value: str) -> str:
+    """ffprobe's sample_aspect_ratio, or "" for square or unknown pixels."""
+    match = re.fullmatch(r"(\d+):(\d+)", value or "")
+    if not match or int(match[1]) == 0 or int(match[2]) == 0 or match[1] == match[2]:
+        return ""
+    return value
+
+
 def probe(path: Path, chain: Toolchain) -> MediaInfo:
     # -show_streams already carries stream-level side_data_list, which is where the
     # DOVI configuration record lives. Do not ask for the "side_data" section on top
@@ -430,6 +442,7 @@ def probe(path: Path, chain: Toolchain) -> MediaInfo:
         fps=fps,
         frames=frames,
         video_bitrate=video_bitrate,
+        sample_aspect=_sample_aspect(video.get("sample_aspect_ratio", "")),
         color_primaries=video.get("color_primaries", ""),
         color_transfer=video.get("color_transfer", ""),
         color_space=video.get("color_space", ""),
