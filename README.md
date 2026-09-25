@@ -118,19 +118,20 @@ A `machine.hwaccel_decode` option used to exist here. It was never read by
 anything, and its removal changed no behaviour.
 
 **`verify` is the exception.** It decodes a whole film and its encode several
-times over, so it uses the `*_rkmpp` decoders wherever they return the same
-frames as software. H.264 decodes bit-identically. AV1 matches too, but
-**without its film grain: `av1_rkmpp` never applies it.** So the grain measure
-decodes the encode on the CPU, and the passes that measure the picture under
-the grain use the hardware. Those passes are held back by their blur and PSNR
-filters, not by decoding, and the kernel keeps those threads on the A55 cores.
-Pinned to the A76s with a thread each, 3,000 SD frames took 52 s instead of
-144 s. Hardware decoding contributed only about 8% of that.
+times over, so it decodes H.264 sources with `h264_rkmpp`, which matched
+software on every frame of two films. AV1 stays on the CPU. `av1_rkmpp` never
+applies film grain, and it decoded a 1202-wide encode wrongly: 14,487 of 14,584
+frames differed from dav1d's, at 20-28 dB. A 1920-wide encode matched exactly.
+Decoding was never the bottleneck anyway. The blur and PSNR filters are, and the
+kernel keeps their threads on the A55 cores. Pinned to the A76s with a thread
+each, 3,000 SD frames took 52 s instead of 144 s. Hardware decoding contributed
+only about 8% of that.
 
-That grain finding also matters for playback. **A player that decodes AV1 on the
-RK3588's video engine shows none of the synthesised grain**, which puts back the
-flat, grain-free look the grain was added to hide. Judge these encodes in a
-player that decodes AV1 in software (dav1d: mpv, VLC, most desktop browsers).
+Both AV1 findings matter for playback. **A player that decodes AV1 on the RK3588's
+video engine shows none of the synthesised grain.** That puts back the flat,
+grain-free look the grain was added to hide. At some frame sizes it may show
+wrong pictures too. Judge these encodes in a player that decodes AV1 in software
+(dav1d: mpv, VLC, most desktop browsers).
 
 jellyfin-ffmpeg still earns its place: `tonemapx` is in Jellyfin's fork and not
 upstream, and it is what makes Dolby Vision profile 5 transcodable at all here.

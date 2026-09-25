@@ -1068,7 +1068,6 @@ class TestGrainRetention(unittest.TestCase):
 
     def test_hardware_decodes_what_it_decodes_exactly(self):
         self.assertEqual(self.decoder("h264", grain=True), ["-c:v", "h264_rkmpp", "-deint", "0"])
-        self.assertEqual(self.decoder("av1", grain=False), ["-c:v", "av1_rkmpp", "-deint", "0"])
 
     def test_measurements_run_on_the_big_cores(self):
         argv = verify.ffmpeg_argv(make_chain(big_cores="4,5,6,7"))
@@ -1078,9 +1077,10 @@ class TestGrainRetention(unittest.TestCase):
     def test_a_uniform_cpu_runs_plain_ffmpeg(self):
         self.assertEqual(verify.ffmpeg_argv(make_chain()), ["ffmpeg"])
 
-    def test_av1_grain_needs_the_software_decoder(self):
-        # av1_rkmpp never applies film grain, so the grain measure would read none.
+    def test_av1_stays_on_the_cpu(self):
+        # av1_rkmpp drops film grain and decoded a 1202-wide encode wrongly.
         self.assertEqual(self.decoder("av1", grain=True), [])
+        self.assertEqual(self.decoder("av1", grain=False), [])
 
     def test_no_rkmpp_build_means_software(self):
         self.assertEqual(self.decoder("h264", grain=False, rkmpp=set()), [])

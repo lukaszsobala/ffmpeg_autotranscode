@@ -199,6 +199,10 @@ def worst_windows(
     return sorted(picked)
 
 
+# Codecs whose rkmpp decode matched software on every frame; see decode_args.
+EXACT_RKMPP = frozenset({"h264"})
+
+
 def ffmpeg_argv(chain: Toolchain) -> list[str]:
     """ffmpeg for the measurement passes, on the big cores when the CPU has them.
 
@@ -227,18 +231,19 @@ def _video_codec(ffprobe: str, path: Path) -> str:
 def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
     """Input options that decode `path` on the Rockchip video engine when that is exact.
 
-    Measured against software on this project's files: H.264 decodes
-    bit-identically, and AV1 matches too -- but without its film grain, which
-    av1_rkmpp never applies. So an AV1 file whose grain is wanted (`grain`)
-    stays on the CPU, while every pass that measures the picture underneath
-    the grain is free to use the hardware. Deinterlacing is on by default in
-    these decoders and would alter the frames, so it is turned off.
+    Only for codecs checked frame by frame against software. H.264 was
+    bit-identical on every frame of two films. AV1 is not trusted: av1_rkmpp
+    never applies film grain, and on a 1202-wide encode 14,487 of 14,584
+    frames came out different (20-28 dB), though a 1920-wide one matched.
+    `grain` is kept for the day another codec qualifies that carries grain.
+    Deinterlacing is on by default in these decoders and would alter the
+    frames, so it is turned off.
     """
     if not chain.rkmpp_decoders:
         return []
     codec = _video_codec(chain.ffprobe, path)
     decoder = f"{codec}_rkmpp"
-    if decoder not in chain.rkmpp_decoders or (grain and codec == "av1"):
+    if codec not in EXACT_RKMPP or decoder not in chain.rkmpp_decoders:
         return []
     return ["-c:v", decoder, "-deint", "0"]
 
