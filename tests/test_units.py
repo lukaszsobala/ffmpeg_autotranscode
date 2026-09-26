@@ -839,9 +839,9 @@ class TestCrfLadder(unittest.TestCase):
     def crf_at(self, width: int, height: int = 1080) -> int:
         return encode.effective_crf(make_info(width=width, height=height), self.cfg)
 
-    def test_each_band_shifts_from_the_1080p_anchor(self):
+    def test_each_band_shifts_from_the_4k_anchor(self):
         widths = (3840, 2560, 1920, 1280, 854, 640)
-        self.assertEqual([self.crf_at(w) for w in widths], [30, 30, 30, 27, 24, 24])
+        self.assertEqual([self.crf_at(w) for w in widths], [30, 37, 37, 27, 24, 24])
 
     def test_a_cropped_scope_print_is_still_its_real_resolution(self):
         # The case that motivated keying on width: both of these are 4K sources
@@ -850,12 +850,12 @@ class TestCrfLadder(unittest.TestCase):
         self.assertEqual(self.crf_at(3836, height=2072), 32)
         self.assertEqual(self.crf_at(3840, height=1600), 32)
         # And the same crop one rung down stays 1080p rather than dropping to 720p.
-        self.assertEqual(self.crf_at(1920, height=800), 30)
+        self.assertEqual(self.crf_at(1920, height=800), 37)
 
     def test_the_anchor_moves_the_whole_ladder(self):
         # One knob still controls the library: --crf 28 lowers every band by 2.
         self.cfg.encode.crf = 28
-        self.assertEqual([self.crf_at(w) for w in (3840, 1920, 1280)], [28, 28, 25])
+        self.assertEqual([self.crf_at(w) for w in (3840, 1920, 1280)], [28, 35, 25])
 
     def test_an_empty_ladder_uses_the_plain_crf(self):
         self.cfg.encode.crf_by_width = {}
@@ -1179,13 +1179,36 @@ class TestVarianceBoost(unittest.TestCase):
         self.assertNotIn("--enable-variance-boost", argv)
         self.assertNotIn("--variance-boost-strength", argv)
 
-    def test_it_is_on_by_default(self):
-        # The only setting that removed the flat-area blocks on the 4K test film.
-        argv = encode.svt_params(make_info(), config.Config(),
-                                 make_chain(svt_options={"--enable-variance-boost"}))
+    def test_it_is_on_by_default_at_4k_only(self):
+        # The only setting that removed the flat-area blocks on the 4K test film,
+        # and a loss at every lower resolution tested.
+        chain = make_chain(svt_options={"--enable-variance-boost"})
+        argv = encode.svt_params(make_info(width=3836, height=2072), config.Config(), chain)
         self.assertEqual(argv[argv.index("--variance-boost-strength") + 1], "2")
+        for width in (1920, 1280, 720):
+            argv = encode.svt_params(make_info(width=width), config.Config(), chain)
+            self.assertNotIn("--variance-boost-strength", argv)
+
+    def test_a_table_is_read_by_band(self):
+        cfg = config.Config()
+        cfg.encode.variance_boost_strength = {"1700": 3, "0": 1}
+        chain = make_chain(svt_options=set())
+        strength = [encode.svt_params(make_info(width=w), cfg, chain)
+                    for w in (3840, 1920, 720)]
+        self.assertEqual([a[a.index("--variance-boost-strength") + 1] for a in strength],
+                         ["3", "3", "1"])
+
+    def test_a_table_is_checked_band_by_band(self):
+        cfg = config.Config()
+        cfg.encode.variance_boost_strength = {"3000": 2, "0": 7}
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
+        cfg.encode.variance_boost_strength = {"wide": 2}
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
 
     def curve(self, cfg: config.Config | None = None, **info: Any) -> str:
+        info.setdefault("width", 3840)    # variance boost is on at 4K only
         argv = encode.svt_params(make_info(**info), cfg or config.Config(),
                                  make_chain(svt_options={"--variance-boost-curve"}))
         return argv[argv.index("--variance-boost-curve") + 1]
@@ -1200,8 +1223,10 @@ class TestVarianceBoost(unittest.TestCase):
         self.assertEqual(self.curve(cfg, color_transfer="smpte2084"), "1")
 
     def test_an_encoder_without_the_curve_is_not_asked_for_it(self):
-        argv = encode.svt_params(make_info(color_transfer="smpte2084"), config.Config(),
+        argv = encode.svt_params(make_info(width=3840, color_transfer="smpte2084"),
+                                 config.Config(),
                                  make_chain(svt_options={"--enable-variance-boost"}))
+        self.assertIn("--variance-boost-strength", argv)
         self.assertNotIn("--variance-boost-curve", argv)
 
     def test_an_unknown_curve_is_rejected(self):
@@ -1215,6 +1240,44 @@ class TestVarianceBoost(unittest.TestCase):
         cfg.encode.variance_boost_strength = 5
         with self.assertRaises(config.ConfigError):
             config.validate(cfg)
+
+
+class TestDarkBias(unittest.TestCase):
+    """1080p pays for its higher CRF with a lower QP on dark frames."""
+
+    OPTIONS = {"--luminance-qp-bias"}
+
+    def bias_at(self, width: int, cfg: config.Config | None = None,
+                options: set[str] = OPTIONS) -> str | None:
+        argv = encode.svt_params(make_info(width=width), cfg or config.Config(),
+                                 make_chain(svt_options=options))
+        return argv[argv.index("--luminance-qp-bias") + 1] \
+            if "--luminance-qp-bias" in argv else None
+
+    def test_only_1080p_gets_it_by_default(self):
+        self.assertEqual([self.bias_at(w) for w in (3840, 1920, 1280, 720)],
+                         [None, "100", None, None])
+
+    def test_one_number_applies_everywhere(self):
+        cfg = config.Config()
+        cfg.encode.luminance_qp_bias = 40
+        self.assertEqual([self.bias_at(w, cfg) for w in (3840, 720)], ["40", "40"])
+
+    def test_an_encoder_without_it_is_not_asked_for_it(self):
+        self.assertIsNone(self.bias_at(1920, options=set()))
+
+    def test_out_of_range_is_rejected(self):
+        cfg = config.Config()
+        cfg.encode.luminance_qp_bias = {"1700": 101}
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
+
+    def test_a_table_loads_from_toml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text("[encode.luminance_qp_bias]\n1700 = 60\n0 = 0\n")
+            cfg = config.load(path)
+        self.assertEqual([self.bias_at(w, cfg) for w in (3840, 1920, 720)], ["60", "60", None])
 
 
 class TestGrainTableScaling(unittest.TestCase):

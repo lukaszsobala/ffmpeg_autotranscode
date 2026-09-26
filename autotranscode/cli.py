@@ -335,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("no media files found")
         return 1
 
-    crf = f"{cfg.encode.crf} at 1080p, by resolution" if cfg.encode.crf_by_width \
+    crf = f"{cfg.encode.crf} at 4K, by resolution" if cfg.encode.crf_by_width \
         else str(cfg.encode.crf)
     log.info("%d file(s) queued, profile=%s preset=%d crf=%s grain=%s",
              len(sources), cfg.machine.profile, cfg.encode.preset, crf, cfg.grain.mode)

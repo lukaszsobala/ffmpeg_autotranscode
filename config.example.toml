@@ -46,12 +46,9 @@ state_file = "~/.cache/autotranscode/state.json"
 [encode]
 preset = 4          # SVT-AV1 preset, -1 (slowest) .. 13. Each step is ~1.5-2.2x speed.
 crf = 30            # 1..70. Lower is higher quality and bigger. This is the
-                    # value for a 1080p source; crf_by_width shifts it elsewhere.
+                    # value for a 4K source; crf_by_width shifts it elsewhere.
 pix_format = "yuv420p10le"   # 10-bit even from 8-bit sources: cheap, and avoids banding.
 tune = 0            # 0 = VQ (subjective quality), 2 = SSIM. Use 0 for watching.
-variance_boost_strength = 2  # 0 off, 1-4 on. Spends more bits on flat and dark areas.
-                             # The only setting that removed blocking in fog and flat
-                             # areas on a grainy 4K HDR film; more bits alone did not.
 variance_boost_curve = "auto" # "auto" uses SVT-AV1's PQ curve (2) for HDR10, else 0.
 ac_bias = 0.0       # 0..8. Above 0 preserves texture and residual grain. Try 0.5-1.0.
 keyint_sec = 10.0   # Keyframe interval in seconds.
@@ -83,9 +80,29 @@ extra_svt_params = []
 # 1080p and under-encode it. Cropping removes bars top and bottom, not the sides.
 [encode.crf_by_width]
 3000 = 0            # 4K. crf 30 with variance boost: the highest free of blocks on 4K HDR.
-1700 = 0            # 1080p
+1700 = 7            # 1080p: 37, and only because of the dark bias below. Without it,
+                    # a grainy 1080p film blocked in a dark scene even at 32.
 1100 = -3           # 720p
 0 = -6              # 576p and below
+
+# The next two take either one number for everything or a table like the one
+# above, where a source gets the value of the band it falls in.
+
+# Variance boost: 0 off, 1-4 on. Spends more bits on flat areas. The only setting
+# that removed blocking in fog and flat areas on a grainy 4K HDR film; more bits
+# alone did not. Below 4K it lost every test: the same size, a worse picture.
+[encode.variance_boost_strength]
+3000 = 2
+0 = 0
+
+# Dark bias, 0-100: a lower QP for dark frames, the darker the lower. It fixed
+# shadows smearing into blocks on a grainy 1080p film where more bits and variance
+# boost did not, and 100 with a higher CRF cost less than 25 or 50 with a lower
+# one. It acts on whole frames, so a dim film pays for it on most of them.
+[encode.luminance_qp_bias]
+3000 = 0
+1700 = 100
+1100 = 0
 
 # Sampling for `estimate`, which ranks a library by what a real encode would save.
 [estimate]

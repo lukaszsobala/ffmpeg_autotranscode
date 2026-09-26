@@ -23,8 +23,9 @@ fog, skies, dark walls — and without it they collapse into flat blocks one 10-
 code value apart. No CRF fixed that, and putting grain back only half did: the
 synthesised grain is too faint to hide steps that size. What removed them was
 SVT-AV1's variance boost, which spends bits on exactly those flat blocks. On by
-default at strength 2, with its PQ curve for HDR10, at CRF 30 for 4K: 1.4x the bits
-of plain CRF 22, still an 85% saving on the test film.
+default for 4K at strength 2, with its PQ curve for HDR10, at CRF 30: 1.4x the bits
+of plain CRF 22, still an 85% saving on the test film. Lower resolutions need
+different fixes; see [Quality scales with resolution](#quality-scales-with-resolution).
 
 AV1 can carry a compact description of grain in the bitstream and re-synthesise it
 at playback, so it costs almost nothing: grain added to the test film's encode
@@ -460,20 +461,35 @@ screen: at 576p each one is magnified several times more than at 2160p. Hold CRF
 constant across a mixed library and the small files come out looking the worst,
 which is the usual reason people conclude AV1 is weak at low resolution.
 
-`encode.crf` is therefore the value for a 1080p source, and `encode.crf_by_width`
-shifts it per band. With the default ladder and the rk3588 profile's anchor of 30:
+`encode.crf` is therefore the value for a 4K source, and `encode.crf_by_width`
+shifts it per band. Two other settings change by band too, because what fixed
+blocking at one resolution lost at another:
 
-| source | CRF |
-|---|---|
-| 4K | 30 |
-| 1080p | 30 |
-| 720p | 27 |
-| 576p and below | 24 |
+| source | CRF | variance boost | dark bias |
+|---|---|---|---|
+| 4K | 30 | 2 | off |
+| 1080p | 37 | off | 100 |
+| 720p | 27 | off | off |
+| 576p and below | 24 | off | off |
+
+- **Variance boost** spends more bits on flat areas. It was the only thing that
+  cleared blocking in fog and on flat paper in a grainy 4K HDR film. Below 4K it
+  lost at every resolution tested: the same size bought a worse picture.
+- **Dark bias** (`encode.luminance_qp_bias`, SVT-AV1's `--luminance-qp-bias`)
+  lowers the QP of dark frames. A grainy 1080p film smeared its shadows into
+  blocks in a dark scene at CRF 32, and neither more bits nor variance boost fixed
+  it. Bias 100 at CRF 37 did, for 1.32x the size of CRF 32 without the bias. Bias
+  25 or 50, at the lower CRFs needed to match it in that scene, cost more. The
+  bias works on whole frames, so a dim film pays for it on most of them. **1080p's
+  CRF 37 depends on it**: drop the bias and bring 1080p back to about 32.
+
+Both settings take either one number for every source or a table keyed by width
+like the CRF ladder.
 
 `--crf` still moves everything at once, because it sets the anchor the ladder
 shifts from. Bands are keyed by **width**: a scope film is cropped to its picture,
 so a 4K print can be 3840x1600 or 3836x2072, and keying on height would file it as
-1080p and under-encode it. Empty the table to go back to one CRF for everything.
+1080p and under-encode it. Empty the CRF table to go back to one CRF for everything.
 
 ## What it refuses to do
 

@@ -76,7 +76,7 @@ def effective_crf(info: MediaInfo, cfg: Config) -> int:
     several times more on the same screen than one at 2160p, so holding CRF
     constant across a library means the small files look the worst. The ladder in
     `encode.crf_by_width` corrects for that; `encode.crf` remains the one knob
-    that moves everything, and the 1080p band is what it means literally.
+    that moves everything, and the 4K band is what it means literally.
 
     Bands are keyed by width because a scope film arrives cropped to its picture:
     3836x2072 is a 4K source whose height would file it as 1080p.
@@ -84,9 +84,20 @@ def effective_crf(info: MediaInfo, cfg: Config) -> int:
     ladder = cfg.encode.crf_by_width
     if not ladder:
         return cfg.encode.crf
-    bands = sorted((int(width) for width in ladder), reverse=True)
+    return max(1, min(70, cfg.encode.crf + by_width(ladder, info)))
+
+
+def by_width(value: int | dict[str, int], info: MediaInfo) -> int:
+    """A setting's value for this source: itself, or its entry in a width table.
+
+    The table's keys are the smallest width of each band; a source takes the
+    widest band it reaches, and anything narrower than every key the narrowest.
+    """
+    if not isinstance(value, dict):
+        return value
+    bands = sorted((int(width) for width in value), reverse=True)
     band = next((width for width in bands if info.width >= width), bands[-1])
-    return max(1, min(70, cfg.encode.crf + ladder[str(band)]))
+    return value[str(band)]
 
 
 def variance_boost_curve(info: MediaInfo, cfg: Config) -> str:
@@ -118,12 +129,18 @@ def svt_params(
     # for, and the strength alone does not turn it on -- this project passed
     # --variance-boost-strength for months without --enable-variance-boost, so the
     # encoder logged "Variance Boost : 0" and the flat areas blocked up.
-    if enc.variance_boost_strength > 0:
+    if (strength := by_width(enc.variance_boost_strength, info)) > 0:
         if "--enable-variance-boost" in chain.svt_options:
             params += ["--enable-variance-boost", "1"]
-        params += ["--variance-boost-strength", str(enc.variance_boost_strength)]
+        params += ["--variance-boost-strength", str(strength)]
         if "--variance-boost-curve" in chain.svt_options:
             params += ["--variance-boost-curve", variance_boost_curve(info, cfg)]
+
+    # Dark frames get a lower QP. Skipped on an encoder without it rather than
+    # failing the run; `doctor` says whether it is there.
+    bias = by_width(enc.luminance_qp_bias, info)
+    if bias > 0 and "--luminance-qp-bias" in chain.svt_options:
+        params += ["--luminance-qp-bias", str(bias)]
 
     if enc.ac_bias > 0 and "--ac-bias" in chain.svt_options:
         # Biases rate-distortion toward high-frequency error; helps texture and

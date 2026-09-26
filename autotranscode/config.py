@@ -28,9 +28,9 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         # it costs 1.5x preset 4 for 1.9%, because the only tools it adds are the
         # self-guided restoration filter and the full PD0 path. Preset 2 is the next
         # real step (4x4 blocks and compound inter prediction), at ~22h per 2h film.
-        # crf 30 is the 1080p anchor, and the resolution ladder keeps 4K there: with
-        # variance boost on, CRF 30 was the highest that kept a grainy 4K HDR film's
-        # fog and flat paper free of blocks (34 and 38 brought them back).
+        # crf 30 is the 4K anchor: with variance boost on, it was the highest that
+        # kept a grainy 4K HDR film's fog and flat paper free of blocks (34 and 38
+        # brought them back). The resolution ladder shifts the other bands from it.
         "encode": {"preset": 4, "crf": 30, "chunk_method": "hybrid"},
         "grain": {"samples": 4, "sample_seconds": 2},
         "target_quality": {"enabled": False},
@@ -66,7 +66,7 @@ class Machine:
 @dataclass(slots=True)
 class Encode:
     preset: int = 6
-    # The CRF for a 1080p source. Other resolutions shift from it by crf_by_width,
+    # The CRF for a 4K source. Other resolutions shift from it by crf_by_width,
     # so this one number still moves the whole library's quality.
     crf: int = 30
     # CRF is not resolution-neutral: a coded pixel at 576p covers far more of the
@@ -78,20 +78,43 @@ class Encode:
     # cropped to its picture, so a 4K print is 3840x1600 or even 3836x2072, and a
     # height-keyed ladder would file it as 1080p and under-encode it. Cropping
     # takes the bars off the top and bottom, so width is what stays put.
+    #
+    # 1080p sits above 4K, not level with it, because it pairs with a dark bias
+    # (luminance_qp_bias below) that already spends its bits where it blocked.
+    # Without that bias, 37 is too high for 1080p: take the shift back to about 2.
     crf_by_width: dict[str, int] = field(
-        default_factory=lambda: {"3000": 0, "1700": 0, "1100": -3, "0": -6}
+        default_factory=lambda: {"3000": 0, "1700": 7, "1100": -3, "0": -6}
     )
     pix_format: str = "yuv420p10le"
     tune: int = 0  # 0=VQ (subjective), 2=SSIM
-    # 0 = off, 1-4 = on at that strength. The only setting that removed the flat
-    # 64px blocks in fog and on paper on the grainy 4K test film: CRF 18 without
-    # it was as blocky as CRF 22, and synthesised grain is too faint to hide steps
-    # of 1-2 code values. Strength 2 at CRF 30 cost 1.4x the bits of plain CRF 22
-    # (85% saving instead of 89%) and was judged clean by eye.
-    variance_boost_strength: int = 2
+    # 0 = off, 1-4 = on at that strength. Either one number, or a table keyed by
+    # width like crf_by_width, taking the value of the band a source falls in.
+    #
+    # On at 4K only. The only setting that removed the flat 64px blocks in fog and
+    # on paper on the grainy 4K test film: CRF 18 without it was as blocky as
+    # CRF 22, and synthesised grain is too faint to hide steps of 1-2 code values.
+    # Strength 2 at CRF 30 cost 1.4x the bits of plain CRF 22 (85% saving instead
+    # of 89%) and was judged clean by eye. Below 4K it lost at every resolution
+    # tested: the same size bought a lower score, and a grainy 1080p film came out
+    # 1.5x the size of its source.
+    variance_boost_strength: int | dict[str, int] = field(
+        default_factory=lambda: {"3000": 2, "0": 0}
+    )
     # Which variance boost curve: 0 default, 1 low-medium contrast, 2 tuned for
     # PQ. "auto" takes 2 for PQ (HDR10) output and 0 otherwise.
     variance_boost_curve: str = "auto"
+    # 0-100: lower the QP of dark frames, in proportion to how dark they are.
+    # One number or a width table, as above. It works per frame, not per block,
+    # so a dim film pays for it on most of its frames.
+    #
+    # On at 1080p only. A grainy 8-bit 1080p film smeared its shadows into blocks
+    # in a dark red scene at CRF 32, and neither more bits (CRF 30), variance boost
+    # nor chroma offsets fixed it. 100 at CRF 37 did, and for less than 25 or 50 at
+    # the lower CRFs that matched it in that scene: 1.32x the bits of CRF 32
+    # without the bias, against 1.57x and 1.46x.
+    luminance_qp_bias: int | dict[str, int] = field(
+        default_factory=lambda: {"3000": 0, "1700": 100, "1100": 0}
+    )
     ac_bias: float = 0.0
     keyint_sec: float = 10.0
     chunk_method: str = "hybrid"  # hybrid works without VapourSynth
@@ -338,6 +361,18 @@ def load(path: Path | None) -> Config:
     return cfg
 
 
+def _check_by_width(value: Any, name: str, low: int, high: int, span: str) -> None:
+    """A setting that is one number, or a table of numbers keyed by width."""
+    table = value if isinstance(value, dict) else {"0": value}
+    if not table:
+        raise ConfigError(f"{name} needs at least one band; use 0 to turn it off")
+    for width, number in table.items():
+        if not str(width).isdigit():
+            raise ConfigError(f"{name} keys must be widths; got '{width}'")
+        if isinstance(number, bool) or not isinstance(number, int) or not low <= number <= high:
+            raise ConfigError(f"{name} must be {span}; got {number!r}")
+
+
 def validate(cfg: Config) -> None:
     if not -1 <= cfg.encode.preset <= 13:
         raise ConfigError("encode.preset must be between -1 and 13")
@@ -351,12 +386,14 @@ def validate(cfg: Config) -> None:
                 f"encode.crf_by_width['{width}'] puts CRF outside 1-70 "
                 f"(encode.crf {cfg.encode.crf} {shift:+d})"
             )
+    _check_by_width(cfg.encode.variance_boost_strength, "encode.variance_boost_strength",
+                    0, 4, "0 (off) to 4")
+    _check_by_width(cfg.encode.luminance_qp_bias, "encode.luminance_qp_bias",
+                    0, 100, "0 (off) to 100")
     if cfg.grain.estimator not in {"svt", "grav1synth"}:
         raise ConfigError("grain.estimator must be svt or grav1synth")
     if not 1 <= cfg.grain.svt_level <= 50:
         raise ConfigError("grain.svt_level must be between 1 and 50")
-    if not 0 <= cfg.encode.variance_boost_strength <= 4:
-        raise ConfigError("encode.variance_boost_strength must be 0 (off) to 4")
     if str(cfg.encode.variance_boost_curve) not in {"auto", "0", "1", "2"}:
         raise ConfigError("encode.variance_boost_curve must be auto, 0, 1 or 2")
     if cfg.library.min_bits_per_pixel < 0:

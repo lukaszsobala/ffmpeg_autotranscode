@@ -152,6 +152,8 @@ def variant_config(base: config.Config, variant: Variant, root: Path, preset: in
     cfg.encode.crf = variant.crf
     cfg.encode.crf_by_width = {}              # the CRF named is the CRF used
     cfg.encode.extra_svt_params = list(variant.svt)
+    if "--luminance-qp-bias" in variant.svt:
+        cfg.encode.luminance_qp_bias = 0      # the variant's own bias, not ours as well
     if preset is not None:
         cfg.encode.preset = preset
     cfg.grain.mode = variant.grain

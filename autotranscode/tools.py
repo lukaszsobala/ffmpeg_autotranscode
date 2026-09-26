@@ -242,6 +242,8 @@ def describe(chain: Toolchain) -> str:
         f"hdr10 meta  {'yes' if chain.has_hdr10_metadata else 'no'}  "
         "(--mastering-display / --content-light)",
         f"ac-bias     {'yes' if '--ac-bias' in chain.svt_options else 'no'}",
+        f"dark bias   {'yes' if '--luminance-qp-bias' in chain.svt_options else 'no'}  "
+        "(--luminance-qp-bias, for 1080p)",
         f"dovi p5     {'yes' if chain.has_dovi_tonemap else 'no'}  "
         "(tonemapx, for profile 5 -> SDR)",
         f"hwaccels    {', '.join(sorted(chain.hwaccels)) or 'none'}  "
