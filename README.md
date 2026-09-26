@@ -152,15 +152,18 @@ What it installs, and from where:
 | | Debian / Ubuntu | macOS |
 |---|---|---|
 | jellyfin-ffmpeg | Jellyfin's apt repository; its portable build where the repository has no packages | its portable build, into `~/.local/lib/jellyfin-ffmpeg` |
-| SVT-AV1 4.0.0 | built from source into `~/.local` | built from source into `~/.local` |
+| SVT-AV1 4.2.0 | built from source into `~/.local` | built from source into `~/.local` |
 | VapourSynth (Av1an will not link without it) | built from source into `~/.local` | Homebrew |
 | Av1an | `cargo install` | Homebrew |
 | grav1synth | `cargo install` | `cargo install` |
 | mkvtoolnix, Python 3.11+ | apt | Homebrew |
 
-SVT-AV1 is pinned rather than taken from a package manager. The per-resolution
-settings were judged by eye on 4.0.0, and distributions lag far behind: Debian 13
-ships 2.3.0, which lacks the dark bias that 1080p's CRF depends on. `doctor` and
+SVT-AV1 is pinned rather than taken from a package manager. Distributions lag far
+behind: Debian 13 ships 2.3.0, which lacks the dark bias that 1080p's CRF depends
+on. The per-resolution settings were judged by eye on 4.0.0. On the same 1080p
+excerpts at the same settings, 4.2.0 came out 2% smaller and 0.2 dB lower
+(within what a CRF step moves), and encoded 5-10% faster on the RK3588, where
+4.1 and 4.2 added NEON kernels. `doctor` and
 `run` refuse an encoder missing an option the configured quality relies on,
 rather than quietly encoding without it. On macOS, Homebrew's ffmpeg brings its
 own SVT-AV1 onto `PATH`; the script says so, and `paths.svtav1encapp` should then

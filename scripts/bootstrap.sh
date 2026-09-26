@@ -19,10 +19,12 @@
 
 set -euo pipefail
 
-# The version the per-resolution CRF ladder was judged on by eye. Distribution
-# packages lag far behind (Debian 13 has 2.3.0, without the dark bias the 1080p
-# setting depends on), and a newer release can move quality at the same CRF.
-SVT_AV1_VERSION="${SVT_AV1_VERSION:-v4.0.0}"
+# Pinned, not taken from a package manager: distribution packages lag far behind
+# (Debian 13 has 2.3.0, without the dark bias the 1080p setting depends on), and
+# a release can move quality at the same CRF. The per-resolution settings were
+# judged on 4.0.0; 4.2.0 matched them within 0.2 dB on the 1080p excerpts and
+# encodes 5-10% faster on ARM. Re-check the ladder on a few excerpts when moving this.
+SVT_AV1_VERSION="${SVT_AV1_VERSION:-v4.2.0}"
 ZIMG_VERSION="${ZIMG_VERSION:-release-3.0.6}"
 # Pinned deliberately, not lazily. R73 onward added Vulkan GPU filters whose
 # gpufilter.h does not compile against Debian 13's Vulkan headers
@@ -159,8 +161,12 @@ stage_svtav1() {
   mkdir -p "$BUILD_DIR"
   local src="$BUILD_DIR/SVT-AV1"
   if [[ -d $src/.git ]]; then
-    git -C "$src" fetch --depth 1 origin "$SVT_AV1_VERSION"
-    git -C "$src" checkout -q FETCH_HEAD
+    # Fetch the tag as a tag: the build names its version with `git describe`,
+    # and a bare FETCH_HEAD checkout reports a commit hash that autotranscode
+    # cannot read a version from.
+    git -C "$src" fetch --depth 1 --force origin \
+      "refs/tags/${SVT_AV1_VERSION}:refs/tags/${SVT_AV1_VERSION}"
+    git -C "$src" checkout -q "$SVT_AV1_VERSION"
   else
     git clone --depth 1 --branch "$SVT_AV1_VERSION" \
       https://gitlab.com/AOMediaCodec/SVT-AV1.git "$src"
