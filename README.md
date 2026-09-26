@@ -139,19 +139,47 @@ upstream, and it is what makes Dolby Vision profile 5 transcodable at all here.
 
 ## Install
 
-On a Rockchip RK3588 board, the bootstrap script does everything:
+The bootstrap script installs everything, on Debian or Ubuntu (arm64, RK3588
+boards included, or x86-64) and on macOS with [Homebrew](https://brew.sh) (Apple
+silicon or Intel):
 
 ```bash
-./scripts/bootstrap-rk3588.sh          # or: ./scripts/bootstrap-rk3588.sh ffmpeg svtav1
+./scripts/bootstrap.sh          # or just some stages: ./scripts/bootstrap.sh ffmpeg svtav1
 ```
 
-Elsewhere you need `jellyfin-ffmpeg`, `SvtAv1EncApp`, `av1an`, `grav1synth` and
-`mkvtoolnix` on `PATH`. Then:
+What it installs, and from where:
+
+| | Debian / Ubuntu | macOS |
+|---|---|---|
+| jellyfin-ffmpeg | Jellyfin's apt repository; its portable build where the repository has no packages | its portable build, into `~/.local/lib/jellyfin-ffmpeg` |
+| SVT-AV1 4.0.0 | built from source into `~/.local` | built from source into `~/.local` |
+| VapourSynth (Av1an will not link without it) | built from source into `~/.local` | Homebrew |
+| Av1an | `cargo install` | Homebrew |
+| grav1synth | `cargo install` | `cargo install` |
+| mkvtoolnix, Python 3.11+ | apt | Homebrew |
+
+SVT-AV1 is pinned rather than taken from a package manager. The per-resolution
+settings were judged by eye on 4.0.0, and distributions lag far behind: Debian 13
+ships 2.3.0, which lacks the dark bias that 1080p's CRF depends on. `doctor` and
+`run` refuse an encoder missing an option the configured quality relies on,
+rather than quietly encoding without it. On macOS, Homebrew's ffmpeg brings its
+own SVT-AV1 onto `PATH`; the script says so, and `paths.svtav1encapp` should then
+name the pinned build.
+
+On another Linux distribution, install the build tools, mkvtoolnix and Python
+3.11+ yourself; the other stages do not use a package manager. Then:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e .   # or: uv venv .venv && uv pip install -e .
 .venv/bin/autotranscode doctor                        # says what is missing and how to get it
 ```
+
+`machine.profile = "auto"`, the default, picks the `rk3588` profile on an RK3588
+board and `generic` anywhere else. `workstation` is there for many fast cores.
+
+jellyfin-ffmpeg is recommended rather than required. Any ffmpeg 7.1 or newer has
+what an encode needs; Jellyfin's adds `tonemapx` (Dolby Vision profile 5 to SDR),
+libvmaf (target quality) and, on Rockchip, hardware decoding for `verify`.
 
 There is nothing to install *into* the venv beyond this package: Python 3.11+ and
 no dependencies at all, because everything heavy is an external binary. The venv

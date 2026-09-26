@@ -16,6 +16,13 @@ TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "te
 # Formats where re-encoding to Opus is a clear win: lossless or legacy-bloated.
 WASTEFUL_AUDIO = {"truehd", "dts", "pcm_s16le", "pcm_s24le", "pcm_bluray", "mlp", "wmapro"}
 
+# Layouts libopus refuses for surround (mapping family 1), and the one each is
+# relabelled to. Most DTS, TrueHD and AC-3 5.1 is "5.1(side)", which differs from
+# Opus's 5.1 only in calling the surround pair side rather than back speakers.
+# jellyfin-ffmpeg patches the encoder to accept it; mainline ffmpeg fails the mux,
+# after the whole video encode has been paid for.
+OPUS_LAYOUTS = {"5.1(side)": "5.1", "5.0(side)": "5.0", "quad(side)": "quad"}
+
 
 def _opus_bitrate(stream: Stream, cfg: Config) -> int:
     channels = stream.channels or 2
@@ -53,6 +60,10 @@ def _audio_args(info: MediaInfo, cfg: Config) -> list[str]:
             if channels > 2:
                 # Required for libopus to encode surround layouts correctly.
                 args += [f"-mapping_family:a:{position}", "1"]
+                if channels == stream.channels and stream.channel_layout in OPUS_LAYOUTS:
+                    # Same channels in the same order, only renamed.
+                    layout = OPUS_LAYOUTS[stream.channel_layout]
+                    args += [f"-filter:a:{position}", f"channelmap=channel_layout={layout}"]
             log.debug(
                 "audio %d (%s, %dch): -> opus %dk", position, stream.codec, stream.channels, bitrate
             )

@@ -58,7 +58,8 @@ class Paths:
 
 @dataclass(slots=True)
 class Machine:
-    profile: str = "generic"
+    # "auto" picks rk3588 on an RK3588 board and generic anywhere else.
+    profile: str = "auto"
     workers: int = 0  # 0 => let Av1an decide
     nice: int = 10
 
@@ -314,6 +315,23 @@ def _apply_section(obj: Any, values: dict[str, Any], where: str) -> None:
         setattr(obj, key, value)
 
 
+def detect_profile() -> str:
+    """The profile for this machine: rk3588 when the device tree names that SoC.
+
+    Boards describe their SoC in the device tree ("radxa,rock-5b\0rockchip,rk3588");
+    a PC or a Mac has no device tree at all and gets the generic profile.
+    """
+    try:
+        compatible = Path("/proc/device-tree/compatible").read_bytes()
+    except OSError:
+        return "generic"
+    return "rk3588" if b"rockchip,rk3588" in compatible.split(b"\0") else "generic"
+
+
+def resolve_profile(profile: str) -> str:
+    return detect_profile() if profile == "auto" else profile
+
+
 def _merge_profile(cfg: Config, profile: str) -> None:
     overrides = PROFILES.get(profile)
     if overrides is None:
@@ -345,7 +363,7 @@ def load(path: Path | None) -> Config:
 
     cfg = Config()
 
-    profile = raw.get("machine", {}).get("profile", cfg.machine.profile)
+    profile = resolve_profile(raw.get("machine", {}).get("profile", cfg.machine.profile))
     _merge_profile(cfg, profile)
     cfg.machine.profile = profile
 
@@ -358,6 +376,7 @@ def load(path: Path | None) -> Config:
         if not isinstance(values, dict):
             raise ConfigError(f"[{section}] must be a table")
         _apply_section(target, values, section)
+    cfg.machine.profile = profile   # the file's "auto" is resolved, not kept
 
     validate(cfg)
     return cfg

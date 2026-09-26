@@ -19,6 +19,9 @@ JELLYFIN_FFMPEG_DIRS = (
     "/usr/lib/jellyfin-ffmpeg",
     "/usr/local/lib/jellyfin-ffmpeg",
     "/opt/jellyfin-ffmpeg",
+    # Where scripts/bootstrap.sh unpacks the portable build: macOS, and Linux
+    # distributions Jellyfin's apt repository does not cover.
+    str(Path.home() / ".local/lib/jellyfin-ffmpeg"),
 )
 
 
@@ -134,7 +137,7 @@ def detect(cfg: Config) -> Toolchain:
     ffprobe = _find_ffmpeg(cfg.paths.ffprobe, "ffprobe")
     if not ffmpeg or not ffprobe:
         raise ToolError(
-            "ffmpeg/ffprobe not found. Install jellyfin-ffmpeg (see scripts/bootstrap-rk3588.sh) "
+            "ffmpeg/ffprobe not found. Install jellyfin-ffmpeg (see scripts/bootstrap.sh) "
             "or set paths.ffmpeg / paths.ffprobe in the config."
         )
 
@@ -187,12 +190,40 @@ def detect(cfg: Config) -> Toolchain:
     return chain
 
 
+def _missing_svt_options(chain: Toolchain, cfg: Config) -> list[str]:
+    """Encoder options the configured quality depends on, absent from this encoder.
+
+    These are not extras to skip quietly. The CRF ladder was set with them on:
+    1080p at CRF 37 is fine with the dark bias and blocky without it, and 4K at
+    CRF 30 is fine with variance boost and blocky without it. An older
+    SvtAv1EncApp -- distribution packages lag well behind -- would give exactly
+    those encodes, with nothing to say so.
+    """
+    def used(value: int | dict[str, int]) -> bool:
+        return any(v > 0 for v in (value.values() if isinstance(value, dict) else [value]))
+
+    problems: list[str] = []
+    upgrade = (f"SvtAv1EncApp {chain.svtav1_version or '(unknown version)'} lacks it; "
+               "install SVT-AV1 3.1 or newer (scripts/bootstrap.sh svtav1)")
+    if used(cfg.encode.luminance_qp_bias) and "--luminance-qp-bias" not in chain.svt_options:
+        problems.append(
+            f"encode.luminance_qp_bias needs --luminance-qp-bias. {upgrade}, or set it "
+            "to 0 and bring encode.crf_by_width's 1080p shift down to about 2"
+        )
+    if used(cfg.encode.variance_boost_strength) \
+            and "--enable-variance-boost" not in chain.svt_options:
+        problems.append(
+            f"encode.variance_boost_strength needs --enable-variance-boost. {upgrade}"
+        )
+    return problems
+
+
 def require(chain: Toolchain, cfg: Config) -> None:
     """Fail early and specifically, rather than deep inside a 10-hour encode."""
     problems: list[str] = []
 
     if chain.av1an is None:
-        problems.append("av1an not found (cargo install av1an, or see scripts/bootstrap-rk3588.sh)")
+        problems.append("av1an not found (see scripts/bootstrap.sh)")
     if chain.svtav1encapp is None:
         # Av1an drives the encoder binary directly, not through FFmpeg. This also
         # matters for grain: --fgs-table is documented as available only through the
@@ -203,12 +234,14 @@ def require(chain: Toolchain, cfg: Config) -> None:
             "set paths.svtav1encapp in the config."
         )
     if cfg.encode.concat == "mkvmerge" and chain.mkvmerge is None:
-        problems.append("mkvmerge not found (apt install mkvtoolnix) or set encode.concat='ffmpeg'")
+        problems.append("mkvmerge not found (install mkvtoolnix) or set encode.concat='ffmpeg'")
     if cfg.grain.mode != "never" and chain.grav1synth is None:
         problems.append(
             "grav1synth not found but grain.mode != 'never' "
             "(cargo install grav1synth, or set grain.mode='never')"
         )
+    if chain.svtav1encapp is not None:
+        problems += _missing_svt_options(chain, cfg)
     if cfg.dolby_vision.profile5 == "tonemap-sdr" and not chain.has_dovi_tonemap:
         problems.append(
             "dolby_vision.profile5='tonemap-sdr' needs an ffmpeg with the tonemapx "

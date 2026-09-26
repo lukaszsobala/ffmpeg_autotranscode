@@ -133,6 +133,7 @@ class Stream:
     language: str = "und"
     title: str = ""
     channels: int = 0
+    channel_layout: str = ""
     bitrate: int = 0
     default: bool = False
     forced: bool = False
@@ -278,6 +279,7 @@ def _stream(raw: dict) -> Stream:
         language=tags.get("language", "und"),
         title=tags.get("title", ""),
         channels=_int(raw.get("channels")),
+        channel_layout=raw.get("channel_layout", ""),
         bitrate=_int(raw.get("bit_rate")),
         default=bool(disposition.get("default")),
         forced=bool(disposition.get("forced")),

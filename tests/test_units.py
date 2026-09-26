@@ -16,7 +16,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
-from autotranscode import config, encode, estimate, grain, mux, pipeline, probe, util, verify
+from autotranscode import config, encode, estimate, grain, mux, pipeline, probe, tools, util, verify
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
 from autotranscode.state import Ledger, Record
@@ -113,6 +113,21 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(cfg.encode.preset, 4)   # from the rk3588 profile
             self.assertEqual(cfg.encode.crf, 25)     # overridden by the file
             self.assertEqual(cfg.machine.workers, 1)
+
+    def test_auto_profile_follows_the_device_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text('[machine]\nprofile = "auto"\n')
+            for board, profile, preset in ((b"radxa,rock-5b\0rockchip,rk3588\0", "rk3588", 4),
+                                           (None, "generic", 6)):
+                read = unittest.mock.Mock(return_value=board, side_effect=None if board
+                                          else FileNotFoundError())
+                with unittest.mock.patch.object(Path, "read_bytes", read):
+                    cfg = config.load(path)
+                self.assertEqual((cfg.machine.profile, cfg.encode.preset), (profile, preset))
+
+    def test_a_config_without_a_profile_is_auto(self):
+        self.assertEqual(config.Config().machine.profile, "auto")
 
     def test_unknown_keys_and_sections_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -239,14 +254,26 @@ class TestSkipRules(unittest.TestCase):
 
 
 class TestAudioPolicy(unittest.TestCase):
-    def audio_args(self, codecs_channels, mode="smart"):
+    def audio_args(self, codecs_channels, mode="smart", layout="", max_channels=0):
         cfg = config.Config()
         cfg.audio.mode = mode
+        cfg.audio.max_channels = max_channels
         info = make_info(audio=[
-            Stream(index=i + 1, codec=c, codec_type="audio", channels=ch)
+            Stream(index=i + 1, codec=c, codec_type="audio", channels=ch, channel_layout=layout)
             for i, (c, ch) in enumerate(codecs_channels)
         ])
         return " ".join(mux._audio_args(info, cfg))
+
+    def test_side_surround_is_relabelled_for_opus(self):
+        # Mainline libopus refuses 5.1(side), the usual DTS and TrueHD layout.
+        args = self.audio_args([("dts", 6)], layout="5.1(side)")
+        self.assertIn("-filter:a:0 channelmap=channel_layout=5.1", args)
+        self.assertNotIn("channelmap", self.audio_args([("dts", 6)], layout="5.1"))
+        self.assertNotIn("channelmap", self.audio_args([("eac3", 6)], layout="5.1(side)"))
+
+    def test_a_downmix_is_not_relabelled(self):
+        args = self.audio_args([("dts", 6)], layout="5.1(side)", max_channels=2)
+        self.assertNotIn("channelmap", args)
 
     def test_smart_copies_efficient_and_reencodes_wasteful(self):
         args = self.audio_args([("eac3", 6), ("truehd", 8)])
@@ -1298,6 +1325,37 @@ class TestDarkBias(unittest.TestCase):
             path.write_text("[encode.luminance_qp_bias]\n1700 = 60\n0 = 0\n")
             cfg = config.load(path)
         self.assertEqual([self.bias_at(w, cfg) for w in (3840, 1920, 720)], ["60", "60", None])
+
+
+class TestEncoderCapabilities(unittest.TestCase):
+    """An old SvtAv1EncApp would quietly give the encodes the ladder was set against."""
+
+    FULL = {"--luminance-qp-bias", "--enable-variance-boost"}
+
+    def problems(self, options: set[str], cfg: config.Config | None = None) -> str:
+        chain = make_chain(svt_options=options, svtav1_version="2.3.0")
+        try:
+            tools.require(chain, cfg or config.Config())
+        except tools.ToolError as exc:
+            return str(exc)
+        return ""
+
+    def test_a_current_encoder_passes(self):
+        self.assertEqual(self.problems(self.FULL), "")
+
+    def test_missing_dark_bias_stops_the_run(self):
+        message = self.problems({"--enable-variance-boost"})
+        self.assertIn("luminance_qp_bias", message)
+        self.assertIn("2.3.0", message)
+
+    def test_missing_variance_boost_stops_the_run(self):
+        self.assertIn("variance_boost_strength", self.problems({"--luminance-qp-bias"}))
+
+    def test_settings_turned_off_need_nothing(self):
+        cfg = config.Config()
+        cfg.encode.luminance_qp_bias = 0
+        cfg.encode.variance_boost_strength = {"3000": 0}
+        self.assertEqual(self.problems(set(), cfg), "")
 
 
 class TestGrainTableScaling(unittest.TestCase):

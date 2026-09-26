@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-file", type=Path, help="also write logs here")
 
     # Common overrides, so routine runs need no config file edits.
-    parser.add_argument("--profile", choices=sorted(config.PROFILES),
+    parser.add_argument("--profile", choices=["auto", *sorted(config.PROFILES)],
                         help="machine profile (overrides the config file)")
     parser.add_argument("--preset", type=int, help="SVT-AV1 preset, -1 (slowest) to 13")
     parser.add_argument("--crf", type=int, help="SVT-AV1 CRF, 1-70")
@@ -90,8 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def apply_overrides(cfg: config.Config, args: argparse.Namespace) -> None:
     if args.profile:
-        config._merge_profile(cfg, args.profile)
-        cfg.machine.profile = args.profile
+        profile = config.resolve_profile(args.profile)
+        config._merge_profile(cfg, profile)
+        cfg.machine.profile = profile
     if args.preset is not None:
         cfg.encode.preset = args.preset
     if args.crf is not None:
@@ -112,7 +113,7 @@ def cmd_doctor(cfg: config.Config, chain: tools.Toolchain) -> int:
         tools.require(chain, cfg)
     except tools.ToolError as exc:
         print(exc)
-        print("\nSee scripts/bootstrap-rk3588.sh for a working install sequence.")
+        print("\nSee scripts/bootstrap.sh for a working install sequence.")
         return 1
     print("All prerequisites satisfied.")
     if not chain.has_grain_pipeline:
