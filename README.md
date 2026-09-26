@@ -489,7 +489,11 @@ like the CRF ladder.
 `--crf` still moves everything at once, because it sets the anchor the ladder
 shifts from. Bands are keyed by **width**: a scope film is cropped to its picture,
 so a 4K print can be 3840x1600 or 3836x2072, and keying on height would file it as
-1080p and under-encode it. Empty the CRF table to go back to one CRF for everything.
+1080p and under-encode it. A picture narrower than 16:9 is filed by its height
+instead: 4:3 HD at 1440x1080 counts as 1080p and 960x720 as 720p, where width
+alone would drop each a band. Non-square pixels count at their shown width, so
+HDV's 1440x1080 is 1920 wide, and a DVD, at 576 or 480 lines, stays SD whatever
+its shape. Empty the CRF table to go back to one CRF for everything.
 
 ## What it refuses to do
 

@@ -836,8 +836,9 @@ class TestCrfLadder(unittest.TestCase):
         self.cfg = config.Config()
         self.cfg.encode.crf = 30
 
-    def crf_at(self, width: int, height: int = 1080) -> int:
-        return encode.effective_crf(make_info(width=width, height=height), self.cfg)
+    def crf_at(self, width: int, height: int = 0) -> int:
+        info = make_info(width=width, height=height or width * 9 // 16)
+        return encode.effective_crf(info, self.cfg)
 
     def test_each_band_shifts_from_the_4k_anchor(self):
         widths = (3840, 2560, 1920, 1280, 854, 640)
@@ -851,6 +852,24 @@ class TestCrfLadder(unittest.TestCase):
         self.assertEqual(self.crf_at(3840, height=1600), 32)
         # And the same crop one rung down stays 1080p rather than dropping to 720p.
         self.assertEqual(self.crf_at(1920, height=800), 37)
+
+    def test_narrow_hd_is_filed_by_its_height(self):
+        # 4:3 HD and 960x720 would drop a band on width alone.
+        self.assertEqual(self.crf_at(1440, height=1080), 37)
+        self.assertEqual(self.crf_at(960, height=720), 27)
+
+    def test_non_square_pixels_are_filed_by_their_shown_width(self):
+        # HDV: 1440x1080 stored, shown 1920 wide. Only the shown width is 1080p
+        # here, because the height is cut to a crop that on its own would not be.
+        info = make_info(width=1440, height=800, sample_aspect="4:3")
+        self.assertEqual(encode.effective_crf(info, self.cfg), 37)
+        self.assertEqual(encode.effective_crf(replace(info, sample_aspect=""), self.cfg), 27)
+
+    def test_dvds_stay_sd_whatever_their_pixel_shape(self):
+        for width, height, sar in ((720, 576, "16:15"), (720, 576, "64:45"),
+                                   (720, 480, "32:27")):
+            info = make_info(width=width, height=height, sample_aspect=sar)
+            self.assertEqual(encode.effective_crf(info, self.cfg), 24, (width, height, sar))
 
     def test_the_anchor_moves_the_whole_ladder(self):
         # One knob still controls the library: --crf 28 lowers every band by 2.
@@ -1186,14 +1205,15 @@ class TestVarianceBoost(unittest.TestCase):
         argv = encode.svt_params(make_info(width=3836, height=2072), config.Config(), chain)
         self.assertEqual(argv[argv.index("--variance-boost-strength") + 1], "2")
         for width in (1920, 1280, 720):
-            argv = encode.svt_params(make_info(width=width), config.Config(), chain)
+            argv = encode.svt_params(make_info(width=width, height=width * 9 // 16),
+                                     config.Config(), chain)
             self.assertNotIn("--variance-boost-strength", argv)
 
     def test_a_table_is_read_by_band(self):
         cfg = config.Config()
         cfg.encode.variance_boost_strength = {"1700": 3, "0": 1}
         chain = make_chain(svt_options=set())
-        strength = [encode.svt_params(make_info(width=w), cfg, chain)
+        strength = [encode.svt_params(make_info(width=w, height=w * 9 // 16), cfg, chain)
                     for w in (3840, 1920, 720)]
         self.assertEqual([a[a.index("--variance-boost-strength") + 1] for a in strength],
                          ["3", "3", "1"])
@@ -1249,8 +1269,8 @@ class TestDarkBias(unittest.TestCase):
 
     def bias_at(self, width: int, cfg: config.Config | None = None,
                 options: set[str] = OPTIONS) -> str | None:
-        argv = encode.svt_params(make_info(width=width), cfg or config.Config(),
-                                 make_chain(svt_options=options))
+        argv = encode.svt_params(make_info(width=width, height=width * 9 // 16),
+                                 cfg or config.Config(), make_chain(svt_options=options))
         return argv[argv.index("--luminance-qp-bias") + 1] \
             if "--luminance-qp-bias" in argv else None
 

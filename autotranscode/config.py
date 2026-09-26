@@ -77,7 +77,9 @@ class Encode:
     # Width, not height, and with slack below each nominal size: a scope film is
     # cropped to its picture, so a 4K print is 3840x1600 or even 3836x2072, and a
     # height-keyed ladder would file it as 1080p and under-encode it. Cropping
-    # takes the bars off the top and bottom, so width is what stays put.
+    # takes the bars off the top and bottom, so width is what stays put. A
+    # picture narrower than 16:9 is filed by its height instead; see
+    # encode.band_width.
     #
     # 1080p sits above 4K, not level with it, because it pairs with a dark bias
     # (luminance_qp_bias below) that already spends its bits where it blocked.

@@ -78,6 +78,8 @@ extra_svt_params = []
 # Keyed by width, with slack, because a scope film is cropped to its picture: a
 # 4K print can be 3840x1600 or 3836x2072, and keying on height would file it as
 # 1080p and under-encode it. Cropping removes bars top and bottom, not the sides.
+# A picture narrower than 16:9 goes by its height instead (1440x1080 4:3 HD is
+# 1080p, 960x720 is 720p), and non-square pixels by their shown width.
 [encode.crf_by_width]
 3000 = 0            # 4K. crf 30 with variance boost: the highest free of blocks on 4K HDR.
 1700 = 7            # 1080p: 37, and only because of the dark bias below. Without it,

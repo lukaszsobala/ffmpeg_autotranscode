@@ -79,7 +79,8 @@ def effective_crf(info: MediaInfo, cfg: Config) -> int:
     that moves everything, and the 4K band is what it means literally.
 
     Bands are keyed by width because a scope film arrives cropped to its picture:
-    3836x2072 is a 4K source whose height would file it as 1080p.
+    3836x2072 is a 4K source whose height would file it as 1080p. `band_width`
+    has the details, including 4:3 and non-square-pixel HD.
     """
     ladder = cfg.encode.crf_by_width
     if not ladder:
@@ -91,13 +92,30 @@ def by_width(value: int | dict[str, int], info: MediaInfo) -> int:
     """A setting's value for this source: itself, or its entry in a width table.
 
     The table's keys are the smallest width of each band; a source takes the
-    widest band it reaches, and anything narrower than every key the narrowest.
+    widest band its `band_width` reaches, and anything narrower the narrowest.
     """
     if not isinstance(value, dict):
         return value
-    bands = sorted((int(width) for width in value), reverse=True)
-    band = next((width for width in bands if info.width >= width), bands[-1])
+    width = band_width(info)
+    bands = sorted((int(key) for key in value), reverse=True)
+    band = next((key for key in bands if width >= key), bands[-1])
     return value[str(band)]
+
+
+def band_width(info: MediaInfo) -> int:
+    """The width a source is filed under: the larger of how wide it is shown and
+    how wide a 16:9 picture of its height would be.
+
+    Width alone keeps a cropped scope film in its real band -- 1920x800 is
+    1080p -- but drops a narrow one a band: 4:3 HD stored as 1440x1080 would be
+    filed as 720p, and 960x720 as SD. The height catches those. Displayed width,
+    not stored, because HDV's 1440x1080 is shown 1920 wide on non-square pixels.
+    """
+    shown = info.width
+    if info.sample_aspect:
+        num, den = (int(part) for part in info.sample_aspect.split(":"))
+        shown = round(info.width * num / den)
+    return max(shown, round(info.height * 16 / 9))
 
 
 def variance_boost_curve(info: MediaInfo, cfg: Config) -> str:
