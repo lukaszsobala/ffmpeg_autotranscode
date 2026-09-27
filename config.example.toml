@@ -54,7 +54,6 @@ crf = 30            # 1..70. Lower is higher quality and bigger. This is the
 pix_format = "yuv420p10le"   # 10-bit even from 8-bit sources: cheap, and avoids banding.
 tune = 0            # 0 = VQ (subjective quality), 2 = SSIM. Use 0 for watching.
 variance_boost_curve = "auto" # "auto" uses SVT-AV1's PQ curve (2) for HDR10, else 0.
-ac_bias = 0.0       # 0..8. Above 0 preserves texture and residual grain. Try 0.5-1.0.
 keyint_sec = 10.0   # Keyframe interval in seconds.
 
 # "hybrid" is the right choice here. lsmash/ffms2/bestsource are more accurate but
@@ -109,6 +108,21 @@ extra_svt_params = []
 3000 = 0
 1700 = 100
 1100 = 0
+
+# ac-bias, 0-8, keeps texture and grain from flattening; tf strength, 0-4 or -1
+# for the encoder's own default (3), is how hard SVT-AV1 averages neighbouring
+# frames. On a grainy 4K film, variance boost alone left the fog blotched: grain
+# averaged into patches tens of pixels across. ac-bias 1 with strength 1 cleared
+# it where CRF 26 and stronger variance boost did not, for 1.17x the size of the
+# film without them. Turning the filter off scored higher still but looked worse
+# in motion. Not yet tried below 4K.
+[encode.ac_bias]
+3000 = 1.0
+0 = 0.0
+
+[encode.tf_strength]
+3000 = 1
+0 = -1
 
 # Sampling for `estimate`, which ranks a library by what a real encode would save.
 [estimate]

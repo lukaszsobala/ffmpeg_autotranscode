@@ -118,7 +118,26 @@ class Encode:
     luminance_qp_bias: int | dict[str, int] = field(
         default_factory=lambda: {"3000": 0, "1700": 100, "1100": 0}
     )
-    ac_bias: float = 0.0
+    # 0-8: bias rate-distortion toward keeping high-frequency detail. One number
+    # or a width table, as above. Temporal filter strength: SVT-AV1's 0-4, or -1
+    # to leave it at the encoder's own default (3 in SVT-AV1 4.2).
+    #
+    # Both on at 4K only, together. Variance boost left a grainy 4K film's fog
+    # blotched: the grain smeared into patches tens of pixels across, some of them
+    # tinted. Temporal filtering averages the grain of neighbouring frames into
+    # exactly those lumps, and ac-bias keeps the encoder from flattening what is
+    # left. Filter strength set the worst fog frame (low-pass 54.6 dB at the
+    # default, 55.6 at 1, 55.9 off), but off looked worse in motion than 1, and
+    # neither CRF 26 nor stronger variance boost came close. 1.17x the bits of
+    # the whole film without them (82.5% saving instead of 85%); better in 148 of
+    # its 159 three-second windows and never worse by more than 0.2 dB. Not yet
+    # tried below 4K.
+    ac_bias: float | dict[str, float] = field(
+        default_factory=lambda: {"3000": 1.0, "0": 0.0}
+    )
+    tf_strength: int | dict[str, int] = field(
+        default_factory=lambda: {"3000": 1, "0": -1}
+    )
     keyint_sec: float = 10.0
     chunk_method: str = "hybrid"  # hybrid works without VapourSynth
     concat: str = "mkvmerge"
@@ -382,15 +401,22 @@ def load(path: Path | None) -> Config:
     return cfg
 
 
-def _check_by_width(value: Any, name: str, low: int, high: int, span: str) -> None:
-    """A setting that is one number, or a table of numbers keyed by width."""
+def _check_by_width(
+    value: Any, name: str, low: float, high: float, span: str, *, decimal: bool = False,
+) -> None:
+    """A setting that is one number, or a table of numbers keyed by width.
+
+    Whole numbers only, unless `decimal`: then 1 and 1.0 are both accepted.
+    """
+    kinds = (int, float) if decimal else (int,)
     table = value if isinstance(value, dict) else {"0": value}
     if not table:
         raise ConfigError(f"{name} needs at least one band; use 0 to turn it off")
     for width, number in table.items():
         if not str(width).isdigit():
             raise ConfigError(f"{name} keys must be widths; got '{width}'")
-        if isinstance(number, bool) or not isinstance(number, int) or not low <= number <= high:
+        if isinstance(number, bool) or not isinstance(number, kinds) \
+                or not low <= number <= high:
             raise ConfigError(f"{name} must be {span}; got {number!r}")
 
 
@@ -411,6 +437,9 @@ def validate(cfg: Config) -> None:
                     0, 4, "0 (off) to 4")
     _check_by_width(cfg.encode.luminance_qp_bias, "encode.luminance_qp_bias",
                     0, 100, "0 (off) to 100")
+    _check_by_width(cfg.encode.ac_bias, "encode.ac_bias", 0, 8, "0 (off) to 8", decimal=True)
+    _check_by_width(cfg.encode.tf_strength, "encode.tf_strength",
+                    -1, 4, "-1 (encoder default) or 0 to 4")
     if cfg.grain.estimator not in {"svt", "grav1synth"}:
         raise ConfigError("grain.estimator must be svt or grav1synth")
     if not 1 <= cfg.grain.svt_level <= 50:

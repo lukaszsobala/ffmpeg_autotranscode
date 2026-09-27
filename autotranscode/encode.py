@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shlex
 from pathlib import Path
+from typing import TypeVar
 
 from .config import Config
 from .probe import MediaInfo
@@ -33,6 +34,8 @@ COLOR_MATRIX = {
     "ycgco": 8, "bt2020nc": 9, "bt2020_ncl": 9, "bt2020c": 10, "bt2020_cl": 10,
     "smpte2085": 11, "chroma-derived-nc": 12, "chroma-derived-c": 13, "ictcp": 14,
 }
+
+Number = TypeVar("Number", int, float)
 
 
 def dovi_tonemap_filter(info: MediaInfo, cfg: Config) -> str:
@@ -88,7 +91,7 @@ def effective_crf(info: MediaInfo, cfg: Config) -> int:
     return max(1, min(70, cfg.encode.crf + by_width(ladder, info)))
 
 
-def by_width(value: int | dict[str, int], info: MediaInfo) -> int:
+def by_width(value: Number | dict[str, Number], info: MediaInfo) -> Number:
     """A setting's value for this source: itself, or its entry in a width table.
 
     The table's keys are the smallest width of each band; a source takes the
@@ -160,10 +163,14 @@ def svt_params(
     if bias > 0 and "--luminance-qp-bias" in chain.svt_options:
         params += ["--luminance-qp-bias", str(bias)]
 
-    if enc.ac_bias > 0 and "--ac-bias" in chain.svt_options:
-        # Biases rate-distortion toward high-frequency error; helps texture and
-        # any grain the denoiser left behind survive the encode.
-        params += ["--ac-bias", str(enc.ac_bias)]
+    # Biases rate-distortion toward high-frequency error, so texture and grain
+    # survive rather than flattening into blotches. With a weaker temporal filter,
+    # which would otherwise average the grain of neighbouring frames into lumps.
+    # `tools.require` refuses an encoder without them when they are configured.
+    if (ac_bias := by_width(enc.ac_bias, info)) > 0 and "--ac-bias" in chain.svt_options:
+        params += ["--ac-bias", str(ac_bias)]
+    if (tf := by_width(enc.tf_strength, info)) >= 0 and "--tf-strength" in chain.svt_options:
+        params += ["--tf-strength", str(tf)]
 
     if info.fps > 0 and enc.keyint_sec > 0:
         params += ["--keyint", str(round(info.fps * enc.keyint_sec))]

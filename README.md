@@ -493,15 +493,15 @@ constant across a mixed library and the small files come out looking the worst,
 which is the usual reason people conclude AV1 is weak at low resolution.
 
 `encode.crf` is therefore the value for a 4K source, and `encode.crf_by_width`
-shifts it per band. Two other settings change by band too, because what fixed
+shifts it per band. Other settings change by band too, because what fixed
 blocking at one resolution lost at another:
 
-| source | CRF | variance boost | dark bias |
-|---|---|---|---|
-| 4K | 30 | 2 | off |
-| 1080p | 37 | off | 100 |
-| 720p | 27 | off | off |
-| 576p and below | 24 | off | off |
+| source | CRF | variance boost | dark bias | ac-bias | temporal filter |
+|---|---|---|---|---|---|
+| 4K | 30 | 2 | off | 1 | 1 (weak) |
+| 1080p | 37 | off | 100 | off | default |
+| 720p | 27 | off | off | off | default |
+| 576p and below | 24 | off | off | off | default |
 
 - **Variance boost** spends more bits on flat areas. It was the only thing that
   cleared blocking in fog and on flat paper in a grainy 4K HDR film. Below 4K it
@@ -513,8 +513,19 @@ blocking at one resolution lost at another:
   25 or 50, at the lower CRFs needed to match it in that scene, cost more. The
   bias works on whole frames, so a dim film pays for it on most of them. **1080p's
   CRF 37 depends on it**: drop the bias and bring 1080p back to about 32.
+- **ac-bias and a weak temporal filter** (`encode.ac_bias`, `encode.tf_strength`)
+  finished the job variance boost started on the 4K film's fog, which it had
+  left blotched: grain smeared into patches tens of pixels across, some of them
+  tinted. SVT-AV1's temporal filter averages neighbouring frames' grain into
+  exactly those lumps, and ac-bias keeps the encoder from flattening what
+  remains. Strength 1 with ac-bias 1 cleared it where CRF 26 and stronger
+  variance boost did not; turning the filter off scored higher but looked worse
+  in motion. The whole film came out 1.17x the size (82.5% saving instead of
+  85%), better in 148 of its 159 three-second windows and never worse by more
+  than 0.2 dB. Neither has been tried below 4K yet. A tf strength of -1 leaves
+  the encoder's own default.
 
-Both settings take either one number for every source or a table keyed by width
+These settings take either one number for every source or a table keyed by width
 like the CRF ladder.
 
 `--crf` still moves everything at once, because it sets the anchor the ladder

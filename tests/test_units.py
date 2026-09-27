@@ -1327,10 +1327,55 @@ class TestDarkBias(unittest.TestCase):
         self.assertEqual([self.bias_at(w, cfg) for w in (3840, 1920, 720)], ["60", "60", None])
 
 
+class TestFogSettings(unittest.TestCase):
+    """4K keeps its grain in flat fog with ac-bias and a weak temporal filter."""
+
+    OPTIONS = {"--ac-bias", "--tf-strength"}
+
+    def flags_at(self, width: int, cfg: config.Config | None = None,
+                 options: set[str] = OPTIONS) -> tuple[str | None, str | None]:
+        argv = encode.svt_params(make_info(width=width, height=width * 9 // 16),
+                                 cfg or config.Config(), make_chain(svt_options=options))
+        return tuple(argv[argv.index(flag) + 1] if flag in argv else None
+                     for flag in ("--ac-bias", "--tf-strength"))
+
+    def test_only_4k_gets_them_by_default(self):
+        self.assertEqual([self.flags_at(w) for w in (3836, 1920, 1280, 720)],
+                         [("1.0", "1"), (None, None), (None, None), (None, None)])
+
+    def test_tables_are_read_by_band(self):
+        cfg = config.Config()
+        cfg.encode.ac_bias = {"1700": 0.5, "0": 0}
+        cfg.encode.tf_strength = 0
+        self.assertEqual([self.flags_at(w, cfg) for w in (3840, 1920, 720)],
+                         [("0.5", "0"), ("0.5", "0"), (None, "0")])
+
+    def test_an_encoder_without_them_is_not_asked_for_them(self):
+        self.assertEqual(self.flags_at(3840, options=set()), (None, None))
+
+    def test_ranges_are_checked(self):
+        for name, value in (("ac_bias", 8.5), ("ac_bias", {"3000": -1.0}),
+                            ("tf_strength", 5), ("tf_strength", {"0": -2}),
+                            ("tf_strength", 1.5)):
+            cfg = config.Config()
+            setattr(cfg.encode, name, value)
+            with self.assertRaises(config.ConfigError, msg=f"{name} = {value!r}"):
+                config.validate(cfg)
+
+    def test_tables_load_from_toml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text("[encode.ac_bias]\n3000 = 2\n0 = 0.5\n"
+                            "[encode.tf_strength]\n3000 = 0\n0 = -1\n")
+            cfg = config.load(path)
+        self.assertEqual([self.flags_at(w, cfg) for w in (3840, 1920)],
+                         [("2", "0"), ("0.5", None)])
+
+
 class TestEncoderCapabilities(unittest.TestCase):
     """An old SvtAv1EncApp would quietly give the encodes the ladder was set against."""
 
-    FULL = {"--luminance-qp-bias", "--enable-variance-boost"}
+    FULL = {"--luminance-qp-bias", "--enable-variance-boost", "--ac-bias", "--tf-strength"}
 
     def problems(self, options: set[str], cfg: config.Config | None = None) -> str:
         chain = make_chain(svt_options=options, svtav1_version="2.3.0")
@@ -1349,12 +1394,19 @@ class TestEncoderCapabilities(unittest.TestCase):
         self.assertIn("2.3.0", message)
 
     def test_missing_variance_boost_stops_the_run(self):
-        self.assertIn("variance_boost_strength", self.problems({"--luminance-qp-bias"}))
+        self.assertIn("variance_boost_strength",
+                      self.problems(self.FULL - {"--enable-variance-boost"}))
+
+    def test_missing_fog_settings_stop_the_run(self):
+        self.assertIn("encode.ac_bias", self.problems(self.FULL - {"--ac-bias"}))
+        self.assertIn("encode.tf_strength", self.problems(self.FULL - {"--tf-strength"}))
 
     def test_settings_turned_off_need_nothing(self):
         cfg = config.Config()
         cfg.encode.luminance_qp_bias = 0
         cfg.encode.variance_boost_strength = {"3000": 0}
+        cfg.encode.ac_bias = 0.0
+        cfg.encode.tf_strength = {"3000": -1}
         self.assertEqual(self.problems(set(), cfg), "")
 
 
