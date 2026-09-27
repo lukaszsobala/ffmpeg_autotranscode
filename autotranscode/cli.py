@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import shlex
 import sys
 from pathlib import Path
 
-from . import __version__, config, encode, estimate, grain, pipeline, probe, tools, verify
+from . import __version__, config, encode, estimate, grain, pipeline, probe, sample, tools, verify
 from .state import Ledger
 from .util import (
     CommandError,
@@ -70,6 +71,33 @@ def build_parser() -> argparse.ArgumentParser:
     estimate_cmd.add_argument("--seconds", type=int, help="seconds per excerpt")
     estimate_cmd.add_argument("--no-grain-probe", action="store_true",
                               help="skip the grain check; faster, and wrong on grainy films")
+
+    sample_cmd = sub.add_parser(
+        "sample",
+        help="encode a few random minutes of a few random files per resolution band, "
+             "to check the settings on more than the films they were tuned on",
+    )
+    sample_cmd.add_argument("inputs", nargs="+", type=Path)
+    sample_cmd.add_argument("-n", "--per-band", type=int, default=3,
+                            help="files to sample per band (default: 3)")
+    sample_cmd.add_argument("--band", action="append", choices=list(sample.BAND_NAMES.values()),
+                            help="only this band; repeatable (default: every band)")
+    sample_cmd.add_argument("--minutes", type=float, default=4.0,
+                            help="length of each excerpt (default: 4)")
+    sample_cmd.add_argument("--skip-start", type=float, default=10.0, metavar="MINUTES",
+                            help="never sample the first this many minutes (default: 10; "
+                                 f"at most {100 * sample.MAX_SKIP_SHARE:.0f}%% of a file)")
+    sample_cmd.add_argument("--skip-end", type=float, default=10.0, metavar="MINUTES",
+                            help="never sample the last this many minutes (default: 10; "
+                                 f"at most {100 * sample.MAX_SKIP_SHARE:.0f}%% of a file)")
+    sample_cmd.add_argument("--seed", type=int, help="repeat an earlier draw")
+    sample_cmd.add_argument("--out", type=Path,
+                            help="where the samples and report.md go; rerun into the same "
+                                 "directory to resume (default: <work_dir>/samples/<time>)")
+    sample_cmd.add_argument("--pick-only", action="store_true",
+                            help="choose the samples and stop, to see them before encoding")
+    sample_cmd.add_argument("--no-verify", action="store_true",
+                            help="skip the scores and snapshots")
 
     verify_cmd = sub.add_parser(
         "verify",
@@ -185,8 +213,8 @@ def cmd_verify(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolch
 def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> int:
     """Sample each file, then rank by what a full encode would buy.
 
-    Ordered by bytes saved per hour of encoding rather than by bytes saved: on a
-    board where a 4K feature costs a day, the question is not which file is
+    Ordered by bytes saved per hour of encoding rather than by bytes saved: when
+    a 4K feature can take many hours, the question is not which file is
     biggest but which hour of encoding is best spent.
     """
     sources = pipeline.discover(inputs, cfg)
@@ -319,6 +347,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_grain_probe:
             cfg.estimate.grain_probe = False
         return cmd_estimate(args.inputs, cfg, chain)
+
+    if args.command == "sample":
+        if args.per_band < 1 or args.minutes <= 0 or min(args.skip_start, args.skip_end) < 0:
+            log.error("--per-band and --minutes must be positive, the skips not negative")
+            return 2
+        if not args.pick_only:
+            try:
+                tools.require(chain, cfg)
+            except tools.ToolError as exc:
+                log.error("%s", exc)
+                return 2
+        out = args.out or cfg.work_dir / "samples" / f"{dt.datetime.now():%Y%m%d-%H%M}"
+        bands = args.band or [sample.band_name(edge) for edge in sample.band_edges(cfg)]
+        try:
+            return sample.run_samples(
+                args.inputs, chain, cfg, out.expanduser().resolve(),
+                per_band=args.per_band, bands=bands, minutes=args.minutes,
+                skip_start=args.skip_start, skip_end=args.skip_end, seed=args.seed,
+                score=not args.no_verify, pick_only=args.pick_only)
+        except KeyboardInterrupt:
+            log.warning("interrupted; rerun with --out %s to resume", out)
+            return 130
 
     if args.command == "plan":
         return cmd_plan(args.inputs, cfg, chain)

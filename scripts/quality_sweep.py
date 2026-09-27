@@ -217,7 +217,7 @@ class Report:
             "  the mean.",
             "- **XPSNR** is kept for reference but does not work on grainy film: it reads the",
             "  grain as texture and forgives errors there. It is also 8-bit only here,",
-            "  because ffmpeg's 10-bit XPSNR is broken on this machine.",
+            "  because ffmpeg's 10-bit XPSNR is broken (seen on ARM64).",
             "- All frame pairs are matched by index, not timestamp: Matroska's millisecond",
             "  rounding otherwise pairs frames one apart and reports garbage.",
             "- **Grain** is the source's pixel-scale grain that survives, with synthesis",

@@ -14,7 +14,7 @@ XPSNR (luma)
     than the same error in texture, which is how visibility actually works. It
     is what flagged the blocking that PSNR missed.
 
-    ffmpeg's xpsnr filter is broken for high bit depth on this machine: a 10-bit
+    ffmpeg's xpsnr filter is broken for high bit depth (seen on ARM64): a 10-bit
     source compared with *itself* scores 9.98 dB rather than infinity, in both
     ffmpeg 7.1 and jellyfin-ffmpeg 8.1, and in 16-bit too. Both inputs are
     therefore converted to 8-bit first, identically. That hides errors below a

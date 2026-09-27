@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import locale
 import os
+import random
 import signal
 import tempfile
 import unittest
@@ -16,7 +17,9 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
-from autotranscode import config, encode, estimate, grain, mux, pipeline, probe, tools, util, verify
+from autotranscode import (
+    config, encode, estimate, grain, mux, pipeline, probe, sample, tools, util, verify,
+)
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
 from autotranscode.state import Ledger, Record
@@ -1520,3 +1523,63 @@ class TestGrainFromSvt(unittest.TestCase):
             svt_frame(7, [0] * 22 + [120, 5]),        # a directional one-off
         ]
         self.assertIsNot(grain.medoid(frames), frames[2])
+
+
+class TestLibrarySamples(unittest.TestCase):
+    """Choosing what `sample` encodes: which files, and where in them."""
+
+    def test_band_follows_the_encode_settings(self):
+        cfg = config.Config()
+        self.assertEqual(sample.band_of(make_info(width=3836, height=2072), cfg), "4K")
+        self.assertEqual(sample.band_of(make_info(width=1920, height=800), cfg), "1080p")
+        self.assertEqual(sample.band_of(make_info(width=1440, height=1080), cfg), "1080p")
+        self.assertEqual(sample.band_of(make_info(width=1280, height=720), cfg), "720p")
+        self.assertEqual(sample.band_of(make_info(width=720, height=576,
+                                                  sample_aspect="64:45"), cfg), "SD")
+
+    def test_start_stays_clear_of_both_ends(self):
+        rng = random.Random(1)
+        for _ in range(200):
+            start = present(sample.choose_start(7200, 240, 600, 600, rng))
+            self.assertGreaterEqual(start, 600)
+            self.assertLessEqual(start + 240, 7200 - 600)
+
+    def test_short_file_skips_less_rather_than_nothing(self):
+        # 22 minutes: ten minutes off each end would leave two, too few for four.
+        start = present(sample.choose_start(1320, 240, 600, 600, random.Random(2)))
+        self.assertGreaterEqual(start, 1320 * sample.MAX_SKIP_SHARE)
+        self.assertLessEqual(start + 240, 1320 * (1 - sample.MAX_SKIP_SHARE))
+
+    def test_too_short_to_sample(self):
+        self.assertIsNone(sample.choose_start(200, 240, 0, 0, random.Random(3)))
+
+    def test_draw_visits_every_folder_before_any_twice(self):
+        series = [Path(f"/lib/Series/S01/e{i:02d}.mkv") for i in range(30)]
+        films = [Path(f"/lib/Film {i}/film.mkv") for i in range(3)]
+        order = sample.draw_order(series + films, random.Random(4))
+        self.assertEqual(sorted(order), sorted(series + films))
+        self.assertEqual({p.parent for p in order[:4]}, {p.parent for p in series[:1] + films})
+
+    def test_same_seed_same_draw(self):
+        files = [Path(f"/lib/{i}/f.mkv") for i in range(20)]
+        self.assertEqual(sample.draw_order(files, random.Random(5)),
+                         sample.draw_order(files, random.Random(5)))
+
+    def test_pick_fills_each_band_and_skips_what_run_would(self):
+        infos = {
+            Path("/lib/a/uhd.mkv"): make_info(path=Path("/lib/a/uhd.mkv"), width=3840,
+                                              height=2160),
+            Path("/lib/b/hd.mkv"): make_info(path=Path("/lib/b/hd.mkv")),
+            Path("/lib/c/hd2.mkv"): make_info(path=Path("/lib/c/hd2.mkv")),
+            Path("/lib/d/done.mkv"): make_info(path=Path("/lib/d/done.mkv"), codec="av1"),
+            Path("/lib/e/short.mkv"): make_info(path=Path("/lib/e/short.mkv"), duration=100.0),
+        }
+        with unittest.mock.patch.object(sample.probe, "probe",
+                                        side_effect=lambda path, chain: infos[path]):
+            picks = sample.pick(list(infos), make_chain(), config.Config(), per_band=2,
+                                bands=["4K", "1080p"], length=240, skip_start=600,
+                                skip_end=600, rng=random.Random(6))
+        self.assertEqual([p.band for p in picks], ["4K", "1080p", "1080p"])
+        self.assertEqual({p.id for p in picks}, {"4K-1", "1080p-1", "1080p-2"})
+        self.assertNotIn("/lib/d/done.mkv", {p.source for p in picks})
+

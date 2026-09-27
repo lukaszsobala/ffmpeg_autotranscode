@@ -201,7 +201,7 @@ generated. Transcodes are immune — every child process is given a locale verif
 to exist — but the same command typed by hand will abort. `doctor` names the
 offending variables. The usual cause is `AcceptEnv LANG LC_*` in `sshd_config`
 importing the locales of whatever machine you are connecting *from*, so unsetting
-them on the client is the tidiest fix; `sudo dpkg-reconfigure locales` on the board
+them on the client is the tidiest fix; `sudo dpkg-reconfigure locales` on the machine
 works too.
 
 ### Why Av1an's `ffmpeg` is a wrapper script
@@ -265,6 +265,7 @@ looked at, not from the default.
 | `measure` | The old grain detector's scores (only for `grain.estimator = "grav1synth"`) |
 | `estimate` | Encode a few short excerpts per file and rank a library by what is worth transcoding |
 | `verify` | Score an encode against its source where the eye looks: XPSNR, grain retained, worst-frame snapshots |
+| `sample` | Encode a few random minutes of a few random files per resolution band, to check the settings on the rest of a library |
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
 | `run` | Transcode (`--dry-run` probes and measures but does not encode) |
 | `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
@@ -274,8 +275,8 @@ Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
 
 ### Deciding what to transcode first
 
-A 4K feature costs the better part of a day on this board, so picking titles by
-eye is expensive guesswork. `estimate` samples instead:
+A 4K feature at a slow preset can take many hours, so picking titles by eye is
+expensive guesswork. `estimate` samples instead:
 
 ```bash
 autotranscode estimate /media/films        # a file, a directory or a .txt list
@@ -370,6 +371,40 @@ after every step, with every per-frame number in `results.json`. Add
 `-- --excerpt DIR/excerpt.mkv --variant 'NAME CRF GRAIN [SVT...]'` for another
 round on the same footage, or `-- --rescore` to re-measure one after the
 measurements change.
+
+### Checking the settings on the rest of a library
+
+Each row of the [resolution table](#quality-scales-with-resolution) was tuned on
+one film, so it is only as good as that film was typical. `sample` tries the
+settings on others:
+
+```bash
+autotranscode sample /media/films -n 3 --minutes 4
+scripts/library-samples.sh /media/films -n 3        # the same, detached
+```
+
+It draws `n` files per band at random, cuts `--minutes` from a random point in
+each, and runs the real pipeline over them with the live config. Each sample gets
+a directory holding the excerpt, its encode, and snapshots of the three frames
+the encode handles worst from both, and `report.md` puts them side by side with
+their bitrates, savings and low-pass PSNR.
+
+- **Openings and end credits are skipped**: the first and last 10 minutes
+  (`--skip-start`, `--skip-end`), but never more than 15% of a file at either
+  end, so a short episode is sampled from its middle rather than passed over.
+- **Folders take turns.** Every folder gives one file before any gives two, so a
+  long series cannot fill a band on its own.
+- **Only files `run` would transcode** are candidates, by the same rules.
+- **Only as many files are probed as it takes** to fill the bands, not the whole
+  library.
+- **Reruns resume.** The picks are written to `picks.json` before anything is
+  encoded, so running again with the same `--out` finishes the same samples
+  rather than drawing new ones; `--seed` repeats a draw into a new directory.
+
+`--band 1080p` limits it to one band (repeatable), `--pick-only` shows the draw
+without encoding, and `--no-verify` skips the scores and snapshots. The global
+`--crf` and `--preset` apply, so the same draw can be encoded again at another
+setting into another directory.
 
 ## Stopping and resuming
 

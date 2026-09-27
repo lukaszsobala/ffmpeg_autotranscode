@@ -1,6 +1,6 @@
 """Encode a few seconds from a few places and extrapolate the whole file.
 
-A full encode on this hardware costs hours, so deciding what to transcode by
+A full encode at a slow preset can cost hours, so deciding what to transcode by
 transcoding it is no help. This samples instead: cut several short excerpts,
 encode them with the settings the real run would use, and compare their size
 against the bytes the source spends on the same moments.

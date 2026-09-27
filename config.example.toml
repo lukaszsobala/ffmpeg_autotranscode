@@ -25,7 +25,7 @@ profile = "auto"
 # unless you want to override that.
 # workers = 1
 
-# Scheduling priority, so an unattended crawl leaves the board usable.
+# Scheduling priority, so an unattended crawl leaves the machine usable.
 nice = 10
 
 [paths]
