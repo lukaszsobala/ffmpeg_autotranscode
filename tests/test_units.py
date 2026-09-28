@@ -1537,6 +1537,13 @@ class TestLibrarySamples(unittest.TestCase):
         self.assertEqual(sample.band_of(make_info(width=720, height=576,
                                                   sample_aspect="64:45"), cfg), "SD")
 
+    def test_a_failure_reports_what_the_tool_said(self):
+        exc = CommandError(["/usr/bin/ffmpeg", "-i", "a long command line"], 234,
+                           "\n[matroska] Can't write packet with unknown timestamp\nmore\n")
+        self.assertEqual(sample._reason(exc), "ffmpeg exit 234: "
+                         "[matroska] Can't write packet with unknown timestamp")
+        self.assertEqual(sample._reason(OSError("disk full")), "disk full")
+
     def test_start_stays_clear_of_both_ends(self):
         rng = random.Random(1)
         for _ in range(200):

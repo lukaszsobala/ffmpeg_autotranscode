@@ -205,7 +205,9 @@ def cut(chain: Toolchain, pick_: Pick, out: Path) -> None:
     seconds early; the result records the excerpt's real length.
     """
     partial = out.with_name(out.name + ".part")
-    run([chain.ffmpeg, "-hide_banner", "-v", "error", "-y",
+    # genpts: AVI stores no timestamps for packed B-frames, and Matroska refuses
+    # a packet without one.
+    run([chain.ffmpeg, "-hide_banner", "-v", "error", "-y", "-fflags", "+genpts",
          "-ss", f"{pick_.start:.3f}", "-i", pick_.source, "-t", f"{pick_.length:.3f}",
          "-map", "0:v:0", "-c", "copy", "-f", "matroska", str(partial)])
     partial.replace(out)
@@ -264,9 +266,17 @@ def encode_pick(
     except pipeline.SkipFile as exc:
         result.ok, result.error = False, f"skipped: {exc}"
     except (CommandError, OSError, ValueError) as exc:
-        result.ok, result.error = False, str(exc).splitlines()[0][:300] if str(exc) else repr(exc)
+        result.ok, result.error = False, _reason(exc)
     saved.write_text(json.dumps(asdict(result), indent=1), encoding="utf-8")
     return result
+
+
+def _reason(exc: Exception) -> str:
+    """One line for the report: what the tool said, not the command that failed."""
+    if isinstance(exc, CommandError):
+        said = [line for line in exc.stderr.strip().splitlines() if line.strip()]
+        return f"{Path(exc.argv[0]).name} exit {exc.returncode}: {said[0] if said else 'no message'}"[:300]
+    return str(exc).splitlines()[0][:300] if str(exc) else repr(exc)
 
 
 def _score(result: Result, chain: Toolchain, excerpt: Path, encoded: Path, directory: Path,
@@ -285,7 +295,7 @@ def _score(result: Result, chain: Toolchain, excerpt: Path, encoded: Path, direc
         verify.snapshots(chain, excerpt, result.worst, snaps, "source", pq=pq)
         verify.snapshots(chain, encoded, result.worst, snaps, "encode", pq=pq)
     except (CommandError, OSError, ValueError) as exc:
-        result.error = f"not scored: {str(exc).splitlines()[0][:200] if str(exc) else exc!r}"
+        result.error = f"not scored: {_reason(exc)}"
         log.warning("  %s", result.error)
 
 
