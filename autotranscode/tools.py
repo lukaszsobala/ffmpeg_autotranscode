@@ -227,7 +227,7 @@ def _missing_svt_options(chain: Toolchain, cfg: Config) -> list[str]:
     """Encoder options the configured quality depends on, absent from this encoder.
 
     These are not extras to skip quietly. The CRF ladder was set with them on:
-    1080p at CRF 30 needs the dark bias for dark scenes, and ac-bias and a weak
+    1080p at CRF 29 needs the dark bias for dark scenes, and ac-bias and a weak
     temporal filter for detail in motion; 4K at CRF 30 needs variance boost and
     the same two, or its fog comes out blotchy. An older SvtAv1EncApp -- distribution packages
     lag well behind -- would give exactly those encodes, with nothing to say so.

@@ -886,7 +886,7 @@ class TestCrfLadder(unittest.TestCase):
     def test_the_default_ladder(self):
         self.cfg.encode.crf_by_width = config.Config().encode.crf_by_width
         widths = (3840, 1920, 1280, 854)
-        self.assertEqual([self.crf_at(w) for w in widths], [30, 30, 27, 24])
+        self.assertEqual([self.crf_at(w) for w in widths], [30, 29, 27, 24])
 
     def test_a_cropped_scope_print_is_still_its_real_resolution(self):
         # The case that motivated keying on width: both of these are 4K sources

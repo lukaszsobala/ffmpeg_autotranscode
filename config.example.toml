@@ -89,8 +89,8 @@ extra_svt_params = []
 # 1080p, 960x720 is 720p), and non-square pixels by their shown width.
 [encode.crf_by_width]
 3000 = 0            # 4K. crf 30 with variance boost: the highest free of blocks on 4K HDR.
-1700 = 0            # 1080p: 30 as well, with the dark bias, ac-bias and tf strength
-                    # below. At 37 rain vanished and faces smeared.
+1700 = -1           # 1080p: 29, with the dark bias, ac-bias and tf strength below.
+                    # At 37 rain vanished and faces smeared; 30 fixed that, 29 is margin.
 1100 = -3           # 720p
 0 = -6              # 576p and below
 

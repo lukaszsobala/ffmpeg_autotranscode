@@ -85,11 +85,12 @@ class Encode:
     # picture narrower than 16:9 is filed by its height instead; see
     # encode.band_width.
     #
-    # 1080p is level with 4K. It once sat at 37 on the strength of the dark bias
-    # below, which held a dark scene together but not detail in motion: rain
-    # vanished and faces smeared on a second film. See ac_bias for what fixed it.
+    # 1080p is one step below 4K. It once sat at 37 on the strength of the dark
+    # bias below, which held a dark scene together but not detail in motion: rain
+    # vanished and faces smeared on a second film. CRF 30 and what ac_bias
+    # describes fixed that; 29 is a step of margin, so every band steps down.
     crf_by_width: dict[str, int] = field(
-        default_factory=lambda: {"3000": 0, "1700": 0, "1100": -3, "0": -6}
+        default_factory=lambda: {"3000": 0, "1700": -1, "1100": -3, "0": -6}
     )
     pix_format: str = "yuv420p10le"
     tune: int = 0  # 0=VQ (subjective), 2=SSIM
