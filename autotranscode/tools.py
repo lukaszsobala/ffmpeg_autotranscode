@@ -227,9 +227,9 @@ def _missing_svt_options(chain: Toolchain, cfg: Config) -> list[str]:
     """Encoder options the configured quality depends on, absent from this encoder.
 
     These are not extras to skip quietly. The CRF ladder was set with them on:
-    1080p at CRF 37 is fine with the dark bias and blocky without it, and 4K at
-    CRF 30 is fine with variance boost, ac-bias and a weak temporal filter and
-    blotchy in fog without them. An older SvtAv1EncApp -- distribution packages
+    1080p at CRF 30 needs the dark bias for dark scenes, and ac-bias and a weak
+    temporal filter for detail in motion; 4K at CRF 30 needs variance boost and
+    the same two, or its fog comes out blotchy. An older SvtAv1EncApp -- distribution packages
     lag well behind -- would give exactly those encodes, with nothing to say so.
     """
     def used(value: float | dict[str, float], off: float = 0) -> bool:
@@ -241,7 +241,7 @@ def _missing_svt_options(chain: Toolchain, cfg: Config) -> list[str]:
     if used(cfg.encode.luminance_qp_bias) and "--luminance-qp-bias" not in chain.svt_options:
         problems.append(
             f"encode.luminance_qp_bias needs --luminance-qp-bias. {upgrade}, or set it "
-            "to 0 and bring encode.crf_by_width's 1080p shift down to about 2"
+            "to 0 and expect dark 1080p scenes to block"
         )
     if used(cfg.encode.variance_boost_strength) \
             and "--enable-variance-boost" not in chain.svt_options:
@@ -348,9 +348,9 @@ def describe(chain: Toolchain) -> str:
         f"libvmaf     {'yes' if chain.has_libvmaf else 'no'}",
         f"hdr10 meta  {'yes' if chain.has_hdr10_metadata else 'no'}  "
         "(--mastering-display / --content-light)",
-        f"ac-bias     {'yes' if '--ac-bias' in chain.svt_options else 'no'}  (for 4K)",
+        f"ac-bias     {'yes' if '--ac-bias' in chain.svt_options else 'no'}  (for 4K and 1080p)",
         f"tf strength {'yes' if '--tf-strength' in chain.svt_options else 'no'}  "
-        "(--tf-strength, for 4K)",
+        "(--tf-strength, for 4K and 1080p)",
         f"dark bias   {'yes' if '--luminance-qp-bias' in chain.svt_options else 'no'}  "
         "(--luminance-qp-bias, for 1080p)",
         f"dovi p5     {'yes' if chain.has_dovi_tonemap else 'no'}  "

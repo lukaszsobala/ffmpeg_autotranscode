@@ -85,11 +85,11 @@ class Encode:
     # picture narrower than 16:9 is filed by its height instead; see
     # encode.band_width.
     #
-    # 1080p sits above 4K, not level with it, because it pairs with a dark bias
-    # (luminance_qp_bias below) that already spends its bits where it blocked.
-    # Without that bias, 37 is too high for 1080p: take the shift back to about 2.
+    # 1080p is level with 4K. It once sat at 37 on the strength of the dark bias
+    # below, which held a dark scene together but not detail in motion: rain
+    # vanished and faces smeared on a second film. See ac_bias for what fixed it.
     crf_by_width: dict[str, int] = field(
-        default_factory=lambda: {"3000": 0, "1700": 7, "1100": -3, "0": -6}
+        default_factory=lambda: {"3000": 0, "1700": 0, "1100": -3, "0": -6}
     )
     pix_format: str = "yuv420p10le"
     tune: int = 0  # 0=VQ (subjective), 2=SSIM
@@ -115,9 +115,9 @@ class Encode:
     #
     # On at 1080p only. A grainy 8-bit 1080p film smeared its shadows into blocks
     # in a dark red scene at CRF 32, and neither more bits (CRF 30), variance boost
-    # nor chroma offsets fixed it. 100 at CRF 37 did, and for less than 25 or 50 at
-    # the lower CRFs that matched it in that scene: 1.32x the bits of CRF 32
-    # without the bias, against 1.57x and 1.46x.
+    # nor chroma offsets fixed it; 100 did. With ac-bias and the weak temporal
+    # filter below it still takes the full 100 at CRF 30: that scene was judged
+    # blocky with 50 at CRF 30, and with 100 at CRF 32.
     luminance_qp_bias: int | dict[str, int] = field(
         default_factory=lambda: {"3000": 0, "1700": 100, "1100": 0}
     )
@@ -125,7 +125,7 @@ class Encode:
     # or a width table, as above. Temporal filter strength: SVT-AV1's 0-4, or -1
     # to leave it at the encoder's own default (3 in SVT-AV1 4.2).
     #
-    # Both on at 4K only, together. Variance boost left a grainy 4K film's fog
+    # Both on at 4K and 1080p, together. Variance boost left a grainy 4K film's fog
     # blotched: the grain smeared into patches tens of pixels across, some of them
     # tinted. Temporal filtering averages the grain of neighbouring frames into
     # exactly those lumps, and ac-bias keeps the encoder from flattening what is
@@ -133,13 +133,18 @@ class Encode:
     # default, 55.6 at 1, 55.9 off), but off looked worse in motion than 1, and
     # neither CRF 26 nor stronger variance boost came close. 1.17x the bits of
     # the whole film without them (82.5% saving instead of 85%); better in 148 of
-    # its 159 three-second windows and never worse by more than 0.2 dB. Not yet
-    # tried below 4K.
+    # its 159 three-second windows and never worse by more than 0.2 dB.
+    #
+    # At 1080p the default filter wiped out rain and the encoder smeared a face
+    # at CRF 37; strength 1 and ac-bias 1 brought the rain back, CRF 30 the face.
+    # With the dark bias, the worst stretches of a grainy 1080p film came out
+    # 2.5x the bits of CRF 37, gaining 3.7 dB of low-pass 5th percentile and
+    # keeping 90% of the grain instead of 72%.
     ac_bias: float | dict[str, float] = field(
-        default_factory=lambda: {"3000": 1.0, "0": 0.0}
+        default_factory=lambda: {"1700": 1.0, "0": 0.0}
     )
     tf_strength: int | dict[str, int] = field(
-        default_factory=lambda: {"3000": 1, "0": -1}
+        default_factory=lambda: {"1700": 1, "0": -1}
     )
     keyint_sec: float = 10.0
     chunk_method: str = "auto"  # lsmash when its VapourSynth plugin loads, else hybrid

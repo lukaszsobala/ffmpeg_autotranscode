@@ -865,9 +865,15 @@ class TestFfmpegShim(unittest.TestCase):
 class TestCrfLadder(unittest.TestCase):
     """CRF is per coded pixel, so the same number means less quality as size drops."""
 
+    # A step at every band, so a source filed in the wrong one shows in its CRF.
+    # The defaults put 4K and 1080p level, which would hide a 4K print filed as
+    # 1080p.
+    LADDER = {"3000": 0, "1700": 3, "1100": -3, "0": -6}
+
     def setUp(self):
         self.cfg = config.Config()
         self.cfg.encode.crf = 30
+        self.cfg.encode.crf_by_width = dict(self.LADDER)
 
     def crf_at(self, width: int, height: int = 0) -> int:
         info = make_info(width=width, height=height or width * 9 // 16)
@@ -875,7 +881,12 @@ class TestCrfLadder(unittest.TestCase):
 
     def test_each_band_shifts_from_the_4k_anchor(self):
         widths = (3840, 2560, 1920, 1280, 854, 640)
-        self.assertEqual([self.crf_at(w) for w in widths], [30, 37, 37, 27, 24, 24])
+        self.assertEqual([self.crf_at(w) for w in widths], [30, 33, 33, 27, 24, 24])
+
+    def test_the_default_ladder(self):
+        self.cfg.encode.crf_by_width = config.Config().encode.crf_by_width
+        widths = (3840, 1920, 1280, 854)
+        self.assertEqual([self.crf_at(w) for w in widths], [30, 30, 27, 24])
 
     def test_a_cropped_scope_print_is_still_its_real_resolution(self):
         # The case that motivated keying on width: both of these are 4K sources
@@ -884,18 +895,18 @@ class TestCrfLadder(unittest.TestCase):
         self.assertEqual(self.crf_at(3836, height=2072), 32)
         self.assertEqual(self.crf_at(3840, height=1600), 32)
         # And the same crop one rung down stays 1080p rather than dropping to 720p.
-        self.assertEqual(self.crf_at(1920, height=800), 37)
+        self.assertEqual(self.crf_at(1920, height=800), 33)
 
     def test_narrow_hd_is_filed_by_its_height(self):
         # 4:3 HD and 960x720 would drop a band on width alone.
-        self.assertEqual(self.crf_at(1440, height=1080), 37)
+        self.assertEqual(self.crf_at(1440, height=1080), 33)
         self.assertEqual(self.crf_at(960, height=720), 27)
 
     def test_non_square_pixels_are_filed_by_their_shown_width(self):
         # HDV: 1440x1080 stored, shown 1920 wide. Only the shown width is 1080p
         # here, because the height is cut to a crop that on its own would not be.
         info = make_info(width=1440, height=800, sample_aspect="4:3")
-        self.assertEqual(encode.effective_crf(info, self.cfg), 37)
+        self.assertEqual(encode.effective_crf(info, self.cfg), 33)
         self.assertEqual(encode.effective_crf(replace(info, sample_aspect=""), self.cfg), 27)
 
     def test_dvds_stay_sd_whatever_their_pixel_shape(self):
@@ -907,7 +918,7 @@ class TestCrfLadder(unittest.TestCase):
     def test_the_anchor_moves_the_whole_ladder(self):
         # One knob still controls the library: --crf 28 lowers every band by 2.
         self.cfg.encode.crf = 28
-        self.assertEqual([self.crf_at(w) for w in (3840, 1920, 1280)], [28, 35, 25])
+        self.assertEqual([self.crf_at(w) for w in (3840, 1920, 1280)], [28, 31, 25])
 
     def test_an_empty_ladder_uses_the_plain_crf(self):
         self.cfg.encode.crf_by_width = {}
@@ -1296,7 +1307,7 @@ class TestVarianceBoost(unittest.TestCase):
 
 
 class TestDarkBias(unittest.TestCase):
-    """1080p pays for its higher CRF with a lower QP on dark frames."""
+    """1080p keeps its dark scenes from blocking with a lower QP on dark frames."""
 
     OPTIONS = {"--luminance-qp-bias"}
 
@@ -1334,7 +1345,8 @@ class TestDarkBias(unittest.TestCase):
 
 
 class TestFogSettings(unittest.TestCase):
-    """4K keeps its grain in flat fog with ac-bias and a weak temporal filter."""
+    """4K keeps its grain in flat fog, and 1080p its rain, with ac-bias and a weak
+    temporal filter."""
 
     OPTIONS = {"--ac-bias", "--tf-strength"}
 
@@ -1345,9 +1357,9 @@ class TestFogSettings(unittest.TestCase):
         return tuple(argv[argv.index(flag) + 1] if flag in argv else None
                      for flag in ("--ac-bias", "--tf-strength"))
 
-    def test_only_4k_gets_them_by_default(self):
+    def test_4k_and_1080p_get_them_by_default(self):
         self.assertEqual([self.flags_at(w) for w in (3836, 1920, 1280, 720)],
-                         [("1.0", "1"), (None, None), (None, None), (None, None)])
+                         [("1.0", "1"), ("1.0", "1"), (None, None), (None, None)])
 
     def test_tables_are_read_by_band(self):
         cfg = config.Config()

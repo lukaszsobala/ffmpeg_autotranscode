@@ -89,8 +89,8 @@ extra_svt_params = []
 # 1080p, 960x720 is 720p), and non-square pixels by their shown width.
 [encode.crf_by_width]
 3000 = 0            # 4K. crf 30 with variance boost: the highest free of blocks on 4K HDR.
-1700 = 7            # 1080p: 37, and only because of the dark bias below. Without it,
-                    # a grainy 1080p film blocked in a dark scene even at 32.
+1700 = 0            # 1080p: 30 as well, with the dark bias, ac-bias and tf strength
+                    # below. At 37 rain vanished and faces smeared.
 1100 = -3           # 720p
 0 = -6              # 576p and below
 
@@ -106,8 +106,8 @@ extra_svt_params = []
 
 # Dark bias, 0-100: a lower QP for dark frames, the darker the lower. It fixed
 # shadows smearing into blocks on a grainy 1080p film where more bits and variance
-# boost did not, and 100 with a higher CRF cost less than 25 or 50 with a lower
-# one. It acts on whole frames, so a dim film pays for it on most of them.
+# boost did not. At CRF 30 that dark scene still blocked with 50, so 100 it is.
+# It acts on whole frames, so a dim film pays for it on most of them.
 [encode.luminance_qp_bias]
 3000 = 0
 1700 = 100
@@ -119,13 +119,13 @@ extra_svt_params = []
 # averaged into patches tens of pixels across. ac-bias 1 with strength 1 cleared
 # it where CRF 26 and stronger variance boost did not, for 1.17x the size of the
 # film without them. Turning the filter off scored higher still but looked worse
-# in motion. Not yet tried below 4K.
+# in motion. At 1080p the default filter erased rain; strength 1 brought it back.
 [encode.ac_bias]
-3000 = 1.0
+1700 = 1.0
 0 = 0.0
 
 [encode.tf_strength]
-3000 = 1
+1700 = 1
 0 = -1
 
 # Sampling for `estimate`, which ranks a library by what a real encode would save.
