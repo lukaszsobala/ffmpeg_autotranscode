@@ -11,6 +11,7 @@ import locale
 import os
 import random
 import signal
+import sys
 import tempfile
 import time
 import unittest
@@ -1780,3 +1781,75 @@ class TestNoSavingIsRemembered(unittest.TestCase):
         self.ledger.record(self.source, Record(source=str(self.source), status="skipped",
                                                reason="already av1"))
         self.assertIsNone(self.ledger.no_saving(self.source))
+
+
+class TestChunkMethod(unittest.TestCase):
+    """Choosing how Av1an cuts the film, and keeping its index out of the library."""
+
+    def _argv(self, cfg: config.Config, chain: Toolchain) -> list[str]:
+        return encode.build_command(make_info(), Path("/o.mkv"), chain, cfg, Path("/t"))
+
+    def test_auto_takes_lsmash_when_its_plugin_loads(self):
+        cfg = config.Config()
+        with_plugin = make_chain(vspipe="/v/vspipe", vapoursynth_plugins={"lsmas", "std"})
+        self.assertEqual(encode.chunk_method(cfg, with_plugin), "lsmash")
+        self.assertEqual(encode.chunk_method(cfg, make_chain()), "hybrid")
+        self.assertEqual(encode.chunk_method(cfg, make_chain(vspipe="/v/vspipe")), "hybrid")
+
+    def test_a_vapoursynth_index_goes_to_the_temp_directory(self):
+        cfg = config.Config()
+        argv = self._argv(cfg, make_chain(vspipe="/v/vspipe", vapoursynth_plugins={"lsmas"}))
+        self.assertEqual(argv[argv.index("-m") + 1], "lsmash")
+        self.assertEqual(argv[argv.index("--cache-mode") + 1], "temp")
+        self.assertNotIn("--cache-mode", self._argv(cfg, make_chain()))
+
+    def test_scene_detection_is_downscaled_unless_turned_off(self):
+        cfg = config.Config()
+        argv = self._argv(cfg, make_chain())
+        self.assertEqual(argv[argv.index("--sc-downscale-height") + 1], "1080")
+        cfg.encode.sc_downscale_height = 0
+        self.assertNotIn("--sc-downscale-height", self._argv(cfg, make_chain()))
+
+    def test_an_explicit_lsmash_without_the_plugin_is_refused(self):
+        def complaint(method: str, chain: Toolchain) -> bool:
+            cfg = config.Config()
+            cfg.encode.chunk_method = method
+            try:
+                tools.require(chain, cfg)
+            except tools.ToolError as exc:
+                return "chunk_method" in str(exc)
+            return False
+
+        without = make_chain(vspipe="/v/vspipe", vapoursynth_plugins={"std"})
+        self.assertTrue(complaint("lsmash", without))
+        self.assertTrue(complaint("lsmash", make_chain()))
+        self.assertFalse(complaint("lsmash", make_chain(vspipe="/v/vspipe",
+                                                        vapoursynth_plugins={"lsmas"})))
+        self.assertFalse(complaint("auto", without))   # falls back to hybrid instead
+
+    def test_unknown_methods_are_rejected(self):
+        cfg = config.Config()
+        cfg.encode.chunk_method = "lsmas"
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
+
+    def test_vspipe_s_folder_reaches_av1an(self):
+        chain = make_chain(vspipe="/opt/vs/bin/vspipe")
+        self.assertIn("/opt/vs/bin", chain.bin_dirs)
+
+
+class TestChildPath(unittest.TestCase):
+    """VapourSynth's embedded Python must not find our virtualenv's python3."""
+
+    def test_our_own_virtualenv_is_left_off_a_child_s_path(self):
+        with unittest.mock.patch.object(sys, "prefix", "/proj/.venv"), \
+                unittest.mock.patch.object(sys, "base_prefix", "/usr"), \
+                unittest.mock.patch.dict(os.environ, {"PATH": "/proj/.venv/bin:/usr/bin:/bin"}):
+            path = util.child_env(["/extra"])["PATH"].split(os.pathsep)
+        self.assertEqual(path, ["/extra", "/usr/bin", "/bin"])
+
+    def test_outside_a_virtualenv_nothing_is_removed(self):
+        with unittest.mock.patch.object(sys, "prefix", "/usr"), \
+                unittest.mock.patch.object(sys, "base_prefix", "/usr"), \
+                unittest.mock.patch.dict(os.environ, {"PATH": "/a/bin:/usr/bin"}):
+            self.assertEqual(util.child_env()["PATH"], "/a/bin:/usr/bin")

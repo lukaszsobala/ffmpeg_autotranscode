@@ -15,7 +15,7 @@ from typing import TypeVar
 
 from .config import Config
 from .probe import MediaInfo
-from .tools import Toolchain
+from .tools import VAPOURSYNTH_CHUNK_METHODS, Toolchain
 from .util import log, run, run_watched
 
 # ITU-T H.273 code points, which is what AV1 signals and what SvtAv1EncApp expects.
@@ -215,6 +215,20 @@ def pix_format(info: MediaInfo, cfg: Config) -> str:
     return "yuv420p10le"
 
 
+def chunk_method(cfg: Config, chain: Toolchain) -> str:
+    """The configured chunk method, with "auto" resolved.
+
+    L-SMASH when its plugin loads: it indexes a file in seconds and hands over
+    exact frames. hybrid instead has Av1an find keyframes with `ffprobe
+    -show_frames`, which decodes the whole film on one core first -- about ten
+    hours for a 4K feature on an RK3588 -- and copies the video into split files.
+    """
+    method = cfg.encode.chunk_method
+    if method == "auto":
+        return "lsmash" if "lsmas" in chain.vapoursynth_plugins else "hybrid"
+    return method
+
+
 def build_command(
     info: MediaInfo,
     output: Path,
@@ -237,7 +251,7 @@ def build_command(
         "-e", "svt-av1",
         "-v", " ".join(svt_params(info, cfg, chain)),
         "--pix-format", pix_format(info, cfg),
-        "-m", enc.chunk_method,
+        "-m", (method := chunk_method(cfg, chain)),
         "-c", enc.concat,
         "--sc-method", enc.sc_method,
         "--extra-split-sec", str(enc.extra_split_sec),
@@ -252,6 +266,11 @@ def build_command(
 
     if cfg.machine.workers > 0:
         argv += ["-w", str(cfg.machine.workers)]
+    if method in VAPOURSYNTH_CHUNK_METHODS:
+        # The index goes next to the source by default: into the library.
+        argv += ["--cache-mode", "temp"]
+    if enc.sc_downscale_height > 0:
+        argv += ["--sc-downscale-height", str(enc.sc_downscale_height)]
 
     # Filters run inside Av1an's chunk pipeline, so no full-size intermediate file
     # is ever written. Tonemapping comes first: everything after it works in the

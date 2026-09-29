@@ -8,7 +8,7 @@
 #   ./scripts/bootstrap.sh            # everything
 #   ./scripts/bootstrap.sh ffmpeg     # just one stage
 #
-# Stages: deps ffmpeg svtav1 vapoursynth av1an grav1synth verify
+# Stages: deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth verify
 #
 # On Linux only the `deps` and `ffmpeg` stages use sudo, and only to run apt-get.
 # On macOS nothing does: Homebrew runs as you. Everything built from source
@@ -35,6 +35,8 @@ ZIMG_VERSION="${ZIMG_VERSION:-release-3.0.6}"
 VAPOURSYNTH_VERSION="${VAPOURSYNTH_VERSION:-R72}"
 # Built from the crate with a local patch; see stage_grav1synth.
 GRAV1SYNTH_VERSION="${GRAV1SYNTH_VERSION:-0.2.0}"
+# L-SMASH-Works tags stopped in 2023; this is the commit tested here (2026-09).
+LSMASH_WORKS_COMMIT="${LSMASH_WORKS_COMMIT:-7e63c8400a252f4dbbeea80cc3bfec895abf12cf}"
 PREFIX="${PREFIX:-$HOME/.local}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$HOME/.cache/autotranscode-build}"
@@ -49,7 +51,7 @@ case "$(uname -s)" in
     command -v apt-get >/dev/null || die "this script installs with apt-get (Debian, Ubuntu \
 and derivatives). On another distribution install by hand: build tools, cmake, nasm, \
 pkg-config, mkvtoolnix, Python 3.11+ and the ffmpeg development headers, then run the \
-ffmpeg, svtav1, vapoursynth, av1an and grav1synth stages, which need no package manager."
+ffmpeg, svtav1, vapoursynth, lsmash, av1an and grav1synth stages, which need no package manager."
     JOBS="${JOBS:-$(nproc)}"
     ;;
   Darwin)
@@ -202,10 +204,9 @@ stage_svtav1() {
 }
 
 stage_vapoursynth() {
-  # This is not optional and not about chunk methods. Av1an links -lvapoursynth
-  # unconditionally: no published version and no upstream branch gates it behind a
-  # cargo feature, so the library must exist even though this tool never uses it
-  # (encode.chunk_method 'hybrid' is FFmpeg-only).
+  # Needed twice over. Av1an links -lvapoursynth unconditionally -- no published
+  # version gates it behind a cargo feature -- and the lsmash chunk method, which
+  # the lsmash stage adds, runs through VapourSynth.
   if [[ $OS == mac ]]; then
     log "Installing VapourSynth from Homebrew"
     brew install vapoursynth
@@ -228,8 +229,7 @@ stage_vapoursynth() {
     git clone --depth 1 --branch "$VAPOURSYNTH_VERSION" \
       https://github.com/vapoursynth/vapoursynth.git "$vs"
   fi
-  # The Python module is not optional, however unused VapourSynth is here: Av1an
-  # links -lvapoursynth-script, and VSScript's API initialises by importing the
+  # The Python module is not optional: Av1an links -lvapoursynth-script, and VSScript's API initialises by importing the
   # Python `vapoursynth` module. Without it every av1an invocation, `--version`
   # included, dies with "Failed to get VSScript API".
   #
@@ -247,6 +247,42 @@ stage_vapoursynth() {
 
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion vapoursynth \
     || die "vapoursynth.pc not found under ${PREFIX}"
+}
+
+stage_lsmash() {
+  # L-SMASH-Works' VapourSynth plugin, for encode.chunk_method "lsmash" (which
+  # "auto" picks when it loads). It indexes a film in seconds and hands Av1an exact
+  # frames. Without it Av1an falls back to hybrid, which first decodes the whole
+  # film on one core to find its keyframes: about ten hours for 4K on an RK3588.
+  log "Building the L-SMASH-Works VapourSynth plugin"
+  mkdir -p "$BUILD_DIR"
+  local src="$BUILD_DIR/lsmash-works"
+  [[ -d $src/.git ]] \
+    || git clone --depth 1 https://github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works.git "$src"
+  # Its bundled FFmpeg fork is left out: the system's FFmpeg 7 libraries build and
+  # decode frame-exact, and the fork is a large build of its own.
+  ( cd "$src" && git fetch --depth 1 origin "$LSMASH_WORKS_COMMIT" \
+    && git checkout -q FETCH_HEAD \
+    && git submodule update --init --depth 1 l-smash obuparse xxHash )
+  rm -rf "$src/build"
+  # Position-independent code, or the static l-smash will not link into the
+  # plugin on arm64. Optional decoders off: FFmpeg decodes everything we read.
+  PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" cmake -S "$src" -B "$src/build" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DBUILD_AVS_PLUGIN=OFF -DBUILD_VS_PLUGIN=ON -DENABLE_DAV1D=OFF -DENABLE_VPX=OFF \
+    -DENABLE_XML2=OFF -DENABLE_MFX=OFF -DZLIB_USE_STATIC_LIBS=OFF
+  cmake --build "$src/build" -j "$JOBS"
+  # Only the plugin: `cmake --install` would also drop l-smash's, obuparse's and
+  # xxHash's static libraries and headers into the prefix, which nothing uses.
+  # VapourSynth autoloads plugins from <its libdir>/vapoursynth.
+  local plugins="$PREFIX/lib/vapoursynth"
+  [[ $OS == mac ]] && plugins="$(brew --prefix)/lib/vapoursynth"
+  local built
+  built=$(find "$src/build" -maxdepth 1 -name 'libLSMASHSource.*' -type f | head -1)
+  [[ -n $built ]] || die "the plugin did not build"
+  mkdir -p "$plugins"
+  install -m 755 "$built" "$plugins/"
+  log "Installed $(basename "$built") into ${plugins}"
 }
 
 ensure_cargo() {
@@ -333,7 +369,7 @@ EOF
 main() {
   local stages=("$@")
   if [[ ${#stages[@]} -eq 0 ]]; then
-    stages=(deps ffmpeg svtav1 vapoursynth av1an grav1synth verify)
+    stages=(deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth verify)
   fi
   for stage in "${stages[@]}"; do
     case "$stage" in
@@ -341,6 +377,7 @@ main() {
       ffmpeg)     stage_ffmpeg ;;
       svtav1)     stage_svtav1 ;;
       vapoursynth) stage_vapoursynth ;;
+      lsmash)     stage_lsmash ;;
       av1an)      stage_av1an ;;
       grav1synth) stage_grav1synth ;;
       verify)     stage_verify ;;

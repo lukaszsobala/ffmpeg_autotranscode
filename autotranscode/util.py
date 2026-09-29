@@ -10,6 +10,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -55,12 +56,25 @@ def child_env(extra_path: Sequence[str] = ()) -> dict[str, str]:
     bare name -- Av1an looks up SvtAv1EncApp, ffmpeg and mkvmerge that way -- would
     otherwise miss the binaries we located through the config, and would silently
     prefer a different copy to the one `doctor` reported on.
+
+    Our own virtualenv's bin directory is left out. VapourSynth embeds Python and
+    takes the first python3 on PATH as its home: the venv's, with the user site --
+    where the vapoursynth module lives -- switched off. Av1an then panics with
+    "Failed to get VSScript API", even for --version, whenever autotranscode runs
+    from an activated venv.
     """
     env = {**os.environ, "LC_ALL": child_locale()}
-    if extra_path:
-        unique = list(dict.fromkeys(extra_path))
-        env["PATH"] = os.pathsep.join([*unique, env.get("PATH", "")]).rstrip(os.pathsep)
+    path = [entry for entry in env.get("PATH", "").split(os.pathsep)
+            if entry and entry not in _own_venv_bins()]
+    env["PATH"] = os.pathsep.join(dict.fromkeys([*extra_path, *path]))
     return env
+
+
+def _own_venv_bins() -> set[str]:
+    if sys.prefix == sys.base_prefix:
+        return set()
+    bin_dir = Path(sys.prefix) / ("Scripts" if os.name == "nt" else "bin")
+    return {str(bin_dir), str(bin_dir.resolve())}
 
 
 def unusable_locale_vars() -> list[str]:

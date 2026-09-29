@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -56,7 +57,9 @@ class Toolchain:
     # Long options SvtAv1EncApp actually accepts. Flags come and go between
     # releases, so we ask the binary rather than assume the build has them.
     svt_options: set[str] = field(default_factory=set)
-    has_vapoursynth: bool = False
+    vspipe: str | None = None
+    # Namespaces of the VapourSynth plugins that actually load ("lsmas", "ffms2").
+    vapoursynth_plugins: set[str] = field(default_factory=set)
 
     # ---- capability helpers -------------------------------------------------
 
@@ -69,8 +72,12 @@ class Toolchain:
         while the encode dies with "Encoder SvtAv1EncApp not found" is exactly the
         gap this closes.
         """
-        found = (self.ffmpeg, self.ffprobe, self.svtav1encapp, self.mkvmerge)
+        found = (self.ffmpeg, self.ffprobe, self.svtav1encapp, self.mkvmerge, self.vspipe)
         return list(dict.fromkeys(str(Path(path).parent) for path in found if path))
+
+    @property
+    def has_vapoursynth(self) -> bool:
+        return self.vspipe is not None
 
     @property
     def has_libvmaf(self) -> bool:
@@ -110,9 +117,9 @@ def _find_ffmpeg(configured: str, name: str) -> str | None:
     return found or shutil.which(name)
 
 
-def _capture(argv: list[str]) -> str:
+def _capture(argv: list[str], extra_path: list[str] | None = None) -> str:
     try:
-        result = run(argv, check=False)
+        result = run(argv, check=False, extra_path=extra_path or ())
     except (OSError, CommandError):
         return ""
     return (result.stdout or "") + (result.stderr or "")
@@ -185,7 +192,9 @@ def detect(cfg: Config) -> Toolchain:
             chain.svtav1_version = match.group(1)
         chain.svt_options = set(re.findall(r"--[a-z0-9][a-z0-9-]+", _capture([svt, "--help"])))
 
-    chain.has_vapoursynth = shutil.which("vspipe") is not None
+    chain.vspipe = _find_vspipe(chain)
+    if chain.vspipe:
+        chain.vapoursynth_plugins = _vapoursynth_plugins(chain)
     chain.big_cores = _big_cores() if shutil.which("taskset") else ""
     return chain
 
@@ -222,6 +231,39 @@ def _missing_svt_options(chain: Toolchain, cfg: Config) -> list[str]:
     return problems
 
 
+# Av1an's VapourSynth chunk methods, and the plugin namespace each needs.
+VAPOURSYNTH_CHUNK_METHODS = {"lsmash": "lsmas", "ffms2": "ffms2", "bestsource": "bs"}
+
+# Loads nothing; reports which plugins VapourSynth found and could load.
+_PLUGIN_PROBE = """\
+import sys
+from vapoursynth import core
+sys.stderr.write("plugins: " + " ".join(p.namespace for p in core.plugins()) + "\\n")
+core.std.BlankClip(length=1).set_output()
+"""
+
+
+def _find_vspipe(chain: Toolchain) -> str | None:
+    """vspipe on PATH, or installed beside our SvtAv1EncApp: a systemd unit's PATH
+    leaves out ~/.local/bin, where the bootstrap script puts both."""
+    if found := shutil.which("vspipe"):
+        return found
+    places = [Path.home() / ".local" / "bin"]
+    if chain.svtav1encapp:
+        places.insert(0, Path(chain.svtav1encapp).parent)
+    return next((str(p / "vspipe") for p in places if (p / "vspipe").is_file()), None)
+
+
+def _vapoursynth_plugins(chain: Toolchain) -> set[str]:
+    assert chain.vspipe is not None
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "plugins.vpy"
+        script.write_text(_PLUGIN_PROBE, encoding="utf-8")
+        output = _capture([chain.vspipe, "--info", str(script)], chain.bin_dirs)
+    match = re.search(r"^plugins: (.*)$", output, re.MULTILINE)
+    return set(match.group(1).split()) if match else set()
+
+
 def require(chain: Toolchain, cfg: Config) -> None:
     """Fail early and specifically, rather than deep inside a 10-hour encode."""
     problems: list[str] = []
@@ -256,10 +298,13 @@ def require(chain: Toolchain, cfg: Config) -> None:
             "target_quality.metric='vmaf' needs an ffmpeg with libvmaf; "
             "jellyfin-ffmpeg has it, the Ubuntu build does not"
         )
-    if cfg.encode.chunk_method in {"lsmash", "ffms2", "bestsource"} and not chain.has_vapoursynth:
+    method = cfg.encode.chunk_method
+    if (plugin := VAPOURSYNTH_CHUNK_METHODS.get(method)) and plugin not in chain.vapoursynth_plugins:
+        where = "VapourSynth" if chain.has_vapoursynth else "VapourSynth (vspipe not found)"
         problems.append(
-            f"encode.chunk_method='{cfg.encode.chunk_method}' needs VapourSynth; "
-            "use 'hybrid' for an FFmpeg-only setup"
+            f"encode.chunk_method='{method}' needs {where} with the '{plugin}' plugin"
+            + (" (scripts/bootstrap.sh lsmash builds it)" if method == "lsmash" else "")
+            + "; 'auto' falls back to 'hybrid' without it"
         )
 
     if problems:
@@ -274,7 +319,8 @@ def describe(chain: Toolchain) -> str:
         f"svtav1      {chain.svtav1encapp or 'MISSING'}  ({chain.svtav1_version or '-'})",
         f"grav1synth  {chain.grav1synth or 'MISSING'}",
         f"mkvmerge    {chain.mkvmerge or 'MISSING'}",
-        f"vapoursynth {'yes' if chain.has_vapoursynth else 'no'}",
+        f"vapoursynth {chain.vspipe or 'no'}  "
+        f"(plugins: {' '.join(sorted(chain.vapoursynth_plugins)) or 'none'})",
         f"libvmaf     {'yes' if chain.has_libvmaf else 'no'}",
         f"hdr10 meta  {'yes' if chain.has_hdr10_metadata else 'no'}  "
         "(--mastering-display / --content-light)",

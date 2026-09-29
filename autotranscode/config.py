@@ -31,17 +31,20 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         # crf 30 is the 4K anchor: with variance boost on, it was the highest that
         # kept a grainy 4K HDR film's fog and flat paper free of blocks (34 and 38
         # brought them back). The resolution ladder shifts the other bands from it.
-        "encode": {"preset": 4, "crf": 30, "chunk_method": "hybrid"},
+        "encode": {"preset": 4, "crf": 30, "chunk_method": "auto"},
         "grain": {"samples": 4, "sample_seconds": 2},
         "target_quality": {"enabled": False},
     },
     "generic": {},
     "workstation": {
         "machine": {"workers": 0},
-        "encode": {"preset": 4, "crf": 28, "chunk_method": "hybrid"},
+        "encode": {"preset": 4, "crf": 28, "chunk_method": "auto"},
         "grain": {"samples": 6, "sample_seconds": 3},
     },
 }
+
+
+CHUNK_METHODS = {"auto", "hybrid", "lsmash", "ffms2", "bestsource", "select", "segment"}
 
 
 @dataclass(slots=True)
@@ -139,9 +142,13 @@ class Encode:
         default_factory=lambda: {"3000": 1, "0": -1}
     )
     keyint_sec: float = 10.0
-    chunk_method: str = "hybrid"  # hybrid works without VapourSynth
+    chunk_method: str = "auto"  # lsmash when its VapourSynth plugin loads, else hybrid
     concat: str = "mkvmerge"
     sc_method: str = "standard"
+    # Scene detection on frames no taller than this; 0 for full size. On a 4K
+    # excerpt 1080 found the same 43 cuts 20% sooner. Lower saves little at 4K,
+    # where decoding is the floor, and added cuts to a 1080p excerpt.
+    sc_downscale_height: int = 1080
     extra_split_sec: int = 10
     min_scene_len: int = 24
     extra_svt_params: list[str] = field(default_factory=list)
@@ -465,6 +472,10 @@ def validate(cfg: Config) -> None:
         raise ConfigError("audio.mode must be copy, opus or smart")
     if cfg.subtitles.mode not in {"copy", "none", "text-only"}:
         raise ConfigError("subtitles.mode must be copy, none or text-only")
+    if cfg.encode.chunk_method not in CHUNK_METHODS:
+        raise ConfigError(f"encode.chunk_method must be one of {', '.join(sorted(CHUNK_METHODS))}")
+    if cfg.encode.sc_downscale_height < 0:
+        raise ConfigError("encode.sc_downscale_height cannot be negative (0 turns it off)")
     if not 0 <= cfg.output.check_saving_after_percent <= 100:
         raise ConfigError("output.check_saving_after_percent must be between 0 and 100")
     if cfg.output.container not in {"mkv", "webm"}:

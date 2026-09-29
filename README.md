@@ -154,6 +154,7 @@ What it installs, and from where:
 | jellyfin-ffmpeg | Jellyfin's apt repository; its portable build where the repository has no packages | its portable build, into `~/.local/lib/jellyfin-ffmpeg` |
 | SVT-AV1 4.2.0 | built from source into `~/.local` | built from source into `~/.local` |
 | VapourSynth (Av1an will not link without it) | built from source into `~/.local` | Homebrew |
+| L-SMASH-Works VapourSynth plugin, for the `lsmash` chunk method | built from source into `~/.local/lib/vapoursynth` | built from source into Homebrew's plugin folder |
 | Av1an | `cargo install` | Homebrew |
 | grav1synth 0.2.0, patched | built from the crate with `scripts/grav1synth-0.2.0-grain-flag.patch` | the same |
 | mkvtoolnix, Python 3.11+ | apt | Homebrew |
@@ -221,7 +222,21 @@ The encode therefore runs with `<work_dir>/bin/ffmpeg` first on Av1an's PATH: a
 few lines of shell that add `-fps_mode passthrough` to y4m pipes and hand
 everything else to the real ffmpeg unchanged. The `Failed to read y4m frame
 delimeter` line printed alongside is not an error; it is SVT-AV1 reaching the end
-of its input while it is still encoding the frames it has read ahead.
+of its input while it is still encoding the frames it has read ahead. This only
+concerns the `hybrid` chunk method; with `lsmash` the frames come from `vspipe`.
+
+### Why chunks come from L-SMASH-Works
+
+To cut a film into chunks, Av1an needs frame-exact access to it. With `hybrid`,
+the only method that needs nothing but FFmpeg, it first lists every keyframe with
+`ffprobe -show_frames`, which decodes the whole video on a single core: 21 minutes
+for a 5-minute 4K excerpt, about ten hours for a 4K feature, before the first chunk
+starts. It then copies the video stream into split files. L-SMASH-Works indexes
+the same excerpt in 1.4 seconds and seeks to exact frames; the frames it hands
+over matched ffmpeg's own decode wherever they were checked. `chunk_method =
+"auto"` uses it when `doctor` shows the `lsmas` plugin, and `scripts/bootstrap.sh
+lsmash` builds it. The index goes into the work directory (Av1an's `--cache-mode
+temp`), never next to the source.
 
 ## Use
 

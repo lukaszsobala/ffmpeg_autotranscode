@@ -56,16 +56,20 @@ tune = 0            # 0 = VQ (subjective quality), 2 = SSIM. Use 0 for watching.
 variance_boost_curve = "auto" # "auto" uses SVT-AV1's PQ curve (2) for HDR10, else 0.
 keyint_sec = 10.0   # Keyframe interval in seconds.
 
-# "hybrid" is the right choice here. lsmash/ffms2/bestsource are more accurate but
-# each needs its own VapourSynth *plugin* (L-SMASH-Works, ffms2, BestSource).
-#
-# Note that the bootstrap script does install VapourSynth, so `doctor` will report
-# `vapoursynth yes` -- but only because Av1an refuses to link without it, not
-# because any source plugin is present. `doctor` cannot tell the difference, so if
-# you switch away from "hybrid", install the matching plugin yourself first.
-chunk_method = "hybrid"
+# How Av1an hands each chunk's frames to the encoder. "auto" takes "lsmash" when
+# the L-SMASH-Works VapourSynth plugin loads (`scripts/bootstrap.sh lsmash`), and
+# "hybrid" otherwise. lsmash indexes a film in seconds and seeks to exact frames;
+# its index goes to the work directory, never next to the source. hybrid needs
+# only FFmpeg, but first decodes the whole film on one core to find keyframes --
+# a 5-minute 4K excerpt took 21 minutes, a 4K feature about ten hours -- and
+# copies the video stream into split files. `doctor` lists the plugins that load.
+chunk_method = "auto"
 concat = "mkvmerge"          # mkvmerge avoids ffmpeg's occasional audio-seek breakage.
 sc_method = "standard"       # "fast" is cheaper but cuts scenes worse.
+# Scene detection on frames at most this tall; 0 for full size. A 4K excerpt gave
+# the same 43 cuts at 1080 as at full size, 20% sooner. Going lower saves little
+# at 4K, where decoding is the floor, and added cuts to a 1080p excerpt.
+sc_downscale_height = 1080
 extra_split_sec = 10
 min_scene_len = 24
 
