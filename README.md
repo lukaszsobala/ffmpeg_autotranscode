@@ -155,7 +155,7 @@ What it installs, and from where:
 | SVT-AV1 4.2.0 | built from source into `~/.local` | built from source into `~/.local` |
 | VapourSynth (Av1an will not link without it) | built from source into `~/.local` | Homebrew |
 | Av1an | `cargo install` | Homebrew |
-| grav1synth | `cargo install` | `cargo install` |
+| grav1synth 0.2.0, patched | built from the crate with `scripts/grav1synth-0.2.0-grain-flag.patch` | the same |
 | mkvtoolnix, Python 3.11+ | apt | Homebrew |
 
 SVT-AV1 is pinned rather than taken from a package manager. Distributions lag far
@@ -168,6 +168,13 @@ excerpts at the same settings, 4.2.0 came out 2% smaller and 0.2 dB lower
 rather than quietly encoding without it. On macOS, Homebrew's ffmpeg brings its
 own SVT-AV1 onto `PATH`; the script says so, and `paths.svtav1encapp` should then
 name the pinned build.
+
+grav1synth is patched because 0.2.0, the latest release, writes a broken
+sequence header whenever the header's last field ends a byte. With the usual
+flags that is any width from 513 to 1024 at a height from 257 to 512 -- 640x480,
+NTSC DVD, 854x480 -- and every such file failed at the grain step with "Error
+when reformatting data of a packet". A grav1synth from plain `cargo install`
+still works for everything else.
 
 On another Linux distribution, install the build tools, mkvtoolnix and Python
 3.11+ yourself; the other stages do not use a package manager. Then:

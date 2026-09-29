@@ -33,7 +33,10 @@ ZIMG_VERSION="${ZIMG_VERSION:-release-3.0.6}"
 # that code, and since nothing here ever calls VapourSynth, newer buys us nothing.
 # (macOS takes Homebrew's VapourSynth instead, which builds there.)
 VAPOURSYNTH_VERSION="${VAPOURSYNTH_VERSION:-R72}"
+# Built from the crate with a local patch; see stage_grav1synth.
+GRAV1SYNTH_VERSION="${GRAV1SYNTH_VERSION:-0.2.0}"
 PREFIX="${PREFIX:-$HOME/.local}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$HOME/.cache/autotranscode-build}"
 
 log()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -275,9 +278,19 @@ stage_av1an() {
 }
 
 stage_grav1synth() {
-  log "Installing grav1synth (source-accurate film grain tables)"
+  log "Building grav1synth ${GRAV1SYNTH_VERSION} (source-accurate film grain tables), patched"
   ensure_cargo
-  cargo install grav1synth --locked
+  # Patched, so not `cargo install grav1synth`: 0.2.0 (the latest release, and main
+  # as of 2026-09) corrupts the sequence header when its last field ends a byte,
+  # which with the usual flags means widths 513-1024 at heights 257-512 -- 640x480,
+  # NTSC DVD, 854x480 -- and every such file fails at the grain step. See the patch.
+  local src="$BUILD_DIR/grav1synth-${GRAV1SYNTH_VERSION}"
+  mkdir -p "$BUILD_DIR"
+  rm -rf "$src"
+  curl -fsSL "https://static.crates.io/crates/grav1synth/grav1synth-${GRAV1SYNTH_VERSION}.crate" \
+    | tar -xz -C "$BUILD_DIR"
+  patch -d "$src" -p1 < "$SCRIPT_DIR/grav1synth-${GRAV1SYNTH_VERSION}-grain-flag.patch"
+  cargo install --path "$src" --locked --force
   grav1synth --help >/dev/null 2>&1 || warn "grav1synth installed but --help failed"
 }
 

@@ -1,0 +1,49 @@
+--- a/src/parser/sequence.rs
++++ b/src/parser/sequence.rs
+@@ -151,6 +151,7 @@
+         } else {
+             Vec::new()
+         };
++        let input_len = input.len();
+         bits(move |input| {
+             let (input, seq_profile): (_, u8) = bit_parsers::take(3usize)(input)?;
+             let (input, _still_picture) = take_bool_bit(input)?;
+@@ -344,11 +345,11 @@
+             if WRITE {
+                 // Toggle the film grain params present flag
+                 // based on whether we are adding or removing film grain.
++                // The flag is not always in the last byte: when it ends a byte, the
++                // trailing bits (0x80) take a byte of their own after it.
+                 let bit_offset = input.1;
+-                obu_out
+-                    .last_mut()
+-                    .unwrap()
+-                    .set_bit(7 - bit_offset, self.incoming_grain_header.is_some());
++                let byte_index = input_len - input.0.len();
++                obu_out[byte_index].set_bit(7 - bit_offset, self.incoming_grain_header.is_some());
+                 self.packet_out.extend_from_slice(&obu_out);
+                 debug!(
+                     "Writing updated sequence header of size {} to packet_out, total packet size \
+--- a/src/parser/obu.rs
++++ b/src/parser/obu.rs
+@@ -93,6 +93,11 @@
+                     pre_len - input.len()
+                 );
+                 if obu_header.has_size_field {
++                    // Skip the trailing bits before measuring: the header was written out
++                    // whole, trailing bits included, but the parser stops at the last
++                    // field, a byte short when the trailing bits fill a byte of their own.
++                    let adjustment = obu_size - (pre_len - input.len());
++                    input = &input[adjustment..];
+                     if WRITE {
+                         let bytes_written = self.packet_out.len() - packet_start_len;
+                         let bytes_taken = pre_input.len() - input.len();
+@@ -105,8 +110,6 @@
+                             );
+                         }
+                     }
+-                    let adjustment = obu_size - (pre_len - input.len());
+-                    input = &input[adjustment..];
+                 }
+ 
+                 Ok((input, Some(Obu::SequenceHeader(header))))
