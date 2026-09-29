@@ -12,3 +12,6 @@ state.json
 
 # Local handoff notes, transferred out of band
 HANDOFF-RK3588.md
+
+# Docker: the paths of this machine, see .env.example
+.env

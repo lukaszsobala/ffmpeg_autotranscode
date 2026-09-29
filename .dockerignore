@@ -1,0 +1,6 @@
+# The image needs the package and two build scripts; nothing else goes to the builder.
+*
+!autotranscode/
+!scripts/bootstrap.sh
+!scripts/grav1synth-0.2.0-grain-flag.patch
+**/__pycache__

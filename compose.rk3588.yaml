@@ -1,0 +1,25 @@
+# Additions for an RK3588 board, on top of compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.rk3588.yaml run --rm autotranscode doctor
+#
+# `doctor` should then report rkmpp decoders and the rk3588 profile.
+
+services:
+  autotranscode:
+    # The video engine, for `verify`'s H.264 decoding (see "Why there is no
+    # hardware acceleration" in the README). Without these autotranscode decodes in
+    # software, which is correct, only slower to score.
+    devices:
+      - /dev/mpp_service
+      - /dev/rga
+      - /dev/dma_heap
+      - /dev/dri
+    # The device nodes belong to these groups; the numbers are the host's
+    # (`getent group video render`), which is what the kernel checks.
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-991}"
+    volumes:
+      # Docker hides the device tree that names the SoC, so without this
+      # machine.profile = "auto" would pick generic instead of rk3588.
+      - /proc/device-tree:/run/host/device-tree:ro

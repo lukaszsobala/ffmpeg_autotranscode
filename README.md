@@ -238,6 +238,96 @@ over matched ffmpeg's own decode wherever they were checked. `chunk_method =
 lsmash` builds it. The index goes into the work directory (Av1an's `--cache-mode
 temp`), never next to the source.
 
+## Docker
+
+The image holds everything above, built by the same `bootstrap.sh` stages, so it
+has the same pinned SVT-AV1, the patched grav1synth, VapourSynth with
+L-SMASH-Works, and jellyfin-ffmpeg. It is the easy way onto a Mac, and an
+alternative to a native install on Linux.
+
+| Host | Image | Notes |
+|---|---|---|
+| RK3588 and other arm64 Linux | arm64 | Built and tested on an RK3588. Add `compose.rk3588.yaml` on those boards. |
+| Apple silicon Mac | arm64 | Docker runs containers in an arm64 Linux VM; see below. Intel Macs are not a target. |
+| x86-64 Linux | amd64 | The Dockerfile has nothing arm-specific, but this build is untested. |
+
+Set up once:
+
+```bash
+cp .env.example .env           # fill in CONFIG_DIR, DATA_DIR, LIBRARY, TZ (and UID/GID on Linux)
+cp config.example.toml "$CONFIG_DIR/autotranscode.toml"   # then edit, with container paths
+docker compose build           # compiles the tools: expect tens of minutes
+docker compose run --rm autotranscode doctor
+```
+
+The container sees three folders:
+
+| Inside | From `.env` | Holds |
+|---|---|---|
+| `/config` | `CONFIG_DIR` | `autotranscode.toml` |
+| `/data` | `DATA_DIR` | the container's home: work dir, state file, staging, logs, samples |
+| the library's own path | `LIBRARY` | your films, at the same path as on the host |
+
+The config is read inside the container, so its paths are container paths. Leave
+the tool entries in `[paths]` (ffmpeg, SvtAv1EncApp and so on) unset: the image
+has them on `PATH`. Put `work_dir`, `state_file` and the staging directory under
+`/data`, or leave them out: `~` is `/data` inside, so the defaults land in
+`/data/.cache/autotranscode`. Library paths stay as they are. An output
+directory outside the library needs a mount of its own; add it in a
+`compose.override.yaml`, which Compose reads automatically.
+
+Then use it as the native command:
+
+```bash
+docker compose run --rm autotranscode sample --minutes 5 -n 1 --out /data/samples "$LIBRARY"
+docker compose run --rm -d --name transcode autotranscode run --log-file /data/logs/run.log "$LIBRARY"
+docker logs -f transcode
+docker stop transcode          # SIGTERM: a checkpoint, as Ctrl-C is natively
+```
+
+`docker stop` gives the run two minutes to wind down (`stop_grace_period`).
+autotranscode turns the signal into a checkpoint, so a rerun resumes it; see
+[Stopping and resuming](#stopping-and-resuming).
+
+### On a Mac
+
+Install Docker Desktop, or OrbStack or Colima. Containers need a Linux kernel,
+so all of them run a Linux VM, arm64 on Apple silicon. Three things follow:
+
+- **CPU speed is close to native Linux.** The encoder runs arm64 code with the
+  same NEON kernels. macOS's split into performance and efficiency cores is hidden
+  from the VM, so the big-core pinning that `verify` does on an RK3588 does not
+  happen, and does not need to.
+- **The VM gets what you give it.** Set CPUs and memory in the Docker app's
+  settings. A 4K encode runs several SVT-AV1 workers at once, each with its own
+  memory. Av1an sizes its workers from what the VM reports; `machine.workers`
+  overrides it.
+- **The Mac's media engine is out of reach.** The VM cannot use VideoToolbox or
+  the GPU. Nothing here needs them: the encode is CPU-only, and `verify` decodes
+  AV1 in software on purpose (see [Why there is no hardware
+  acceleration](#why-there-is-no-hardware-acceleration)).
+
+Folders on the Mac reach the VM through Docker's file sharing, which is slower
+than the VM's own disk. Staging, which is on by default, reads each film from the
+library once and works from a copy under `/data`. Keep `DATA_DIR` on the internal
+SSD. A library on an external drive under `/Volumes` is shared by default in
+Docker Desktop.
+
+### On an RK3588
+
+```bash
+docker compose -f compose.yaml -f compose.rk3588.yaml run --rm autotranscode doctor
+```
+
+The extra file passes the video engine through, for `verify`'s H.264 decoding.
+It also mounts the device tree, which Docker otherwise hides, so that
+`machine.profile = "auto"` finds `rk3588`. `doctor` shows both: `profile rk3588`,
+and the `rkmpp` decoders. Without that file the container still works: `verify`
+then decodes in software, and the profile must be set by hand.
+
+A container on Linux is an ordinary process with its own view of the system,
+not a VM, so encoding in it should run at native speed.
+
 ## Use
 
 ```bash
