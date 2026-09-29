@@ -11,6 +11,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -223,6 +224,75 @@ def run_watched(
     if returncode != 0:
         raise CommandError(argv, returncode, "")
     return None
+
+
+def run_progress(
+    argv: list[str],
+    label: str,
+    *,
+    frames: int | None = None,
+    every: float = 60.0,
+    extra_path: Sequence[str] = (),
+) -> float:
+    """Run an ffmpeg pass that writes nothing to the terminal, saying what it is,
+    how far it has got every `every` seconds, and how long it took. Returns the
+    seconds taken; raises CommandError like run().
+
+    `argv` must ask for machine-readable progress on stdout (PROGRESS_ARGS). Its
+    frame count is the output's: `frames` is how many that will be, for a share
+    done and a time left. 0 when unknown shows the count alone; None hides it,
+    for passes whose output is a handful of selected frames.
+    """
+    log.debug("exec: %s", shlex.join(argv))
+    log.info("  %s...", label)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, errors="replace",
+                            env=child_env(extra_path))
+    assert proc.stdout is not None and proc.stderr is not None
+    stderr: list[str] = []
+    drain = threading.Thread(target=lambda: stderr.append(proc.stderr.read()), daemon=True)
+    drain.start()
+    started = last = time.monotonic()
+    done = 0
+    try:
+        with proc.stdout:
+            for line in proc.stdout:
+                key, _, value = line.strip().partition("=")
+                if key == "frame" and value.isdigit():
+                    done = int(value)
+                elif value == "continue" and time.monotonic() - last >= every:
+                    last = time.monotonic()
+                    log.info("  %s: %s", label, _progress(done, frames, last - started))
+        returncode = proc.wait()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        drain.join()
+        proc.stderr.close()
+    elapsed = time.monotonic() - started
+    if returncode != 0:
+        raise CommandError(argv, returncode, "".join(stderr))
+    log.info("  %s: done in %s", label, human_duration(elapsed))
+    return elapsed
+
+
+# ffmpeg options for run_progress: key=value blocks on stdout every 5 seconds.
+PROGRESS_ARGS = ("-progress", "pipe:1", "-stats_period", "5")
+
+
+def _progress(done: int, total: int | None, elapsed: float) -> str:
+    so_far = f"{human_duration(elapsed)} so far"
+    if total is None:
+        return f"still running, {so_far}"
+    if not total:
+        return f"{done:,} frames, {so_far}"
+    share = min(done / total, 1.0)
+    text = f"{done:,} of {total:,} frames ({share:.0%}), {so_far}"
+    if 0 < share < 1:
+        text += f", about {human_duration(elapsed / share - elapsed)} left"
+    return text
 
 
 def _stop_group(proc: subprocess.Popen[bytes], grace: float = 10.0) -> None:

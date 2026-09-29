@@ -284,7 +284,8 @@ def _score(result: Result, chain: Toolchain, excerpt: Path, encoded: Path, direc
     """Scores and snapshots. A failure here leaves the encode standing: it is noted,
     and a rerun measures again without encoding again."""
     try:
-        comparison = verify.compare(chain, excerpt, encoded, work / f"verify-{result.id}")
+        comparison = verify.compare(chain, excerpt, encoded, work / f"verify-{result.id}",
+                                    frames=result.frames)
         if comparison.lowpass:
             result.lowpass_mean = comparison.lowpass_mean
             result.lowpass_p5 = comparison.lowpass_p5

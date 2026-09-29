@@ -196,7 +196,7 @@ def cmd_verify(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolch
         info = probe.probe(args.reference, chain)
         work = cfg.work_dir / "verify"
         result = verify.compare(chain, args.reference, args.encoded, work,
-                                grain=not args.no_grain)
+                                grain=not args.no_grain, frames=info.frames)
     except (CommandError, OSError, ValueError) as exc:
         log.error("cannot verify: %s", str(exc)[:300])
         return 1

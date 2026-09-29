@@ -1182,15 +1182,15 @@ class TestXpsnrAlignment(unittest.TestCase):
     def test_both_inputs_are_renumbered_so_frames_pair_by_index(self):
         seen: list[list[str]] = []
 
-        def fake_run(argv, **_kwargs):
+        def fake_run(argv, _label, **_kwargs):
             seen.append(argv)
             Path(argv[argv.index("-lavfi") + 1].split("stats_file=")[1]).write_text(
                 "n:    1  XPSNR y: 40.0000  XPSNR u: 45.0  XPSNR v: 46.0\n")
-            return util.Completed(argv, 0, "", "", 0.0)
+            return 0.0
 
-        original = verify.run
-        verify.run = fake_run
-        self.addCleanup(setattr, verify, "run", original)
+        original = verify.run_progress
+        verify.run_progress = fake_run
+        self.addCleanup(setattr, verify, "run_progress", original)
         with tempfile.TemporaryDirectory() as tmp:
             scores = verify.xpsnr(make_chain(), Path("/src.mkv"), Path("/enc.mkv"),
                                   Path(tmp) / "x.log")
@@ -1727,6 +1727,41 @@ class TestWatchedCommand(unittest.TestCase):
         self.assertIsNone(util.run_watched(["true"], lambda: "never asked", every=5))
         with self.assertRaises(CommandError):
             util.run_watched(["false"], lambda: None, every=5)
+
+
+class TestMeasurementProgress(unittest.TestCase):
+    """A long measurement pass says what it is doing and how far it has got."""
+
+    def test_progress_text(self):
+        self.assertEqual(util._progress(250, 1000, 60),
+                         "250 of 1,000 frames (25%), 1m00s so far, about 3m00s left")
+        self.assertEqual(util._progress(0, 1000, 5), "0 of 1,000 frames (0%), 5s so far")
+        self.assertEqual(util._progress(1200, 1000, 90), "1,200 of 1,000 frames (100%), 1m30s so far")
+        self.assertEqual(util._progress(1200, 0, 90), "1,200 frames, 1m30s so far")
+        self.assertEqual(util._progress(3, None, 90), "still running, 1m30s so far")
+
+    def test_reports_frames_read_from_ffmpeg_progress_blocks(self):
+        script = ("printf 'frame=10\\nprogress=continue\\n'; sleep 0.2; "
+                  "printf 'frame=40\\nprogress=continue\\n'; sleep 0.2; "
+                  "printf 'frame=80\\nprogress=end\\n'; echo oops >&2")
+        with self.assertLogs("autotranscode", "INFO") as logs:
+            util.run_progress(["sh", "-c", script], "measuring", frames=80, every=0.1)
+        text = "\n".join(logs.output)
+        self.assertIn("measuring...", text)
+        self.assertIn("40 of 80 frames (50%)", text)
+        self.assertIn("measuring: done in", text)
+        self.assertNotIn("80 of 80", text, "the final block is the done line's job")
+
+    def test_failure_carries_stderr(self):
+        with self.assertRaises(CommandError) as caught, self.assertLogs("autotranscode", "INFO"):
+            util.run_progress(["sh", "-c", "echo broken >&2; exit 3"], "measuring")
+        self.assertEqual(caught.exception.returncode, 3)
+        self.assertIn("broken", caught.exception.stderr)
+
+    def test_every_pass_asks_ffmpeg_for_progress(self):
+        argv = verify.measure_argv(make_chain())
+        self.assertIn("-progress", argv)
+        self.assertIn("-nostats", argv)
 
 
 def _alive(pid: int) -> bool:

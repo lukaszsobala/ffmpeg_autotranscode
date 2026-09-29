@@ -56,7 +56,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .tools import Toolchain
-from .util import CommandError, log, run
+from .util import PROGRESS_ARGS, CommandError, log, run, run_progress
 
 # Separates grain from structure for the retention measure; see the docstring.
 GRAIN_FILTER = "median=radius=1"
@@ -218,6 +218,12 @@ def ffmpeg_argv(chain: Toolchain) -> list[str]:
     return ["taskset", "-c", chain.big_cores, chain.ffmpeg, "-filter_complex_threads", threads]
 
 
+def measure_argv(chain: Toolchain) -> list[str]:
+    """ffmpeg_argv, quiet but for errors, reporting progress for run_progress."""
+    return [*ffmpeg_argv(chain), "-hide_banner", "-nostats", "-v", "error", "-y",
+            *PROGRESS_ARGS]
+
+
 @functools.cache
 def _video_codec(ffprobe: str, path: Path) -> str:
     try:
@@ -248,7 +254,8 @@ def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
     return ["-c:v", decoder, "-deint", "0"]
 
 
-def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path) -> list[float]:
+def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path,
+          frames: int = 0) -> list[float]:
     """Per-frame luma XPSNR of `distorted` against `reference`.
 
     Synthesised film grain is not applied to `distorted` (see module docstring):
@@ -264,7 +271,7 @@ def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path) -> li
     output is frame-exact; `ALIGN` renumbers both inputs 0, 1, 2...
     """
     argv = [
-        *ffmpeg_argv(chain), "-hide_banner", "-nostats", "-v", "error", "-y",
+        *measure_argv(chain),
         *decode_args(chain, reference, grain=True), "-i", str(reference),
         *decode_args(chain, distorted, grain=False),
         "-export_side_data", "film_grain", "-i", str(distorted),
@@ -274,11 +281,12 @@ def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path) -> li
         f"[ref][dist]xpsnr=stats_file={stats.as_posix()}",
         "-f", "null", "-",
     ]
-    run(argv)
+    run_progress(argv, "measuring XPSNR", frames=frames)
     return parse_xpsnr_log(stats.read_text(encoding="utf-8", errors="replace"))
 
 
-def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path) -> list[float]:
+def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path,
+                 frames: int = 0) -> list[float]:
     """Per-frame luma PSNR of both files after a slight blur, at 10-bit.
 
     Separates the two ways a grainy film gets damaged. An encoder that strips
@@ -296,7 +304,7 @@ def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path
     8-bit code value, and paired by index for the reason given in xpsnr().
     """
     argv = [
-        *ffmpeg_argv(chain), "-hide_banner", "-nostats", "-v", "error", "-y",
+        *measure_argv(chain),
         *decode_args(chain, reference, grain=True), "-i", str(reference),
         *decode_args(chain, distorted, grain=False),
         "-export_side_data", "film_grain", "-i", str(distorted),
@@ -306,21 +314,22 @@ def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path
         f"[ref][dist]psnr=stats_file={stats.as_posix()}",
         "-f", "null", "-",
     ]
-    run(argv)
+    run_progress(argv, "measuring low-pass PSNR", frames=frames)
     return parse_psnr_log(stats.read_text(encoding="utf-8", errors="replace"))
 
 
-def noise_mse(chain: Toolchain, path: Path, stats: Path) -> list[float]:
+def noise_mse(chain: Toolchain, path: Path, stats: Path, label: str = "measuring grain",
+              frames: int = 0) -> list[float]:
     """Per-frame luma MSE between `path` and its median-filtered self: its grain."""
     argv = [
-        *ffmpeg_argv(chain), "-hide_banner", "-nostats", "-v", "error", "-y",
+        *measure_argv(chain),
         *decode_args(chain, path, grain=True), "-i", str(path),
         "-an", "-sn", "-dn",
         "-filter_complex",
         f"{GRAIN_GRAPH}psnr=stats_file={stats.as_posix()}",
         "-f", "null", "-",
     ]
-    run(argv)
+    run_progress(argv, label, frames=frames)
     return parse_mse_log(stats.read_text(encoding="utf-8", errors="replace"))
 
 
@@ -341,15 +350,17 @@ def retention_by_frame(source: list[float], encoded: list[float]) -> list[float]
 
 
 def grain_retention(
-    chain: Toolchain, reference: Path, distorted: Path, work: Path,
+    chain: Toolchain, reference: Path, distorted: Path, work: Path, frames: int = 0,
 ) -> tuple[float, list[float]]:
     """Grain amplitude kept by `distorted`, overall and per frame.
 
     Pixel-scale detail (hair, fabric weave) counts too; losing that is a loss
     the eye sees as well.
     """
-    source = noise_mse(chain, reference, work / "noise_reference.log")
-    encoded = noise_mse(chain, distorted, work / "noise_distorted.log")
+    source = noise_mse(chain, reference, work / "noise_reference.log",
+                       "measuring grain in the source", frames)
+    encoded = noise_mse(chain, distorted, work / "noise_distorted.log",
+                        "measuring grain in the encode", frames)
     return retention(source, encoded), retention_by_frame(source, encoded)
 
 
@@ -369,13 +380,13 @@ def snapshots(
     chosen = "+".join(f"eq(n\\,{frame})" for frame in sorted(frames))
     view = PQ_TO_SDR if pq else "format=rgb24"
     pattern = out_dir / f".{label}_%03d.png"
-    run([
-        *ffmpeg_argv(chain), "-hide_banner", "-nostats", "-v", "error", "-y",
+    run_progress([
+        *measure_argv(chain),
         "-i", str(path),
         "-vf", f"select='{chosen}',{view}",
         "-fps_mode", "passthrough",
         str(pattern),
-    ])
+    ], f"writing snapshots of the {label}")
     written: list[Path] = []
     for position, frame in enumerate(sorted(frames), start=1):
         produced = out_dir / f".{label}_{position:03d}.png"
@@ -388,16 +399,18 @@ def snapshots(
 
 def compare(
     chain: Toolchain, reference: Path, distorted: Path, work: Path,
-    *, grain: bool = True, worst: int = 3,
+    *, grain: bool = True, worst: int = 3, frames: int = 0,
 ) -> Comparison:
-    """Everything above, for one pair of files."""
+    """Everything above, for one pair of files. `frames`, the expected count, only
+    lets the first pass report a share done; later ones know it from the first."""
     work.mkdir(parents=True, exist_ok=True)
-    scores = xpsnr(chain, reference, distorted, work / "xpsnr.log")
+    scores = xpsnr(chain, reference, distorted, work / "xpsnr.log", frames)
     if not scores:
         raise CommandError(["xpsnr"], 1, "XPSNR produced no scores")
     result = Comparison(frames=len(scores), xpsnr=scores)
     try:
-        result.lowpass = lowpass_psnr(chain, reference, distorted, work / "lowpass.log")
+        result.lowpass = lowpass_psnr(chain, reference, distorted, work / "lowpass.log",
+                                      result.frames)
     except CommandError as exc:
         log.warning("low-pass PSNR not measured: %s", exc.stderr.strip()[:200])
     # Worst frames by the structural measure when there is one: XPSNR is blind to
@@ -407,7 +420,7 @@ def compare(
     if grain:
         try:
             result.grain_retention, result.grain_by_frame = grain_retention(
-                chain, reference, distorted, work)
+                chain, reference, distorted, work, result.frames)
         except CommandError as exc:
             log.warning("grain retention not measured: %s", exc.stderr.strip()[:200])
     return result
