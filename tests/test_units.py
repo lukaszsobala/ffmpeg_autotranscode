@@ -258,6 +258,46 @@ class TestSkipRules(unittest.TestCase):
             Path("/library/Film (1975).av1.mkv"),
         )
 
+    def test_an_output_directory_mirrors_the_library_folders(self):
+        # Two shows with an S01E01.mkv each must not share one output name.
+        self.cfg.output.directory = "/out"
+        roots = [Path("/library")]
+        a = make_info(path=Path("/library/Show A/Season 1/S01E01.mkv"))
+        b = make_info(path=Path("/library/Show B/Season 1/S01E01.mkv"))
+        self.assertEqual(pipeline.output_path(a, self.cfg, roots),
+                         Path("/out/Show A/Season 1/S01E01.av1.mkv"))
+        self.assertEqual(pipeline.output_path(b, self.cfg, roots),
+                         Path("/out/Show B/Season 1/S01E01.av1.mkv"))
+
+    def test_a_film_lands_in_the_same_place_from_a_nested_root(self):
+        self.cfg.output.directory = "/out"
+        info = make_info(path=Path("/library/Films/Film (1975)/Film (1975).mkv"))
+        whole = pipeline.output_path(info, self.cfg, [Path("/library")])
+        both = pipeline.output_path(info, self.cfg, [Path("/library/Films"), Path("/library")])
+        self.assertEqual(whole, Path("/out/Films/Film (1975)/Film (1975).av1.mkv"))
+        self.assertEqual(both, whole)
+
+    def test_a_file_outside_every_root_goes_to_the_top(self):
+        self.cfg.output.directory = "/out"
+        info = make_info(path=Path("/elsewhere/Film (1975).mkv"))
+        self.assertEqual(pipeline.output_path(info, self.cfg, [Path("/library")]),
+                         Path("/out/Film (1975).av1.mkv"))
+
+    def test_only_directories_among_the_inputs_are_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "library"
+            folder.mkdir()
+            film = Path(tmp) / "film.mkv"
+            film.write_bytes(b"x")
+            self.assertEqual(pipeline.library_roots([folder, film]), [folder])
+
+    def test_an_unused_name_counts_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            taken = Path(tmp) / "Film.av1.mkv"
+            self.assertEqual(pipeline.unused_name(taken).name, "Film.av1.new.mkv")
+            (Path(tmp) / "Film.av1.new.mkv").write_bytes(b"x")
+            self.assertEqual(pipeline.unused_name(taken).name, "Film.av1.new2.mkv")
+
 
 class TestAudioPolicy(unittest.TestCase):
     def audio_args(self, codecs_channels, mode="smart", layout="", max_channels=0):
@@ -730,6 +770,52 @@ class TestStopAndResume(unittest.TestCase):
         self.assertNotEqual(seen[0], destination, "the mux must not write the final name")
         self.assertTrue(destination.is_file())
         self.assertFalse(seen[0].exists(), "the temporary must be renamed away, not copied")
+
+    def _output_appears_during_the_encode(self) -> tuple[Path, Path]:
+        """Run process_one while a file takes the output's name mid-encode."""
+        self._stub_probe()
+        self.cfg.output.directory = str(self.root / "out")
+        final = pipeline.output_path(self._info(), self.cfg)
+        work = pipeline._work_dir(self.source, self.cfg)
+
+        def encoded(*_args, **_kwargs):
+            (work / "encoded.mkv").write_bytes(b"e" * 4096)
+            final.write_bytes(b"theirs")
+
+        def fake_mux(video, info, out, chain, cfg, dry_run=False):
+            Path(out).write_bytes(b"ours")
+            return out
+
+        self._stub_encode(encoded)
+        original_mux = pipeline.mux.mux
+        pipeline.mux.mux = fake_mux
+        self.addCleanup(setattr, pipeline.mux, "mux", original_mux)
+        return final, final.with_name("Film (1975).av1.new.mkv")
+
+    def test_an_output_that_appears_during_the_encode_is_not_overwritten(self):
+        for staging in (True, False):
+            with self.subTest(staging=staging):
+                self.cfg.staging.enabled = staging
+                final, kept = self._output_appears_during_the_encode()
+                with self.assertRaisesRegex(pipeline.OutputExists, "new.mkv"):
+                    pipeline.process_one(self.source, make_chain(), self.cfg)
+                self.assertEqual(final.read_bytes(), b"theirs")
+                self.assertEqual(kept.read_bytes(), b"ours", "hours of encoding must not be lost")
+                self.assertEqual(list(self.cfg.staging_dir.glob("*")), [],
+                                 "the staged copy has served its purpose")
+                final.unlink()
+                kept.unlink()
+
+    def test_an_output_that_appears_during_the_encode_is_a_failure(self):
+        # A failure shows in the run's summary and exit code, where a skip would not.
+        self.cfg.staging.enabled = False
+        self._output_appears_during_the_encode()
+        ledger = Ledger(self.root / "state.json")
+        failures = pipeline._process_all(
+            [self.source], make_chain(), self.cfg, ledger, pipeline.StopRequest()
+        )
+        self.assertEqual(failures, 1)
+        self.assertEqual(present(ledger.get(self.source)).status, "failed")
 
     def test_a_partial_output_does_not_look_like_a_finished_one(self):
         # The .part name is what keeps the next run from skipping the title.

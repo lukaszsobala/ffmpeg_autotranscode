@@ -14,12 +14,13 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import hashlib
+import itertools
 import json
 import os
 import shutil
 import signal
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -33,6 +34,11 @@ from .util import CommandError, human_duration, human_size, log
 
 class SkipFile(Exception):
     """This file should not be transcoded; the message says why."""
+
+
+class OutputExists(Exception):
+    """A file took the output's name while the encode ran. The encode is kept
+    beside it under another name rather than written over it."""
 
 
 class NoSaving(SkipFile):
@@ -135,12 +141,39 @@ def discover(inputs: list[Path], cfg: Config) -> list[Path]:
     return unique
 
 
-def output_path(info: MediaInfo, cfg: Config) -> Path:
-    directory = (
-        Path(cfg.output.directory).expanduser() if cfg.output.directory else info.path.parent
-    )
+def library_roots(inputs: list[Path]) -> list[Path]:
+    """The directories among the inputs, which an output directory mirrors."""
+    return [entry.expanduser().absolute() for entry in inputs if entry.expanduser().is_dir()]
+
+
+def output_path(info: MediaInfo, cfg: Config, roots: Sequence[Path] = ()) -> Path:
+    """Where the encode goes: next to the source, or in output.directory.
+
+    An output directory mirrors the folders below the library directory the source
+    was found in, so two films that share a file name in different folders do not
+    share an output. Of nested roots the outermost counts, so running on a whole
+    library and on one of its folders puts a film in the same place. A file given
+    on its own, or through a .txt list, goes to the top of the output directory.
+    """
     name = f"{info.path.stem}{cfg.output.suffix}.{cfg.output.container}"
+    if not cfg.output.directory:
+        return info.path.parent / name
+    directory = Path(cfg.output.directory).expanduser()
+    source = info.path.expanduser().absolute()
+    containing = [root for root in roots if source.is_relative_to(root)]
+    if containing:
+        outermost = min(containing, key=lambda root: len(root.parts))
+        directory /= source.parent.relative_to(outermost)
     return directory / name
+
+
+def unused_name(path: Path) -> Path:
+    """`path` with ".new", ".new2", ... before its suffix: the first that is free."""
+    for n in itertools.count(1):
+        candidate = path.with_name(f"{path.stem}.new{n if n > 1 else ''}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise AssertionError("unreachable")
 
 
 def check_skip(info: MediaInfo, output: Path, cfg: Config) -> None:
@@ -317,7 +350,8 @@ def stage_source(info: MediaInfo, cfg: Config) -> Path | None:
 
 
 def process_one(
-    source: Path, chain: Toolchain, cfg: Config, *, dry_run: bool = False
+    source: Path, chain: Toolchain, cfg: Config, *, dry_run: bool = False,
+    roots: Sequence[Path] = (),
 ) -> Record:
     started = time.monotonic()
     info = probe(source, chain)
@@ -326,7 +360,7 @@ def process_one(
     log.info("  %.3f bits/pixel, encoding at crf %d",
              info.bits_per_pixel, encode.effective_crf(info, cfg))
 
-    final = output_path(info, cfg)
+    final = output_path(info, cfg, roots)
     check_skip(info, final, cfg)
     final.parent.mkdir(parents=True, exist_ok=True)
 
@@ -350,8 +384,9 @@ def process_one(
             source, info, read, final, staged_out, work, chain, cfg, started,
             dry_run=dry_run,
         )
-    except SkipFile:
-        # A decided skip is a finished outcome, so the copy has served its purpose.
+    except (SkipFile, OutputExists):
+        # A decided skip is a finished outcome, and so is an encode kept under
+        # another name; either way the copy has served its purpose.
         _drop_staged(staged, staged_out, cfg)
         raise
     except BaseException:
@@ -476,6 +511,13 @@ def _transcode(
             settings_key(cfg, chain),
         )
 
+    # Checked again now, not only before the encode: hours have passed, and another
+    # run or a copy by hand may have put a file under this name since.
+    # Neither file is thrown away: the encode goes beside it, and the file is
+    # reported as failed so that someone decides which to keep.
+    wanted = final
+    if wanted.exists():
+        final = unused_name(wanted)
     if staged_out is not None:
         log.info("  writing %s to %s", human_size(output_bytes), final.parent)
         # shutil.move, not os.replace: staging is normally on a different
@@ -491,6 +533,13 @@ def _transcode(
         # Same directory, so this is an atomic rename: the destination name either
         # does not exist or is the complete file, never anything in between.
         os.replace(muxed, final)
+
+    if final != wanted:
+        _cleanup(work, cfg, table)
+        raise OutputExists(
+            f"{wanted.name} appeared during the encode, so this encode was kept as "
+            f"{final.name} beside it; keep one and delete the other"
+        )
 
     elapsed = time.monotonic() - started
     log.info(
@@ -527,10 +576,11 @@ def _cleanup(work: Path, cfg: Config, table: Path | None) -> None:
 
 
 def process_all(
-    sources: list[Path], chain: Toolchain, cfg: Config, ledger: Ledger, *, dry_run: bool = False
+    sources: list[Path], chain: Toolchain, cfg: Config, ledger: Ledger, *, dry_run: bool = False,
+    roots: Sequence[Path] = (),
 ) -> int:
     with stop_signals() as stop:
-        return _process_all(sources, chain, cfg, ledger, stop, dry_run=dry_run)
+        return _process_all(sources, chain, cfg, ledger, stop, dry_run=dry_run, roots=roots)
 
 
 def _process_all(
@@ -541,6 +591,7 @@ def _process_all(
     stop: StopRequest,
     *,
     dry_run: bool = False,
+    roots: Sequence[Path] = (),
 ) -> int:
     failures = 0
     total = len(sources)
@@ -558,7 +609,7 @@ def _process_all(
             continue
 
         try:
-            record = process_one(source, chain, cfg, dry_run=dry_run)
+            record = process_one(source, chain, cfg, dry_run=dry_run, roots=roots)
         except NoSaving as exc:
             log.info("  skipped: %s", exc)
             ledger.record(source, Record(source=str(source), status="skipped",
@@ -567,6 +618,11 @@ def _process_all(
         except SkipFile as exc:
             log.info("  skipped: %s", exc)
             ledger.record(source, Record(source=str(source), status="skipped", reason=str(exc)))
+            continue
+        except OutputExists as exc:
+            failures += 1
+            log.error("  %s", exc)
+            ledger.record(source, Record(source=str(source), status="failed", reason=str(exc)))
             continue
         except (CommandError, OSError, ValueError) as exc:
             # A tool killed by our own stop signal exits non-zero before Python

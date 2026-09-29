@@ -347,6 +347,12 @@ converts it to SDR with `tonemapx` instead of skipping it. Set
   ~0.15, a 1080p web release ~0.08, a good 4K AV1 encode ~0.01. A source whose
   bitrate cannot be read is never skipped on this rule.
 - `output.replace_source` deletes originals and is **off** by default.
+- **Overwriting an output.** A file whose output name is taken is skipped before
+  anything runs. A file that takes the name while the encode runs is left alone:
+  the encode is kept beside it as `<name>.new.mkv` and the source is reported as
+  failed, for you to keep one. With `output.directory` set, the output mirrors the
+  folders below the directory given to `run`, so films that share a file name in
+  different folders do not collide; files named one by one go to its top.
 
 ## Testing
 

@@ -223,6 +223,7 @@ def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain)
         log.error("no media files found")
         return 1
 
+    roots = pipeline.library_roots(inputs)
     work = cfg.work_dir / "estimate"
     results: list[estimate.Estimate] = []
     skipped = 0
@@ -232,7 +233,7 @@ def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain)
             info = probe.probe(source, chain)
             # The same rules `run` applies, so an estimate over a library does not
             # spend minutes sampling files that would never be transcoded.
-            pipeline.check_skip(info, pipeline.output_path(info, cfg), cfg)
+            pipeline.check_skip(info, pipeline.output_path(info, cfg, roots), cfg)
             result = estimate.estimate(info, chain, cfg, work)
         except pipeline.SkipFile as exc:
             log.info("  skip: %s", exc)
@@ -283,6 +284,7 @@ def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> 
     if not sources:
         log.error("no media files found")
         return 1
+    roots = pipeline.library_roots(inputs)
 
     for source in sources:
         print(f"\n=== {source}")
@@ -292,7 +294,7 @@ def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> 
             print(f"  cannot probe: {exc}")
             continue
         print(f"  {info.describe()}, {human_size(info.size_bytes)}")
-        out = pipeline.output_path(info, cfg)
+        out = pipeline.output_path(info, cfg, roots)
         try:
             pipeline.check_skip(info, out, cfg)
         except pipeline.SkipFile as exc:
@@ -394,7 +396,8 @@ def main(argv: list[str] | None = None) -> int:
 
     ledger = Ledger(cfg.state_path)
     try:
-        failures = pipeline.process_all(sources, chain, cfg, ledger, dry_run=args.dry_run)
+        failures = pipeline.process_all(sources, chain, cfg, ledger, dry_run=args.dry_run,
+                                        roots=pipeline.library_roots(args.inputs))
     except KeyboardInterrupt:
         return 130
     return 1 if failures else 0

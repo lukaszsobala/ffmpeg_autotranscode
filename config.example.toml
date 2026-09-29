@@ -256,7 +256,10 @@ mode = "copy"                # copy | none | text-only (drops PGS/VobSub bitmaps
 [output]
 suffix = ".av1"              # movie.mkv -> movie.av1.mkv
 container = "mkv"
-directory = ""               # empty writes next to the source
+# Empty writes next to the source. A directory mirrors the folders below the one
+# given to `run`, so that two films with the same file name do not collide; files
+# named one by one, or through a .txt list, go to its top.
+directory = ""
 # Percent, not a fraction: 10.0 means "must be at least 10% smaller than the
 # source". Below it the encode is deleted and the file recorded as skipped, on the
 # grounds that a marginal saving is not worth a re-encode generation. Set 0.0 to
