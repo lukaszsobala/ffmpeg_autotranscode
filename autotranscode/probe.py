@@ -280,7 +280,7 @@ def _stream(raw: dict) -> Stream:
         title=tags.get("title", ""),
         channels=_int(raw.get("channels")),
         channel_layout=raw.get("channel_layout", ""),
-        bitrate=_int(raw.get("bit_rate")),
+        bitrate=_int(raw.get("bit_rate")) or _tag_int(raw, "BPS"),
         default=bool(disposition.get("default")),
         forced=bool(disposition.get("forced")),
     )

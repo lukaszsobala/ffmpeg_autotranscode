@@ -425,7 +425,7 @@ than an emergency. Three independent layers:
 |---|---|
 | `Ctrl-C`, or `kill <pid>` | Stop and checkpoint. Exit code 130; nothing is written to the ledger, so a rerun picks the file up again. |
 | `Ctrl-C` twice | Give up on a tool that is slow to wind down. Chunks already finished are still kept. |
-| `kill -STOP -<pgid>` / `kill -CONT -<pgid>` | Freeze and thaw in place, losing nothing at all -- the encode keeps its memory and carries on mid-chunk. Use this for a pause measured in minutes. |
+| `kill -STOP -<pgid>` / `kill -CONT -<pgid>` | Freeze and thaw in place, losing nothing at all -- the encode keeps its memory and carries on mid-chunk. Use this for a pause measured in minutes. Av1an runs in a process group of its own, so take the pgid from `ps -o pgid= -C av1an`; under systemd, `systemctl --user kill --signal=STOP <unit>` does it for you. |
 | Power cut | Same as Ctrl-C, minus the chunk in flight, with one caveat below. |
 
 To resume, run the same command again. It must be the *same* command: the resume
@@ -578,10 +578,20 @@ its shape. Empty the CRF table to go back to one CRF for everything.
 - Files already in AV1, clips shorter than `library.min_duration_sec`, and any result
   that saves less than `output.min_saving_percent` (the output is deleted and the file
   is marked skipped).
+- **Encodes heading for too little saving.** Once `output.check_saving_after_percent`
+  of the frames are encoded (10 by default), the finished chunks are set against the
+  bytes the source spends on the same frames, and the encode stops as soon as the
+  projected result misses `min_saving_percent`. A grainy 4K web release at 25 Mbps
+  can come out twice its size at CRF 30; this finds that out a tenth of the way in
+  rather than days later. Progress lines in the log show where each file is heading.
+- **Files that did not save enough before**, while the settings that decide size
+  (the `encode`, `grain` and `audio` sections, `min_saving_percent`, the SVT-AV1
+  version) are unchanged. Trying again would spend the same hours on the same
+  result. Change any of them, `--crf` included, and the file gets another try.
 - **Sources already below `library.min_bits_per_pixel`** (bitrate / (width x height x
   fps)). These are close to what AV1 itself would spend, so an encode costs hours and
-  saves little — and `min_saving_percent` only finds that out afterwards, having spent
-  the time. The default of 0.03 is deliberately low, so it rejects the hopeless rather
+  saves little — and the saving check only finds that out once some of the time is
+  spent. The default of 0.03 is deliberately low, so it rejects the hopeless rather
   than the merely unattractive: a 4K HDR remux measures ~0.15, a 1080p web release
   ~0.08, a good 4K AV1 encode ~0.01. A source whose bitrate cannot be read is never
   skipped on this rule.

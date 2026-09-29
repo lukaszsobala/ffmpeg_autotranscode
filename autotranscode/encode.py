@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import os
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
 from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
-from .util import log, run
+from .util import log, run, run_watched
 
 # ITU-T H.273 code points, which is what AV1 signals and what SvtAv1EncApp expects.
 # ffprobe reports the names on the left.
@@ -273,16 +274,23 @@ def build_command(
     return argv
 
 
-def run_encode(argv: list[str], cfg: Config, chain: Toolchain, dry_run: bool = False) -> None:
+def run_encode(
+    argv: list[str], cfg: Config, chain: Toolchain, dry_run: bool = False,
+    check: Callable[[], str | None] | None = None,
+) -> str | None:
     """Run Av1an with its output streamed to the terminal rather than captured.
 
     These encodes run for hours; swallowing the progress bar would be unkind.
+    `check` is asked every minute whether to stop; the reason it gave is returned.
     """
     if cfg.machine.nice > 0:
         argv = ["nice", "-n", str(cfg.machine.nice), *argv]
-    shim_dir = [] if dry_run else [str(write_ffmpeg_shim(cfg.work_dir / "bin", chain.ffmpeg))]
     log.info("encoding (this is the long part)")
-    run(argv, capture=False, dry_run=dry_run, extra_path=[*shim_dir, *chain.bin_dirs])
+    if dry_run:
+        run(argv, dry_run=True)
+        return None
+    shim_dir = str(write_ffmpeg_shim(cfg.work_dir / "bin", chain.ffmpeg))
+    return run_watched(argv, check or (lambda: None), extra_path=[shim_dir, *chain.bin_dirs])
 
 
 # Av1an 0.5.2 (and master as of 2026-09) cuts each chunk out of a split segment

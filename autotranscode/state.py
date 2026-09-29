@@ -28,6 +28,8 @@ class Record:
     denoise: str = ""
     seconds: float = 0.0
     finished_at: str = ""
+    # For a file that did not save enough: pipeline.settings_key when it was tried.
+    settings: str = ""
 
     @property
     def saving_percent(self) -> float:
@@ -90,6 +92,11 @@ class Ledger:
     def already_done(self, source: Path) -> Record | None:
         record = self.get(source)
         return record if record and record.status == "done" else None
+
+    def no_saving(self, source: Path) -> Record | None:
+        """The record of an encode that came out too large, if that is the last word."""
+        record = self.get(source)
+        return record if record and record.status == "skipped" and record.settings else None
 
     def record(self, source: Path, record: Record) -> None:
         self.records[_key(source)] = record

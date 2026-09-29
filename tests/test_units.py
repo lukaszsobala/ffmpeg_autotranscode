@@ -6,11 +6,13 @@ Deliberately stdlib-only (unittest, no pytest) so this runs on a bare board:
 
 from __future__ import annotations
 
+import json
 import locale
 import os
 import random
 import signal
 import tempfile
+import time
 import unittest
 import unittest.mock
 from dataclasses import replace
@@ -18,7 +20,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from autotranscode import (
-    config, encode, estimate, grain, mux, pipeline, probe, sample, tools, util, verify,
+    config, encode, estimate, grain, mux, pipeline, probe, sample, tools, util, verify, watch,
 )
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
@@ -1590,3 +1592,191 @@ class TestLibrarySamples(unittest.TestCase):
         self.assertEqual({p.id for p in picks}, {"4K-1", "1080p-1", "1080p-2"})
         self.assertNotIn("/lib/d/done.mkv", {p.source for p in picks})
 
+
+
+class TestEarlySavingCheck(unittest.TestCase):
+    """Stopping an encode that is heading for a result too large to keep."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _av1an_temp(self, scenes: list[tuple[int, int]], done: dict[int, int]) -> Path:
+        """An Av1an temp directory: split_scenes, and {chunk index: bytes} finished."""
+        temp = self.root / "av1an"
+        temp.mkdir(exist_ok=True)
+        (temp / "scenes.json").write_text(json.dumps({
+            "frames": scenes[-1][1],
+            "split_scenes": [{"start_frame": a, "end_frame": b} for a, b in scenes],
+        }))
+        (temp / "done.json").write_text(json.dumps({
+            "frames": scenes[-1][1],
+            "done": {f"{i:05d}": {"frames": scenes[i][1] - scenes[i][0], "size_bytes": size}
+                     for i, size in done.items()},
+        }))
+        return temp
+
+    def test_chunks_are_placed_by_the_scene_list(self):
+        temp = self._av1an_temp([(0, 100), (100, 250), (250, 400)], {2: 900, 0: 300})
+        frames, chunks = watch.finished_chunks(temp)
+        self.assertEqual(frames, 400)
+        self.assertEqual(sorted((c.start, c.end, c.size) for c in chunks),
+                         [(0, 100, 300), (250, 400, 900)])
+
+    def test_nothing_is_finished_before_av1an_writes_its_files(self):
+        self.assertEqual(watch.finished_chunks(self.root), (0, []))
+        temp = self._av1an_temp([(0, 100)], {0: 1})
+        (temp / "done.json").write_text('{"frames": 100, "do')   # caught mid-write
+        self.assertEqual(watch.finished_chunks(temp), (0, []))
+
+    def test_packets_are_put_in_display_order(self):
+        self.assertEqual(watch.frame_sizes(["0,10\n", "3000,40\n", "1000,20\n", "2000,30\n"]),
+                         [10, 20, 30, 40])
+        # Missing timestamps, as in AVI: decode order is the best there is.
+        self.assertEqual(watch.frame_sizes(["N/A,10\n", "0,40\n", "N/A,20\n"]), [10, 40, 20])
+
+    def test_projection_compares_the_same_frames(self):
+        # The source spends 10 bytes a frame, but 50 in frames 100-199. The encode
+        # spent 2500 bytes on those frames: half the source, not 2.5 times its average.
+        sizes = [10] * 1000
+        sizes[100:200] = [50] * 100
+        info = make_info(size_bytes=sum(sizes) + 5000, duration=40.0)
+        projection = present(watch.project(info, config.Config(), 1000,
+                                           [watch.Chunk(100, 200, 2500)], sizes))
+        self.assertAlmostEqual(projection.ratio, 0.5)
+        self.assertEqual(projection.output_bytes, sum(sizes) // 2 + 5000)
+        self.assertAlmostEqual(projection.done_percent, 10.0)
+
+    def test_projection_counts_audio_re_encoded_to_opus(self):
+        truehd = Stream(index=1, codec="truehd", codec_type="audio", channels=2,
+                        bitrate=1_128_000)
+        cfg = config.Config()
+        info = make_info(size_bytes=10_000_000, duration=8.0, audio=[truehd])
+        saved = mux.audio_saving_bytes(info, cfg)
+        self.assertEqual(saved, (1_128_000 - 2 * cfg.audio.opus_kbps_per_channel * 1000))
+        with_audio = present(watch.project(info, cfg, 100, [watch.Chunk(0, 100, 1000)],
+                                           [10] * 100))
+        without = present(watch.project(replace(info, audio=[]), cfg, 100,
+                                        [watch.Chunk(0, 100, 1000)], [10] * 100))
+        self.assertEqual(without.output_bytes - with_audio.output_bytes, saved)
+
+    def _watch(self, sizes: list[int], temp: Path) -> watch.SavingWatch:
+        cfg = config.Config()
+        cfg.output.min_saving_percent = 10.0
+        cfg.output.check_saving_after_percent = 10.0
+        info = make_info(size_bytes=sum(sizes), duration=40.0)
+        fake = unittest.mock.Mock(sizes=sizes)
+        with unittest.mock.patch.object(watch, "SourceSizes", return_value=fake):
+            return watch.SavingWatch(info, cfg, make_chain(), temp)
+
+    def test_an_encode_heading_for_a_larger_file_is_stopped(self):
+        scenes = [(i * 100, i * 100 + 100) for i in range(10)]
+        # 5% of the frames is too early to judge, however bad it looks.
+        early = self._watch([10] * 1000, self._av1an_temp(
+            [(0, 50), *[(i * 100 + 50, i * 100 + 150) for i in range(9)], (950, 1000)],
+            {0: 5000}))
+        self.assertIsNone(early())
+        check = self._watch([10] * 1000, self._av1an_temp(scenes, {0: 2000, 1: 2000}))
+        self.assertRegex(present(check()), r"stopped at 20% of the frames: heading for "
+                                           r"100\.0% larger, below the 10% threshold")
+
+    def test_an_encode_heading_for_a_good_saving_carries_on(self):
+        scenes = [(i * 100, i * 100 + 100) for i in range(10)]
+        check = self._watch([10] * 1000, self._av1an_temp(scenes, {0: 300, 1: 300}))
+        self.assertIsNone(check())
+
+    def test_a_cover_image_is_not_mistaken_for_the_video(self):
+        scenes = [(i * 100, i * 100 + 100) for i in range(10)]
+        check = self._watch([10], self._av1an_temp(scenes, {0: 5000, 1: 5000}))
+        with self.assertLogs(util.log, "WARNING"):
+            self.assertIsNone(check())
+
+    def test_the_setting_must_be_a_percentage(self):
+        cfg = config.Config()
+        cfg.output.check_saving_after_percent = 150
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
+
+
+class TestWatchedCommand(unittest.TestCase):
+    """Stopping a command must take its children with it."""
+
+    def test_a_stop_ends_the_command_and_its_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            calls = []
+
+            def check():
+                calls.append(1)
+                return "enough" if pidfile.is_file() and pidfile.read_text().strip() else None
+
+            started = time.monotonic()
+            reason = util.run_watched(
+                ["sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait"], check, every=0.05)
+            self.assertEqual(reason, "enough")
+            self.assertLess(time.monotonic() - started, 10)
+            child = int(pidfile.read_text())
+            deadline = time.monotonic() + 5
+            while _alive(child) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(_alive(child), "the command's own child must be stopped too")
+
+    def test_a_command_that_ends_by_itself(self):
+        self.assertIsNone(util.run_watched(["true"], lambda: "never asked", every=5))
+        with self.assertRaises(CommandError):
+            util.run_watched(["false"], lambda: None, every=5)
+
+
+def _alive(pid: int) -> bool:
+    """Running, as opposed to gone or a zombie waiting for a new parent to reap it."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+class TestNoSavingIsRemembered(unittest.TestCase):
+    """A file that came out too large is not encoded again for nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.source = self.root / "Film (1975).mkv"
+        self.source.write_bytes(b"x" * 4096)
+        self.cfg = config.Config()
+        self.ledger = Ledger(self.root / "state.json")
+        self.tries = 0
+
+        def too_large(*_args, **_kwargs):
+            self.tries += 1
+            raise pipeline.NoSaving("stopped at 10% of the frames",
+                                    pipeline.settings_key(self.cfg, make_chain()))
+
+        original = pipeline.process_one
+        pipeline.process_one = too_large
+        self.addCleanup(setattr, pipeline, "process_one", original)
+
+    def _run(self) -> None:
+        pipeline._process_all([self.source], make_chain(), self.cfg, self.ledger,
+                              pipeline.StopRequest())
+
+    def test_not_tried_again_with_the_same_settings(self):
+        self._run()
+        self._run()
+        self.assertEqual(self.tries, 1)
+        record = present(self.ledger.get(self.source))
+        self.assertEqual(record.status, "skipped")
+        self.assertEqual(Ledger(self.root / "state.json").no_saving(self.source), record)
+
+    def test_tried_again_once_the_settings_change(self):
+        self._run()
+        self.cfg.encode.crf += 6
+        self._run()
+        self.assertEqual(self.tries, 2)
+
+    def test_other_skips_are_not_remembered_this_way(self):
+        self.ledger.record(self.source, Record(source=str(self.source), status="skipped",
+                                               reason="already av1"))
+        self.assertIsNone(self.ledger.no_saving(self.source))

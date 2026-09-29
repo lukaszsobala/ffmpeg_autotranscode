@@ -31,22 +31,33 @@ def _opus_bitrate(stream: Stream, cfg: Config) -> int:
     return channels * cfg.audio.opus_kbps_per_channel
 
 
+def audio_decision(stream: Stream, cfg: Config) -> str:
+    """"copy" or "opus" for one audio track."""
+    if cfg.audio.mode in ("copy", "opus"):
+        return cfg.audio.mode
+    # smart
+    if stream.codec in WASTEFUL_AUDIO:
+        return "opus"
+    return "copy" if stream.codec in cfg.audio.passthrough_codecs else "opus"
+
+
+def audio_saving_bytes(info: MediaInfo, cfg: Config) -> int:
+    """Roughly what re-encoding audio to Opus will save, for a size projection.
+
+    Counts only the tracks whose bitrate is known, so it errs towards saving less.
+    """
+    saved = 0.0
+    for stream in info.audio:
+        if audio_decision(stream, cfg) == "opus" and stream.bitrate:
+            saved += max(0, stream.bitrate - _opus_bitrate(stream, cfg) * 1000) * info.duration / 8
+    return int(saved)
+
+
 def _audio_args(info: MediaInfo, cfg: Config) -> list[str]:
     """Decide per-track whether to copy or re-encode, and say why in the log."""
     args: list[str] = []
     for position, stream in enumerate(info.audio):
-        if cfg.audio.mode == "copy":
-            decision = "copy"
-        elif cfg.audio.mode == "opus":
-            decision = "opus"
-        else:  # smart
-            if stream.codec in WASTEFUL_AUDIO:
-                decision = "opus"
-            elif stream.codec in cfg.audio.passthrough_codecs:
-                decision = "copy"
-            else:
-                decision = "opus"
-
+        decision = audio_decision(stream, cfg)
         if decision == "copy":
             args += [f"-c:a:{position}", "copy"]
             log.debug("audio %d (%s, %dch): copy", position, stream.codec, stream.channels)

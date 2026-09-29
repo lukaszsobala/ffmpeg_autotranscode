@@ -258,6 +258,13 @@ directory = ""               # empty writes next to the source
 # grounds that a marginal saving is not worth a re-encode generation. Set 0.0 to
 # keep every result.
 min_saving_percent = 10.0
+# Stop early instead of finding out at the end. Once this percentage of the frames
+# is encoded, the finished chunks are set against the bytes the source spends on
+# the same frames, and the encode stops as soon as the projected result misses
+# min_saving_percent. The file is recorded as skipped and not tried again until
+# the encode settings change. A grainy film can come out larger than its source
+# after days of encoding; this finds out in hours. 0 turns the check off.
+check_saving_after_percent = 10.0
 replace_source = false       # true deletes the original after a successful encode
 
 [library]

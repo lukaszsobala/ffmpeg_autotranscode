@@ -269,6 +269,9 @@ class Output:
     container: str = "mkv"
     directory: str = ""  # empty => write next to the source
     min_saving_percent: float = 10.0
+    # Once this share of the frames is encoded, project the final size from the
+    # chunks so far and stop when it misses min_saving_percent. 0 never checks.
+    check_saving_after_percent: float = 10.0
     replace_source: bool = False
 
 
@@ -462,6 +465,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("audio.mode must be copy, opus or smart")
     if cfg.subtitles.mode not in {"copy", "none", "text-only"}:
         raise ConfigError("subtitles.mode must be copy, none or text-only")
+    if not 0 <= cfg.output.check_saving_after_percent <= 100:
+        raise ConfigError("output.check_saving_after_percent must be between 0 and 100")
     if cfg.output.container not in {"mkv", "webm"}:
         raise ConfigError("output.container must be mkv or webm (AV1 + full subtitle support)")
     if cfg.encode.concat == "mkvmerge" and cfg.output.container != "mkv":

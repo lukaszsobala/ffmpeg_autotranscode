@@ -14,15 +14,16 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import hashlib
+import json
 import os
 import shutil
 import signal
 import time
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
-from . import encode, grain, mux
+from . import encode, grain, mux, watch
 from .config import Config
 from .probe import MediaInfo, probe
 from .state import Ledger, Record
@@ -32,6 +33,31 @@ from .util import CommandError, human_duration, human_size, log
 
 class SkipFile(Exception):
     """This file should not be transcoded; the message says why."""
+
+
+class NoSaving(SkipFile):
+    """The encode would not save enough. `settings` is `settings_key` at the time,
+    so that the file is not tried again until something that decides size changes."""
+
+    def __init__(self, message: str, settings: str):
+        super().__init__(message)
+        self.settings = settings
+
+
+def settings_key(cfg: Config, chain: Toolchain) -> str:
+    """A digest of everything that decides how large an encode comes out.
+
+    A file that did not save enough is skipped while this stays the same: trying
+    again would spend the same hours to reach the same size.
+    """
+    decisive = {
+        "encode": asdict(cfg.encode),
+        "grain": asdict(cfg.grain),
+        "audio": asdict(cfg.audio),
+        "min_saving_percent": cfg.output.min_saving_percent,
+        "svt_av1": chain.svtav1_version,
+    }
+    return hashlib.sha256(json.dumps(decisive, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 class StopRequest:
@@ -390,7 +416,16 @@ def _transcode(
     encoded = work / "encoded.mkv"
     encoded.unlink(missing_ok=True)
     argv = encode.build_command(read, encoded, chain, cfg, work / "av1an", denoise)
-    encode.run_encode(argv, cfg, chain, dry_run=dry_run)
+    check = (watch.SavingWatch(read, cfg, chain, work / "av1an")
+             if cfg.output.check_saving_after_percent > 0 and not dry_run else None)
+    try:
+        stopped = encode.run_encode(argv, cfg, chain, dry_run=dry_run, check=check)
+    finally:
+        if check is not None:
+            check.close()
+    if stopped:
+        _cleanup(work, cfg, table)
+        raise NoSaving(stopped, settings_key(cfg, chain))
 
     if dry_run:
         return Record(
@@ -436,8 +471,9 @@ def _transcode(
     if saving < cfg.output.min_saving_percent:
         muxed.unlink(missing_ok=True)
         _cleanup(work, cfg, table)
-        raise SkipFile(
-            f"only {saving:.1f}% smaller, below the {cfg.output.min_saving_percent:.0f}% threshold"
+        raise NoSaving(
+            f"only {saving:.1f}% smaller, below the {cfg.output.min_saving_percent:.0f}% threshold",
+            settings_key(cfg, chain),
         )
 
     if staged_out is not None:
@@ -508,6 +544,7 @@ def _process_all(
 ) -> int:
     failures = 0
     total = len(sources)
+    settings = settings_key(cfg, chain)
 
     for index, source in enumerate(sources, start=1):
         log.info("[%d/%d] %s", index, total, source)
@@ -515,9 +552,18 @@ def _process_all(
         if done := ledger.already_done(source):
             log.info("  skipping, already transcoded to %s", done.output)
             continue
+        if (tried := ledger.no_saving(source)) and tried.settings == settings:
+            log.info("  skipping, did not save enough with the same settings before (%s)",
+                     tried.reason)
+            continue
 
         try:
             record = process_one(source, chain, cfg, dry_run=dry_run)
+        except NoSaving as exc:
+            log.info("  skipped: %s", exc)
+            ledger.record(source, Record(source=str(source), status="skipped",
+                                         reason=str(exc), settings=exc.settings))
+            continue
         except SkipFile as exc:
             log.info("  skipped: %s", exc)
             ledger.record(source, Record(source=str(source), status="skipped", reason=str(exc)))

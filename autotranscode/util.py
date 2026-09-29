@@ -8,9 +8,10 @@ import locale
 import logging
 import os
 import shlex
+import signal
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -172,3 +173,50 @@ def setup_logging(verbosity: int, log_file: Path | None = None) -> None:
         handlers=handlers,
         force=True,
     )
+
+
+def run_watched(
+    argv: list[str],
+    check: Callable[[], str | None],
+    *,
+    every: float = 60.0,
+    extra_path: Sequence[str] = (),
+) -> str | None:
+    """Run a long command with its output on the terminal, asking `check` every
+    `every` seconds whether to stop it. Returns why it was stopped, or None when it
+    ran to the end.
+
+    The command gets a process group of its own, so that stopping it stops its
+    children too: Av1an's ffmpeg and encoder processes would otherwise run on to
+    the end of their chunk. Outside the terminal's foreground group it no longer
+    sees Ctrl-C, so an interrupt arriving here is passed on to it.
+    """
+    log.debug("exec: %s", shlex.join(argv))
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, env=child_env(extra_path),
+                            process_group=0)
+    try:
+        while True:
+            try:
+                returncode = proc.wait(timeout=every)
+                break
+            except subprocess.TimeoutExpired:
+                if reason := check():
+                    _stop_group(proc)
+                    return reason
+    except BaseException:
+        _stop_group(proc)
+        raise
+    if returncode != 0:
+        raise CommandError(argv, returncode, "")
+    return None
+
+
+def _stop_group(proc: subprocess.Popen[bytes], grace: float = 10.0) -> None:
+    """SIGTERM the whole group, then SIGKILL whatever is left after `grace`."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=grace)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait()
