@@ -10,7 +10,8 @@
 #
 # Stages: deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth verify
 #
-# On Linux only the `deps` and `ffmpeg` stages use sudo, and only to run apt-get.
+# On Linux only the `deps` and `ffmpeg` stages use sudo, and only to run apt-get;
+# as root, as in the Dockerfile, they run it directly.
 # On macOS nothing does: Homebrew runs as you. Everything built from source
 # installs into a user-owned prefix ($HOME/.local by default), so the long stages
 # need no privileges and leave nothing behind outside your home directory. Set
@@ -44,6 +45,8 @@ BUILD_DIR="${BUILD_DIR:-$HOME/.cache/autotranscode-build}"
 log()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
+# sudo, except as root: root has no need of it, and a container has no sudo.
+as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
 
 case "$(uname -s)" in
   Linux)
@@ -70,13 +73,13 @@ stage_deps() {
     brew install cmake nasm pkg-config git mkvtoolnix python@3.13 ffmpeg
     return
   fi
-  sudo apt-get update
-  sudo apt-get install -y --no-install-recommends \
+  as_root apt-get update
+  as_root apt-get install -y --no-install-recommends \
     build-essential cmake git yasm nasm pkg-config ca-certificates curl gnupg xz-utils \
     autoconf automake libtool \
     clang libclang-dev llvm-dev \
     libavformat-dev libavfilter-dev libavdevice-dev libavutil-dev libswscale-dev \
-    mkvtoolnix python3 python3-venv
+    zlib1g-dev mkvtoolnix python3 python3-dev python3-venv
 }
 
 # jellyfin-ffmpeg's portable build: two self-contained binaries, for systems its
@@ -127,12 +130,12 @@ stage_ffmpeg() {
     local pkg=""
     if [[ -n $codename && ($id == debian || $id == ubuntu) \
           && ($arch == arm64 || $arch == amd64) ]]; then
-      sudo install -d -m 0755 /etc/apt/keyrings
+      as_root install -d -m 0755 /etc/apt/keyrings
       curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
-        | sudo gpg --dearmor --yes -o /etc/apt/keyrings/jellyfin.gpg
+        | as_root gpg --dearmor --yes -o /etc/apt/keyrings/jellyfin.gpg
       echo "deb [signed-by=/etc/apt/keyrings/jellyfin.gpg arch=${arch}] https://repo.jellyfin.org/${id} ${codename} main" \
-        | sudo tee /etc/apt/sources.list.d/jellyfin.sources.list >/dev/null
-      if sudo apt-get update; then
+        | as_root tee /etc/apt/sources.list.d/jellyfin.sources.list >/dev/null
+      if as_root apt-get update; then
         # The highest major available, rather than a name that changes every
         # release (jellyfin-ffmpeg6, 7, 8, ...).
         pkg=$(apt-cache search --names-only '^jellyfin-ffmpeg[0-9]+$' \
@@ -140,13 +143,13 @@ stage_ffmpeg() {
       fi
       if [[ -z $pkg ]]; then
         warn "Jellyfin's repository has nothing for ${id} ${codename}; removing it"
-        sudo rm -f /etc/apt/sources.list.d/jellyfin.sources.list
-        sudo apt-get update
+        as_root rm -f /etc/apt/sources.list.d/jellyfin.sources.list
+        as_root apt-get update
       fi
     fi
     if [[ -n $pkg ]]; then
       log "Selected package: ${pkg}"
-      sudo apt-get install -y "$pkg"
+      as_root apt-get install -y "$pkg"
     else
       install_portable_ffmpeg
     fi
@@ -188,8 +191,8 @@ stage_svtav1() {
     cmake --install "$src/Build"
   else
     warn "${PREFIX} is not writable; installing with sudo"
-    sudo cmake --install "$src/Build"
-    [[ $OS == linux ]] && sudo ldconfig
+    as_root cmake --install "$src/Build"
+    [[ $OS == linux ]] && as_root ldconfig
   fi
 
   local svt="$PREFIX/bin/SvtAv1EncApp"

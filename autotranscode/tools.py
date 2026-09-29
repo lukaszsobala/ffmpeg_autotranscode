@@ -6,6 +6,7 @@ single place that answers "is it installed, which version, and what can it do".
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import tempfile
@@ -24,6 +25,9 @@ JELLYFIN_FFMPEG_DIRS = (
     # distributions Jellyfin's apt repository does not cover.
     str(Path.home() / ".local/lib/jellyfin-ffmpeg"),
 )
+
+# The Rockchip video engine's device node; see _rockchip_video_engine.
+MPP_DEVICE = "/dev/mpp_service"
 
 
 class ToolError(RuntimeError):
@@ -125,14 +129,34 @@ def _capture(argv: list[str], extra_path: list[str] | None = None) -> str:
     return (result.stdout or "") + (result.stderr or "")
 
 
-def _big_cores() -> str:
-    """The highest-capacity cores as "a,b,c", or "" when all cores are alike."""
+def _rockchip_video_engine() -> bool:
+    """Whether the rkmpp decoders can open the video engine, not just exist.
+
+    jellyfin-ffmpeg's arm64 build lists them on every ARM machine: another board,
+    a container the device was not passed to, a Mac's Linux VM. There they fail on
+    the first frame, and verify would fail with them.
+    """
+    return os.access(MPP_DEVICE, os.R_OK | os.W_OK)
+
+
+def _big_cores(cpus: Path = Path("/sys/devices/system/cpu")) -> str:
+    """The highest-capacity cores as "a,b,c", or "" when all cores are alike.
+
+    Only cores this process may run on: taskset refuses any other, and a
+    container or service limited to some cores would fail every measurement.
+    """
+    try:
+        allowed = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        allowed = None
     capacity: dict[int, int] = {}
-    for path in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpu_capacity"):
+    for path in cpus.glob("cpu[0-9]*/cpu_capacity"):
         try:
             capacity[int(path.parent.name[3:])] = int(path.read_text())
         except (OSError, ValueError):
             continue
+    if allowed is not None:
+        capacity = {cpu: value for cpu, value in capacity.items() if cpu in allowed}
     if len(set(capacity.values())) < 2:
         return ""
     top = max(capacity.values())
@@ -170,7 +194,7 @@ def detect(cfg: Config) -> Toolchain:
         parts[1]
         for line in _capture([ffmpeg, "-hide_banner", "-decoders"]).splitlines()
         if len(parts := line.split()) > 2 and parts[1].endswith("_rkmpp")
-    }
+    } if _rockchip_video_engine() else set()
     chain.filters = {
         parts[1]
         for line in _capture([ffmpeg, "-hide_banner", "-filters"]).splitlines()
@@ -333,5 +357,8 @@ def describe(chain: Toolchain) -> str:
         "(tonemapx, for profile 5 -> SDR)",
         f"hwaccels    {', '.join(sorted(chain.hwaccels)) or 'none'}  "
         "(this build's decoders; unused -- the encode is CPU-only)",
+        f"rkmpp       {', '.join(sorted(chain.rkmpp_decoders)) or 'none'}  "
+        f"(usable decoders, for verify; needs {MPP_DEVICE})",
+        f"big cores   {chain.big_cores or 'none'}  (verify's filter passes run there)",
     ]
     return "\n".join(lines)

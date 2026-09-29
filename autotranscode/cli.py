@@ -135,6 +135,7 @@ def apply_overrides(cfg: config.Config, args: argparse.Namespace) -> None:
 
 
 def cmd_doctor(cfg: config.Config, chain: tools.Toolchain) -> int:
+    print(f"profile     {cfg.machine.profile}")
     print(tools.describe(chain))
     print()
     try:

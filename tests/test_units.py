@@ -1888,3 +1888,41 @@ class TestChildPath(unittest.TestCase):
                 unittest.mock.patch.object(sys, "base_prefix", "/usr"), \
                 unittest.mock.patch.dict(os.environ, {"PATH": "/a/bin:/usr/bin"}):
             self.assertEqual(util.child_env()["PATH"], "/a/bin:/usr/bin")
+
+
+class TestInsideAContainer(unittest.TestCase):
+    """What a container hides or withholds must not be mistaken for the hardware."""
+
+    def test_profile_from_the_device_tree_the_rockchip_compose_file_mounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hidden, mounted = Path(tmp) / "proc", Path(tmp) / "host"
+            mounted.write_bytes(b"radxa,rock-5b\0rockchip,rk3588\0")
+            with unittest.mock.patch.object(config, "DEVICE_TREE_COMPATIBLE", (hidden, mounted)):
+                self.assertEqual(config.detect_profile(), "rk3588")
+            with unittest.mock.patch.object(config, "DEVICE_TREE_COMPATIBLE", (hidden,)):
+                self.assertEqual(config.detect_profile(), "generic")
+
+    def test_rkmpp_decoders_need_the_device_not_just_the_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "mpp_service"
+            with unittest.mock.patch.object(tools, "MPP_DEVICE", str(device)):
+                self.assertFalse(tools._rockchip_video_engine())
+                device.touch()
+                self.assertTrue(tools._rockchip_video_engine())
+
+    def _cpus(self, root: Path, capacities: list[int]) -> Path:
+        for number, capacity in enumerate(capacities):
+            (root / f"cpu{number}").mkdir()
+            (root / f"cpu{number}" / "cpu_capacity").write_text(f"{capacity}\n")
+        return root
+
+    def test_big_cores_are_only_those_this_process_may_use(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cpus = self._cpus(Path(tmp), [414] * 4 + [1024] * 4)
+            with unittest.mock.patch.object(os, "sched_getaffinity", return_value=set(range(8))):
+                self.assertEqual(tools._big_cores(cpus), "4,5,6,7")
+            with unittest.mock.patch.object(os, "sched_getaffinity", return_value={0, 1, 6, 7}):
+                self.assertEqual(tools._big_cores(cpus), "6,7")
+            # Limited to one kind of core: nothing to choose between.
+            with unittest.mock.patch.object(os, "sched_getaffinity", return_value={4, 5}):
+                self.assertEqual(tools._big_cores(cpus), "")

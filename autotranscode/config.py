@@ -344,17 +344,28 @@ def _apply_section(obj: Any, values: dict[str, Any], where: str) -> None:
         setattr(obj, key, value)
 
 
+# Where the SoC is named: the kernel's own copy, then the host's copy as the
+# Rockchip compose file mounts it. Docker hides /sys/firmware, which is where
+# /proc/device-tree points, and will not mount anything under /proc.
+DEVICE_TREE_COMPATIBLE = (
+    Path("/proc/device-tree/compatible"),
+    Path("/run/host/device-tree/compatible"),
+)
+
+
 def detect_profile() -> str:
     """The profile for this machine: rk3588 when the device tree names that SoC.
 
     Boards describe their SoC in the device tree ("radxa,rock-5b\0rockchip,rk3588");
     a PC or a Mac has no device tree at all and gets the generic profile.
     """
-    try:
-        compatible = Path("/proc/device-tree/compatible").read_bytes()
-    except OSError:
-        return "generic"
-    return "rk3588" if b"rockchip,rk3588" in compatible.split(b"\0") else "generic"
+    for path in DEVICE_TREE_COMPATIBLE:
+        try:
+            compatible = path.read_bytes()
+        except OSError:
+            continue
+        return "rk3588" if b"rockchip,rk3588" in compatible.split(b"\0") else "generic"
+    return "generic"
 
 
 def resolve_profile(profile: str) -> str:
