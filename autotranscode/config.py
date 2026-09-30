@@ -33,7 +33,6 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         # brought them back). The resolution curve lowers it for smaller sources.
         "encode": {"preset": 4, "crf": 30, "chunk_method": "auto"},
         "grain": {"samples": 4, "sample_seconds": 2},
-        "target_quality": {"enabled": False},
     },
     "generic": {},
     "workstation": {
@@ -170,17 +169,6 @@ class Encode:
 
 
 @dataclass(slots=True)
-class TargetQuality:
-    enabled: bool = False
-    metric: str = "vmaf"
-    score: float = 94.0
-    min_q: int = 18
-    max_q: int = 48
-    probes: int = 4
-    probing_speed: str = "veryfast"
-
-
-@dataclass(slots=True)
 class Estimate:
     """Sampling settings for `estimate`, which ranks a library by what it would save."""
 
@@ -289,8 +277,7 @@ class Subtitles:
 
 @dataclass(slots=True)
 class Output:
-    suffix: str = ".av1"
-    container: str = "mkv"
+    suffix: str = ".av1"   # always Matroska: it holds every track the mux carries over
     directory: str = ""  # empty => write next to the source
     min_saving_percent: float = 10.0
     # Once this share of the frames is encoded, project the final size from the
@@ -321,7 +308,6 @@ class Config:
     paths: Paths = field(default_factory=Paths)
     machine: Machine = field(default_factory=Machine)
     encode: Encode = field(default_factory=Encode)
-    target_quality: TargetQuality = field(default_factory=TargetQuality)
     estimate: Estimate = field(default_factory=Estimate)
     grain: Grain = field(default_factory=Grain)
     staging: Staging = field(default_factory=Staging)
@@ -426,12 +412,7 @@ def load(path: Path | None) -> Config:
     _merge_profile(cfg, profile)
     cfg.machine.profile = profile
 
-    if "crf_by_width" in raw.get("encode", {}):
-        raise ConfigError(
-            "encode.crf_by_width is gone: CRF now follows a curve over width "
-            "(encode.crf_per_doubling, crf_drop_at_720, crf_max_drop; see "
-            "config.example.toml). Delete the table to use the default curve"
-        )
+    _refuse_retired(raw)
     for section, values in raw.items():
         if not hasattr(cfg, section):
             raise ConfigError(f"unknown config section [{section}]")
@@ -445,6 +426,32 @@ def load(path: Path | None) -> Config:
 
     validate(cfg)
     return cfg
+
+
+def _refuse_retired(raw: dict[str, Any]) -> None:
+    """Explain settings that were removed, rather than calling them unknown.
+
+    `output.container = "mkv"` is accepted and dropped: it was the default, and
+    it is still what every output is.
+    """
+    if "crf_by_width" in raw.get("encode", {}):
+        raise ConfigError(
+            "encode.crf_by_width is gone: CRF now follows a curve over width "
+            "(encode.crf_per_doubling, crf_drop_at_720, crf_max_drop; see "
+            "config.example.toml). Delete the table to use the default curve"
+        )
+    if "target_quality" in raw:
+        raise ConfigError(
+            "[target_quality] is gone: Av1an's metric search was never used here, and "
+            "a metric is what misjudged grainy films. Delete the section"
+        )
+    output = raw.get("output", {})
+    if isinstance(output, dict) and "container" in output:
+        if output.pop("container") != "mkv":
+            raise ConfigError(
+                "output.container is gone and outputs are always Matroska: WebM cannot "
+                "hold copied AAC, AC-3 or FLAC audio, PGS or ASS subtitles, or fonts"
+            )
 
 
 def _check_by_width(
@@ -514,7 +521,3 @@ def validate(cfg: Config) -> None:
         raise ConfigError("encode.sc_downscale_height cannot be negative (0 turns it off)")
     if not 0 <= cfg.output.check_saving_after_percent <= 100:
         raise ConfigError("output.check_saving_after_percent must be between 0 and 100")
-    if cfg.output.container not in {"mkv", "webm"}:
-        raise ConfigError("output.container must be mkv or webm (AV1 + full subtitle support)")
-    if cfg.encode.concat == "mkvmerge" and cfg.output.container != "mkv":
-        raise ConfigError("encode.concat=mkvmerge can only produce mkv")

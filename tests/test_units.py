@@ -151,11 +151,16 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
             config.validate(cfg)
 
-        cfg = config.Config()
-        cfg.output.container = "webm"
-        cfg.encode.concat = "mkvmerge"   # mkvmerge cannot produce webm
-        with self.assertRaises(config.ConfigError):
-            config.validate(cfg)
+    def test_retired_settings_are_explained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            for text, message in (("[target_quality]\nenabled = false\n", "target_quality"),
+                                  ('[output]\ncontainer = "webm"\n', "Matroska")):
+                path.write_text(text)
+                with self.assertRaisesRegex(config.ConfigError, message):
+                    config.load(path)
+            path.write_text('[output]\ncontainer = "mkv"\n')
+            config.load(path)   # the old default is still accepted
 
 
 class TestSkipRules(unittest.TestCase):
@@ -592,10 +597,10 @@ class TestStaging(unittest.TestCase):
 
         self.assertEqual(pipeline.output_path(info, self.cfg).parent, self.source.parent)
 
-    def test_staged_output_lands_in_staging_with_the_configured_container(self):
+    def test_staged_output_lands_in_staging_as_matroska(self):
         out = pipeline.staged_output_path(self.source, self.cfg)
         self.assertEqual(out.parent, self.cfg.staging_dir)
-        self.assertTrue(out.name.endswith(f".out.{self.cfg.output.container}"))
+        self.assertTrue(out.name.endswith(".out.mkv"))
 
     def test_the_staged_output_does_not_collide_with_the_staged_input(self):
         staged_in = pipeline.stage_source(self._info(), self.cfg)
@@ -1189,13 +1194,6 @@ class TestMuxOutput(unittest.TestCase):
         argv = mux.build_command(Path("/w/encoded.mkv"), make_info(),
                                  Path("/out/Film.av1.mkv.part"), make_chain(), config.Config())
         self.assertEqual(argv[-3:], ["-f", "matroska", "/out/Film.av1.mkv.part"])
-
-    def test_webm_output_gets_the_webm_muxer(self):
-        cfg = config.Config()
-        cfg.output.container = "webm"
-        argv = mux.build_command(Path("/w/encoded.mkv"), make_info(),
-                                 Path("/out/Film.av1.webm.part"), make_chain(), cfg)
-        self.assertEqual(argv[-3:-1], ["-f", "webm"])
 
     def _mux(self, *subs: str, mode: str = "copy") -> list[str]:
         cfg = config.Config()

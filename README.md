@@ -5,7 +5,7 @@ tools that already do the hard parts well:
 
 | Tool | What it does here |
 |---|---|
-| [Av1an](https://github.com/rust-av/Av1an) | Scene detection, chunking, parallel workers, resume, optional target-quality search |
+| [Av1an](https://github.com/rust-av/Av1an) | Scene detection, chunking, parallel workers, resume |
 | [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) 4.x | The encoder (`SvtAv1EncApp`) |
 | [grav1synth](https://github.com/rust-av/grav1synth) | Writes a film grain table into the AV1 bitstream |
 | [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) 8 | Probing, muxing, and `tonemapx` for Dolby Vision profile 5 |
@@ -60,8 +60,8 @@ repository root with no install at all.
 board and `generic` anywhere else. `workstation` is there for many fast cores.
 
 jellyfin-ffmpeg is recommended rather than required. Any ffmpeg 7.1 or newer has
-what an encode needs; Jellyfin's adds `tonemapx` (Dolby Vision profile 5 to SDR),
-libvmaf (target quality) and, on Rockchip, hardware decoding for `verify`.
+what an encode needs; Jellyfin's adds `tonemapx` (Dolby Vision profile 5 to SDR)
+and, on Rockchip, hardware decoding for `verify`.
 
 `chunk_method = "auto"` uses L-SMASH-Works when `doctor` shows the `lsmas` plugin
 (`scripts/bootstrap.sh lsmash` builds it). Without it, Av1an decodes the whole film

@@ -104,10 +104,6 @@ def _subtitle_args(info: MediaInfo, cfg: Config) -> tuple[list[str], list[str]]:
     return maps, codecs
 
 
-# output.container -> ffmpeg muxer name.
-MUXERS = {"mkv": "matroska", "webm": "webm"}
-
-
 def display_aspect(info: MediaInfo) -> str:
     """The picture's display aspect as "W:H" when its pixels are not square."""
     if not info.sample_aspect or not info.width or not info.height:
@@ -134,8 +130,7 @@ def build_command(
     argv += sub_maps
     # Attachments: the fonts an ASS subtitle track is styled with. Without them
     # a player falls back to its own font, and the subtitles lose their look.
-    if cfg.output.container == "mkv":
-        argv += ["-map", "1:t?"]
+    argv += ["-map", "1:t?"]
     argv += ["-c:v", "copy"]
     if aspect := display_aspect(info):
         # AV1 has no pixel-shape field for ffmpeg to copy, so without this a 4:3
@@ -151,7 +146,7 @@ def build_command(
         "-disposition:v:0", "default",
         # Named, not inferred: the pipeline writes to "<name>.part" and renames it
         # into place, and ffmpeg cannot pick a muxer from a .part extension.
-        "-f", MUXERS[cfg.output.container],
+        "-f", "matroska",
         str(output),
     ]
     return argv

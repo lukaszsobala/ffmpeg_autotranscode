@@ -31,7 +31,7 @@ nice = 10
 [paths]
 # Leave as "ffmpeg"/"ffprobe" to auto-detect jellyfin-ffmpeg in its usual locations
 # before falling back to PATH. jellyfin-ffmpeg is strongly preferred: it ships
-# libvmaf and rkmpp/rkrga, which distribution builds generally do not.
+# tonemapx and rkmpp/rkrga, which distribution builds generally do not.
 ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
 av1an = "av1an"
@@ -138,22 +138,9 @@ samples = 0          # excerpts per file. 0 scales with runtime, within the boun
 min_samples = 3
 max_samples = 6
 sample_seconds = 10
-# Probe grain first, so a grainy film is estimated on the denoise + grain-synthesis
-# route it would really take. Costs a few seconds per file and changes the answer
-# most on the files where the savings are largest.
+# With grain.denoise_before_encode on, probe grain first, so that a grainy film is
+# sampled denoised, as the real run would encode it. Otherwise it does not run.
 grain_probe = true
-
-[target_quality]
-# Let Av1an search per-chunk for the CRF that hits a quality score. Much more
-# consistent than a fixed CRF, but multiplies encode time by the probe count.
-# On RK3588 this is usually not worth it; leave it off and tune crf instead.
-enabled = false
-metric = "vmaf"              # vmaf | ssimulacra2 | butteraugli-inf | xpsnr
-score = 94.0
-min_q = 18
-max_q = 48
-probes = 4
-probing_speed = "veryfast"
 
 [grain]
 # "auto"   measure each file and take the grain route only when it is grainy
@@ -258,8 +245,7 @@ max_channels = 0             # 0 keeps the source layout; 2 forces a stereo down
 mode = "copy"                # copy | none | text-only (drops PGS/VobSub bitmaps)
 
 [output]
-suffix = ".av1"              # movie.mkv -> movie.av1.mkv
-container = "mkv"
+suffix = ".av1"              # movie.mp4 -> movie.av1.mkv; always Matroska
 # Empty writes next to the source. A directory mirrors the folders below the one
 # given to `run`, so that two films with the same file name do not collide; files
 # named one by one, or through a .txt list, go to its top.

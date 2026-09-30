@@ -84,10 +84,6 @@ class Toolchain:
         return self.vspipe is not None
 
     @property
-    def has_libvmaf(self) -> bool:
-        return "libvmaf" in self.filters
-
-    @property
     def has_grain_pipeline(self) -> bool:
         return self.av1an is not None and self.grav1synth is not None
 
@@ -110,7 +106,7 @@ def _which(candidate: str) -> str | None:
 
 
 def _find_ffmpeg(configured: str, name: str) -> str | None:
-    """Prefer jellyfin-ffmpeg: it ships libvmaf, rkmpp/rkrga and a current SVT-AV1."""
+    """Prefer jellyfin-ffmpeg: it ships tonemapx, rkmpp/rkrga and a current SVT-AV1."""
     if configured not in {"ffmpeg", "ffprobe"}:
         return _which(configured)
     for directory in JELLYFIN_FFMPEG_DIRS:
@@ -318,11 +314,6 @@ def require(chain: Toolchain, cfg: Config) -> None:
             "dolby_vision.profile5='tonemap-sdr' needs an ffmpeg with the tonemapx "
             "filter (jellyfin-ffmpeg has it); set it back to 'skip' otherwise"
         )
-    if cfg.target_quality.enabled and cfg.target_quality.metric == "vmaf" and not chain.has_libvmaf:
-        problems.append(
-            "target_quality.metric='vmaf' needs an ffmpeg with libvmaf; "
-            "jellyfin-ffmpeg has it, the Ubuntu build does not"
-        )
     method = cfg.encode.chunk_method
     if (plugin := VAPOURSYNTH_CHUNK_METHODS.get(method)) and plugin not in chain.vapoursynth_plugins:
         where = "VapourSynth" if chain.has_vapoursynth else "VapourSynth (vspipe not found)"
@@ -346,7 +337,6 @@ def describe(chain: Toolchain) -> str:
         f"mkvmerge    {chain.mkvmerge or 'MISSING'}",
         f"vapoursynth {chain.vspipe or 'no'}  "
         f"(plugins: {' '.join(sorted(chain.vapoursynth_plugins)) or 'none'})",
-        f"libvmaf     {'yes' if chain.has_libvmaf else 'no'}",
         f"hdr10 meta  {'yes' if chain.has_hdr10_metadata else 'no'}  "
         "(--mastering-display / --content-light)",
         f"ac-bias     {'yes' if '--ac-bias' in chain.svt_options else 'no'}  (for 4K and 1080p)",

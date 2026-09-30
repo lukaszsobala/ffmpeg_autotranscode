@@ -156,7 +156,7 @@ def output_path(info: MediaInfo, cfg: Config, roots: Sequence[Path] = ()) -> Pat
     library and on one of its folders puts a film in the same place. A file given
     on its own, or through a .txt list, goes to the top of the output directory.
     """
-    name = f"{info.path.stem}{cfg.output.suffix}.{cfg.output.container}"
+    name = f"{info.path.stem}{cfg.output.suffix}.mkv"
     if not cfg.output.directory:
         return info.path.parent / name
     directory = Path(cfg.output.directory).expanduser()
@@ -296,7 +296,7 @@ def _staged_path(source: Path, cfg: Config, suffix: str) -> Path:
 
 
 def staged_output_path(source: Path, cfg: Config) -> Path:
-    return _staged_path(source, cfg, f".out.{cfg.output.container}")
+    return _staged_path(source, cfg, ".out.mkv")
 
 
 def stage_source(info: MediaInfo, cfg: Config) -> Path | None:

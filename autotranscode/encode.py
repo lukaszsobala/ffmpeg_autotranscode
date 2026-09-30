@@ -1,7 +1,6 @@
 """Build and run the Av1an command line.
 
-Av1an owns the hard parts: scene detection, chunking, parallel workers, resume and
-target-quality search. This module's only job is to translate config plus probed
+Av1an owns the hard parts: scene detection, chunking, parallel workers and resume. This module's only job is to translate config plus probed
 source properties into correct flags for Av1an and SvtAv1EncApp.
 """
 
@@ -289,17 +288,6 @@ def build_command(
     filters = [f for f in (dovi_tonemap_filter(info, cfg), denoise_filter) if f]
     if filters:
         argv += ["-f", f"-vf {','.join(filters)}"]
-
-    tq = cfg.target_quality
-    if tq.enabled:
-        argv += [
-            "--target-quality", str(tq.score),
-            "--target-metric", tq.metric,
-            "--probes", str(tq.probes),
-            "--probing-speed", tq.probing_speed,
-            "--min-q", str(tq.min_q),
-            "--max-q", str(tq.max_q),
-        ]
 
     return argv
 
