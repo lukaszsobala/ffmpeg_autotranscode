@@ -38,6 +38,30 @@ class Record:
         return 100.0 * (1 - self.output_bytes / self.source_bytes)
 
 
+@dataclass(slots=True)
+class Guess:
+    """What `estimate` projected for a source. Kept apart from its Record: a guess
+    is not a verdict, and a newer estimate simply replaces it."""
+
+    source: str
+    source_bytes: int
+    projected_bytes: int
+    encode_seconds: float
+    crf: float
+    # pipeline.size_key when it was sampled; a guess made with other settings is ignored.
+    settings: str
+    estimated_at: str = ""
+
+    @property
+    def saved_bytes(self) -> int:
+        return self.source_bytes - self.projected_bytes
+
+    @property
+    def saved_per_hour(self) -> float:
+        hours = self.encode_seconds / 3600
+        return self.saved_bytes / hours if hours else 0.0
+
+
 def _key(path: Path) -> str:
     """Identify a source by path plus size, so an edited file is reprocessed."""
     try:
@@ -50,6 +74,7 @@ class Ledger:
     def __init__(self, path: Path):
         self.path = path
         self.records: dict[str, Record] = {}
+        self.guesses: dict[str, Guess] = {}
         self._load()
 
     def _load(self) -> None:
@@ -65,6 +90,11 @@ class Ledger:
                 self.records[key] = Record(**value)
             except TypeError:
                 log.debug("dropping incompatible state entry %s", key)
+        for key, value in raw.get("estimates", {}).items():
+            try:
+                self.guesses[key] = Guess(**value)
+            except TypeError:
+                log.debug("dropping incompatible estimate %s", key)
 
     def save(self) -> None:
         """Write atomically: a crash mid-write must not destroy hours of bookkeeping."""
@@ -72,6 +102,7 @@ class Ledger:
         payload = {
             "version": 1,
             "records": {key: asdict(record) for key, record in self.records.items()},
+            "estimates": {key: asdict(guess) for key, guess in self.guesses.items()},
         }
         handle = tempfile.NamedTemporaryFile(  # noqa: SIM115 - closed explicitly below
             "w", encoding="utf-8", dir=self.path.parent, delete=False, suffix=".tmp"
@@ -102,12 +133,23 @@ class Ledger:
         self.records[_key(source)] = record
         self.save()
 
+    def guess(self, source: Path, settings: str) -> Guess | None:
+        """The estimate for `source` made with these settings, if there is one."""
+        guess = self.guesses.get(_key(source))
+        return guess if guess and guess.settings == settings else None
+
+    def record_guess(self, source: Path, guess: Guess) -> None:
+        self.guesses[_key(source)] = guess
+        self.save()
+
     def summary(self) -> str:
         done = [r for r in self.records.values() if r.status == "done"]
         failed = [r for r in self.records.values() if r.status == "failed"]
         skipped = [r for r in self.records.values() if r.status == "skipped"]
         saved = sum(r.source_bytes - r.output_bytes for r in done)
         lines = [f"{len(done)} done, {len(failed)} failed, {len(skipped)} skipped"]
+        if self.guesses:
+            lines.append(f"{len(self.guesses)} estimated")
         if done:
             mean = sum(r.saving_percent for r in done) / len(done)
             lines.append(f"mean saving {mean:.1f}%, {saved / 2**30:.1f} GiB reclaimed")

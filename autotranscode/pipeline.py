@@ -51,21 +51,52 @@ class NoSaving(SkipFile):
         self.settings = settings
 
 
-def settings_key(cfg: Config, chain: Toolchain) -> str:
+def _size_settings(cfg: Config, chain: Toolchain) -> dict[str, object]:
+    return {
+        "encode": asdict(cfg.encode),
+        "grain": asdict(cfg.grain),
+        "audio": asdict(cfg.audio),
+        "svt_av1": chain.svtav1_version,
+    }
+
+
+def _digest(settings: dict[str, object]) -> str:
+    return hashlib.sha256(json.dumps(settings, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def size_key(cfg: Config, chain: Toolchain) -> str:
     """A digest of everything that decides how large an encode comes out.
+
+    An estimate stays good while this stays the same.
+    """
+    return _digest(_size_settings(cfg, chain))
+
+
+def settings_key(cfg: Config, chain: Toolchain) -> str:
+    """`size_key` plus the minimum savings.
 
     A file that did not save enough is skipped while this stays the same: trying
     again would spend the same hours to reach the same size.
     """
-    decisive = {
-        "encode": asdict(cfg.encode),
-        "grain": asdict(cfg.grain),
-        "audio": asdict(cfg.audio),
+    return _digest({
+        **_size_settings(cfg, chain),
         "min_saving_percent": cfg.output.min_saving_percent,
         "min_saving_mib": cfg.output.min_saving_mib,
-        "svt_av1": chain.svtav1_version,
-    }
-    return hashlib.sha256(json.dumps(decisive, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    })
+
+
+def by_estimate(sources: list[Path], ledger: Ledger, cfg: Config,
+                chain: Toolchain) -> tuple[list[Path], int]:
+    """Estimated files first, best saving per hour of encoding at the top; then the
+    rest in their usual order. Returns the order and how many had an estimate.
+
+    A run that is stopped early has then spent its hours where they bought the most.
+    """
+    key = size_key(cfg, chain)
+    rate = {source: guess.saved_per_hour
+            for source in sources if (guess := ledger.guess(source, key))}
+    ordered = sorted(sources, key=lambda source: (source not in rate, -rate.get(source, 0.0)))
+    return ordered, len(rate)
 
 
 class StopRequest:
@@ -618,6 +649,7 @@ def _process_all(
     failures = 0
     total = len(sources)
     settings = settings_key(cfg, chain)
+    sizes = size_key(cfg, chain)
 
     for index, source in enumerate(sources, start=1):
         log.info("[%d/%d] %s", index, total, source)
@@ -628,6 +660,10 @@ def _process_all(
         if (tried := ledger.no_saving(source)) and tried.settings == settings:
             log.info("  skipping, did not save enough with the same settings before (%s)",
                      tried.reason)
+            continue
+        guess = ledger.guess(source, sizes)
+        if guess and (short := watch.shortfall(cfg, guess.source_bytes, guess.projected_bytes)):
+            log.info("  skipping, estimated to come out %s", short)
             continue
 
         try:

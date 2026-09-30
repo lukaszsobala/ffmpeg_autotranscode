@@ -8,8 +8,8 @@ import shlex
 import sys
 from pathlib import Path
 
-from . import __version__, config, encode, estimate, grain, pipeline, probe, sample, tools, verify
-from .state import Ledger
+from . import __version__, config, encode, estimate, grain, pipeline, probe, sample, tools, verify, watch
+from .state import Guess, Ledger
 from .util import (
     CommandError,
     child_locale,
@@ -221,6 +221,9 @@ def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain)
     Ordered by bytes saved per hour of encoding rather than by bytes saved: when
     a 4K feature can take many hours, the question is not which file is
     biggest but which hour of encoding is best spent.
+
+    Each result is kept in the ledger. `run` works through a library in the same
+    order and skips the files heading below the minimum savings.
     """
     sources = pipeline.discover(inputs, cfg)
     if not sources:
@@ -229,6 +232,8 @@ def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain)
 
     roots = pipeline.library_roots(inputs)
     work = cfg.work_dir / "estimate"
+    ledger = Ledger(cfg.state_path)
+    key = pipeline.size_key(cfg, chain)
     results: list[estimate.Estimate] = []
     skipped = 0
     for index, source in enumerate(sources, start=1):
@@ -250,6 +255,12 @@ def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain)
             log.warning("  no usable samples; skipping")
             continue
         results.append(result)
+        ledger.record_guess(source, Guess(
+            source=str(source), source_bytes=info.size_bytes,
+            projected_bytes=result.projected_bytes,
+            encode_seconds=result.projected_encode_seconds, crf=result.crf, settings=key,
+            estimated_at=dt.datetime.now().isoformat(timespec="seconds"),
+        ))
         log.info("  %s -> %s (%+.0f%%), %.1f fps, about %s to encode",
                  human_size(info.size_bytes), human_size(result.projected_bytes),
                  -result.saving_percent, result.fps,
@@ -274,8 +285,12 @@ def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain)
 
     saved = sum(r.saved_bytes for r in results)
     hours = sum(r.projected_encode_seconds for r in results) / 3600
+    short = [r for r in results
+             if watch.shortfall(cfg, r.info.size_bytes, r.projected_bytes) is not None]
     if skipped:
         print(f"\n{skipped} file(s) skipped by the same rules `run` uses.")
+    if short:
+        print(f"{len(short)} file(s) fall short of the minimum saving; `run` will skip them.")
     print(f"\n{len(results)} file(s): {human_size(sum(r.info.size_bytes for r in results))} "
           f"-> {human_size(sum(r.projected_bytes for r in results))}, "
           f"saving {human_size(saved)} for about {hours:.0f}h of encoding.")
@@ -289,6 +304,9 @@ def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> 
         log.error("no media files found")
         return 1
     roots = pipeline.library_roots(inputs)
+    ledger = Ledger(cfg.state_path)
+    sources, _ = pipeline.by_estimate(sources, ledger, cfg, chain)
+    key = pipeline.size_key(cfg, chain)
 
     for source in sources:
         print(f"\n=== {source}")
@@ -304,6 +322,12 @@ def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> 
         except pipeline.SkipFile as exc:
             print(f"  SKIP: {exc}")
             continue
+        if guess := ledger.guess(source, key):
+            if short := watch.shortfall(cfg, guess.source_bytes, guess.projected_bytes):
+                print(f"  SKIP: estimated to come out {short}")
+                continue
+            print(f"  estimate: {human_size(guess.projected_bytes)}, "
+                  f"{human_size(int(guess.saved_per_hour))} saved per hour")
         print(f"  output: {out}")
         argv = encode.build_command(info, Path("<encoded.mkv>"), chain, cfg,
                                     Path("<temp>"), "<denoise-if-grainy>")
@@ -399,6 +423,10 @@ def main(argv: list[str] | None = None) -> int:
              len(sources), cfg.machine.profile, cfg.encode.preset, crf, cfg.grain.mode)
 
     ledger = Ledger(cfg.state_path)
+    sources, estimated = pipeline.by_estimate(sources, ledger, cfg, chain)
+    if estimated:
+        log.info("%d of them estimated: those go first, most saved per hour of encoding "
+                 "at the top", estimated)
     try:
         failures = pipeline.process_all(sources, chain, cfg, ledger, dry_run=args.dry_run,
                                         roots=pipeline.library_roots(args.inputs))

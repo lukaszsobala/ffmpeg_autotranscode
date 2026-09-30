@@ -163,7 +163,7 @@ honoured). `-c` overrides it; with neither, the built-in defaults apply.
 |---|---|
 | `doctor` | Check tools and capabilities; explain what is missing |
 | `measure` | The old grain detector's scores (only for `grain.estimator = "grav1synth"`) |
-| `estimate` | Encode a few short excerpts per file and rank a library by what is worth transcoding |
+| `estimate` | Encode a few short excerpts per file and rank a library by what is worth transcoding; `run` then follows that ranking |
 | `verify` | Score an encode against its source where the eye looks: low-pass PSNR, grain retained, worst-frame snapshots |
 | `sample` | Encode a few random minutes of a few random files per resolution band, to check the settings on the rest of a library |
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
@@ -210,6 +210,21 @@ Some Film                       764.6 MiB   48.1 MiB      94%    34m21s   1.2 Gi
 ```
 
 Files are ranked by **saved/h**, bytes saved per hour of encoding.
+
+Each result is kept in the state file, and `run` uses it:
+
+- Estimated files go first, the most saved per hour at the top, and the rest follow
+  in their usual order. A run stopped partway has spent its hours where they bought
+  the most.
+- A file whose estimate misses `output.min_saving_percent` or `output.min_saving_mib`
+  is skipped without encoding. Nothing is recorded against it: a later estimate can
+  change its mind.
+- An estimate counts only while the settings that decide size are the ones it was
+  made with (the `encode`, `grain` and `audio` sections and the SVT-AV1 version) and
+  the file is unchanged. Change any of them and estimate again; until then those
+  files are encoded in their usual order, the early saving check still watching.
+
+`plan` shows the same order and the same skips.
 
 It takes roughly a minute per file. `--samples` and `--seconds` trade accuracy for
 time. The grain table adds nothing measurable to a file's size, so the grain check

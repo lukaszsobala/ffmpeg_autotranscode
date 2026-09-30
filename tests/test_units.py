@@ -25,7 +25,7 @@ from autotranscode import (
 )
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
-from autotranscode.state import Ledger, Record
+from autotranscode.state import Guess, Ledger, Record
 from autotranscode.tools import Toolchain
 from autotranscode.util import MIB, CommandError
 
@@ -2121,3 +2121,79 @@ class TestShortfall(unittest.TestCase):
         before = pipeline.settings_key(self.cfg, make_chain())
         self.cfg.output.min_saving_mib = 50.0
         self.assertNotEqual(before, pipeline.settings_key(self.cfg, make_chain()))
+
+
+class TestEstimatesSteerTheRun(unittest.TestCase):
+    """`estimate` leaves its projections in the ledger; `run` orders by them and
+    skips the files heading below the minimum savings."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = config.Config()
+        self.chain = make_chain()
+        self.ledger = Ledger(self.root / "state.json")
+        self.key = pipeline.size_key(self.cfg, self.chain)
+        self.files = []
+        for name in ("a", "b", "c", "d"):
+            path = self.root / f"{name}.mkv"
+            path.write_bytes(b"x" * 64)
+            self.files.append(path)
+
+    def _guess(self, path: Path, source_mib: float, projected_mib: float, hours: float,
+               settings: str | None = None) -> None:
+        self.ledger.record_guess(path, Guess(
+            source=str(path), source_bytes=int(source_mib * MIB),
+            projected_bytes=int(projected_mib * MIB), encode_seconds=hours * 3600,
+            crf=29.0, settings=settings or self.key))
+
+    def test_guesses_survive_a_reload(self):
+        self._guess(self.files[0], 2000, 500, 2)
+        again = Ledger(self.root / "state.json")
+        guess = present(again.guess(self.files[0], self.key))
+        self.assertEqual(guess.projected_bytes, 500 * MIB)
+        self.assertAlmostEqual(guess.saved_per_hour, 750 * MIB)
+
+    def test_a_guess_made_with_other_settings_is_ignored(self):
+        self._guess(self.files[0], 2000, 500, 2, settings="something-else")
+        self.assertIsNone(self.ledger.guess(self.files[0], self.key))
+
+    def test_a_guess_is_forgotten_when_the_file_changes(self):
+        self._guess(self.files[0], 2000, 500, 2)
+        self.files[0].write_bytes(b"y" * 128)
+        self.assertIsNone(self.ledger.guess(self.files[0], self.key))
+
+    def test_the_thresholds_do_not_invalidate_an_estimate(self):
+        before = pipeline.size_key(self.cfg, self.chain), pipeline.settings_key(self.cfg, self.chain)
+        self.cfg.output.min_saving_mib = 500.0
+        self.assertEqual(before[0], pipeline.size_key(self.cfg, self.chain))
+        self.assertNotEqual(before[1], pipeline.settings_key(self.cfg, self.chain))
+        self.cfg.encode.crf = 25
+        self.assertNotEqual(before[0], pipeline.size_key(self.cfg, self.chain))
+
+    def test_estimated_files_go_first_best_saving_per_hour_on_top(self):
+        a, b, c, d = self.files
+        self._guess(b, 2000, 1000, 10)    # 100 MiB/h
+        self._guess(d, 2000, 1000, 1)     # 1000 MiB/h
+        self._guess(a, 2000, 1000, 1, settings="stale")
+        ordered, estimated = pipeline.by_estimate(self.files, self.ledger, self.cfg, self.chain)
+        self.assertEqual(ordered, [d, b, a, c])
+        self.assertEqual(estimated, 2)
+
+    def test_a_file_estimated_to_fall_short_is_skipped_before_encoding(self):
+        a, b, c, d = self.files
+        self._guess(a, 2000, 1950, 1)     # 2.5% smaller
+        self._guess(b, 300, 250, 1)       # 50 MiB smaller
+        self._guess(c, 2000, 500, 1)
+        encoded = []
+
+        def fake_process_one(source, *_args, **_kwargs):
+            encoded.append(source)
+            return Record(source=str(source), status="done")
+
+        with unittest.mock.patch.object(pipeline, "process_one", fake_process_one):
+            pipeline._process_all(self.files, self.chain, self.cfg, self.ledger,
+                                  pipeline.StopRequest())
+        self.assertEqual(encoded, [c, d])
+        self.assertIsNone(self.ledger.get(a), "a guess is not a verdict: nothing is recorded")
