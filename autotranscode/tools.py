@@ -229,8 +229,9 @@ def _missing_svt_options(chain: Toolchain, cfg: Config) -> list[str]:
     These are not extras to skip quietly. The CRF curve was set with them on:
     1080p at CRF 29 needs the dark bias for dark scenes, and ac-bias and a weak
     temporal filter for detail in motion; 4K at CRF 30 needs variance boost and
-    the same two, or its fog comes out blotchy. An older SvtAv1EncApp -- distribution packages
-    lag well behind -- would give exactly those encodes, with nothing to say so.
+    the same two, or its fog comes out blotchy. An older SvtAv1EncApp --
+    distribution packages lag well behind -- would give exactly those encodes,
+    with nothing to say so.
     """
     def used(value: float | dict[str, float], off: float = 0) -> bool:
         return any(v > off for v in (value.values() if isinstance(value, dict) else [value]))

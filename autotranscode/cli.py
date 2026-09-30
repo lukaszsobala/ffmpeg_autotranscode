@@ -70,7 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
                               help="excerpts per file (default: 3-6, by runtime)")
     estimate_cmd.add_argument("--seconds", type=int, help="seconds per excerpt")
     estimate_cmd.add_argument("--no-grain-probe", action="store_true",
-                              help="skip the grain check; faster, and wrong on grainy films")
+                              help="skip the grain check (it only runs with "
+                                   "grain.denoise_before_encode on)")
 
     sample_cmd = sub.add_parser(
         "sample",
@@ -184,11 +185,14 @@ def cmd_measure(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) 
         print(f"{name:<48} {report.mean_psnr:>8.2f}  "
               f"{report.grainy!s:<7} {report.denoise_filter or '-'}")
 
-    print(
-        f"\nCurrent threshold: grain.threshold_db = {cfg.grain.threshold_db}\n"
-        "Files below it take the denoise + grain-synthesis route. Adjust the threshold\n"
-        "so it lands between your visibly clean and visibly grainy titles."
-    )
+    print(f"\nCurrent threshold: grain.threshold_db = {cfg.grain.threshold_db}")
+    if grain.needs_probe(cfg):
+        print("Files below it take the grain route. Adjust the threshold so it lands\n"
+              "between your visibly clean and visibly grainy titles.")
+    else:
+        print("With these settings the score decides nothing: every film gets a grain\n"
+              "table, and calibration after the encode decides how much to keep. It only\n"
+              "matters with grain.estimator = \"grav1synth\" or grain.denoise_before_encode.")
     return 0
 
 

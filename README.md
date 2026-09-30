@@ -209,12 +209,12 @@ file                                 size   estimate   saving    encode   saved/
 Some Film                       764.6 MiB   48.1 MiB      94%    34m21s   1.2 GiB  32
 ```
 
-Files are ranked by **saved/h**, bytes saved per hour of encoding. `+grain` after
-the CRF means the grain route was chosen.
+Files are ranked by **saved/h**, bytes saved per hour of encoding.
 
 It takes roughly a minute per file. `--samples` and `--seconds` trade accuracy for
-time, and `--no-grain-probe` skips the grain check — faster, and wrong on exactly
-the films where grain matters most.
+time. The grain table adds nothing measurable to a file's size, so the grain check
+only runs with `grain.denoise_before_encode` on, where a grainy film is sampled
+denoised; `+grain` after the CRF marks those, and `--no-grain-probe` skips the check.
 
 Rank a library with it; do not quote its numbers. On a 4K test film it predicted a
 93.7% saving against 93.1% achieved, and an encode time of 34 minutes against an

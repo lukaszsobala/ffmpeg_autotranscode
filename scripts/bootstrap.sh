@@ -24,7 +24,7 @@ set -euo pipefail
 # (Debian 13 has 2.3.0, without the dark bias the 1080p setting depends on), and
 # a release can move quality at the same CRF. The per-resolution settings were
 # judged on 4.0.0; 4.2.0 matched them within 0.2 dB on the 1080p excerpts and
-# encodes 5-10% faster on ARM. Re-check the ladder on a few excerpts when moving this.
+# encodes 5-10% faster on ARM. Re-check the CRF curve on a few excerpts when moving this.
 SVT_AV1_VERSION="${SVT_AV1_VERSION:-v4.2.0}"
 ZIMG_VERSION="${ZIMG_VERSION:-release-3.0.6}"
 # Pinned deliberately, not lazily. R73 onward added Vulkan GPU filters whose
@@ -34,6 +34,9 @@ ZIMG_VERSION="${ZIMG_VERSION:-release-3.0.6}"
 # that code, and since nothing here ever calls VapourSynth, newer buys us nothing.
 # (macOS takes Homebrew's VapourSynth instead, which builds there.)
 VAPOURSYNTH_VERSION="${VAPOURSYNTH_VERSION:-R72}"
+# The version autotranscode's Av1an flags and its ffmpeg shim were written against
+# (see FFMPEG_SHIM in autotranscode/encode.py); its options change between releases.
+AV1AN_VERSION="${AV1AN_VERSION:-0.5.2}"
 # Built from the crate with a local patch; see stage_grav1synth.
 GRAV1SYNTH_VERSION="${GRAV1SYNTH_VERSION:-0.2.0}"
 # L-SMASH-Works tags stopped in 2023; this is the commit tested here (2026-09).
@@ -199,7 +202,7 @@ stage_svtav1() {
   [[ -x $svt ]] || die "SvtAv1EncApp not found at ${svt} after install"
   "$svt" --version | head -1
   # Homebrew's ffmpeg brings its own svt-av1, whose SvtAv1EncApp may come first on
-  # PATH. Name ours in the config so the version the ladder was tuned on is used.
+  # PATH. Name ours in the config so the version the settings were tuned on is used.
   if [[ $(command -v SvtAv1EncApp || true) != "$svt" ]]; then
     warn "PATH finds $(command -v SvtAv1EncApp || echo 'no SvtAv1EncApp'), not this build."
     warn "Point the config at it: paths.svtav1encapp = \"${svt}\""
@@ -312,7 +315,7 @@ stage_av1an() {
   # then lets the finished binary find the libraries without LD_LIBRARY_PATH.
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
   RUSTFLAGS="-L $PREFIX/lib -C link-arg=-Wl,-rpath,$PREFIX/lib" \
-    cargo install av1an --locked
+    cargo install av1an --version "$AV1AN_VERSION" --locked
   av1an --version | head -1
 }
 

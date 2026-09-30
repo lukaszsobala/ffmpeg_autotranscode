@@ -780,6 +780,7 @@ class TestStopAndResume(unittest.TestCase):
 
         def encoded(*_args, **_kwargs):
             (work / "encoded.mkv").write_bytes(b"e" * 4096)
+            final.parent.mkdir(parents=True, exist_ok=True)
             final.write_bytes(b"theirs")
 
         def fake_mux(video, info, out, chain, cfg, dry_run=False):
@@ -805,6 +806,32 @@ class TestStopAndResume(unittest.TestCase):
                                  "the staged copy has served its purpose")
                 final.unlink()
                 kept.unlink()
+
+    def test_a_file_that_is_not_written_leaves_no_folders(self):
+        # A mirrored output directory would otherwise fill with empty folders.
+        self._stub_probe()
+        self.cfg.staging.enabled = False
+        self.cfg.output.directory = str(self.root / "out")
+        roots = [self.root]
+        work = pipeline._work_dir(self.source, self.cfg)
+
+        def encoded(*_args, **_kwargs):
+            (work / "encoded.mkv").write_bytes(b"e" * 4096)
+
+        def fake_mux(video, info, out, chain, cfg, dry_run=False):
+            Path(out).write_bytes(b"o" * 8192)   # larger than the source
+            return out
+
+        self._stub_encode(encoded)
+        original_mux = pipeline.mux.mux
+        pipeline.mux.mux = fake_mux
+        self.addCleanup(setattr, pipeline.mux, "mux", original_mux)
+
+        pipeline.process_one(self.source, make_chain(), self.cfg, dry_run=True, roots=roots)
+        self.assertFalse((self.root / "out").exists(), "a dry run writes nothing")
+        with self.assertRaises(pipeline.NoSaving):
+            pipeline.process_one(self.source, make_chain(), self.cfg, roots=roots)
+        self.assertFalse((self.root / "out" / "library").exists())
 
     def test_an_output_that_appears_during_the_encode_is_a_failure(self):
         # A failure shows in the run's summary and exit code, where a skip would not.
@@ -1032,6 +1059,14 @@ class TestCrfCurve(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
             config.validate(self.cfg)
 
+    def test_whole_numbers_in_the_file_become_floats_where_floats_are_wanted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text("[encode]\ncrf_per_doubling = 3\n[output]\nmin_saving_percent = 5\n")
+            cfg = config.load(path)
+        self.assertIsInstance(cfg.encode.crf_per_doubling, float)
+        self.assertIsInstance(cfg.output.min_saving_percent, float)
+
     def test_the_old_ladder_table_is_refused_with_directions(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.toml"
@@ -1161,6 +1196,33 @@ class TestMuxOutput(unittest.TestCase):
         argv = mux.build_command(Path("/w/encoded.mkv"), make_info(),
                                  Path("/out/Film.av1.webm.part"), make_chain(), cfg)
         self.assertEqual(argv[-3:-1], ["-f", "webm"])
+
+    def _mux(self, *subs: str, mode: str = "copy") -> list[str]:
+        cfg = config.Config()
+        cfg.subtitles.mode = mode
+        info = make_info(subtitles=[probe.Stream(index=2 + n, codec=codec, codec_type="subtitle")
+                                    for n, codec in enumerate(subs)])
+        return mux.build_command(Path("/w/encoded.mkv"), info, Path("/out/F.av1.mkv.part"),
+                                 make_chain(), cfg)
+
+    def test_an_mp4_text_track_becomes_srt(self):
+        # Matroska refuses mov_text, which failed the mux after the whole encode.
+        argv = self._mux("hdmv_pgs_subtitle", "mov_text")
+        self.assertIn("-c:s:1", argv)
+        self.assertEqual(argv[argv.index("-c:s:1") + 1], "srt")
+        self.assertNotIn("-c:s:0", argv)
+
+    def test_text_only_counts_the_tracks_it_keeps(self):
+        # The second kept track is output subtitle 1, whatever its place in the source.
+        argv = self._mux("hdmv_pgs_subtitle", "subrip", "mov_text", mode="text-only")
+        maps = [argv[i + 1] for i, a in enumerate(argv) if a == "-map"]
+        self.assertIn("1:s:1", maps)
+        self.assertIn("1:s:2", maps)
+        self.assertNotIn("1:s:0", maps)
+        self.assertEqual(argv[argv.index("-c:s:1") + 1], "srt")
+
+    def test_fonts_come_along_with_the_subtitles(self):
+        self.assertIn("1:t?", self._mux("ass"))
 
 
 class TestPixelAspect(unittest.TestCase):

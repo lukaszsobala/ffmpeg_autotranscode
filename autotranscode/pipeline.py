@@ -2,8 +2,9 @@
 
 The whole pipeline for one file:
 
-    probe -> skip checks -> grain probe -> grain table -> Av1an encode
-          -> grav1synth apply -> mux audio/subs/chapters -> size sanity check
+    probe -> skip checks -> grain table -> Av1an encode (stopped early if it will
+          not save enough) -> grav1synth apply, calibrated to the source's grain
+          -> mux audio/subs/chapters -> size check -> move into place
 
 Each step delegates to a tool that already does that job well; this module decides
 what to run and what to do when a step declines to help.
@@ -362,7 +363,6 @@ def process_one(
 
     final = output_path(info, cfg, roots)
     check_skip(info, final, cfg)
-    final.parent.mkdir(parents=True, exist_ok=True)
 
     # Everything above is keyed to the real source: the output path, the work
     # directory digest that makes Av1an resumable, and the ledger entry. Only the
@@ -433,12 +433,12 @@ def _transcode(
     table: Path | None = None
 
     if cfg.grain.mode != "never":
-        wanted = True
+        grainy = True
         if grain.needs_probe(cfg):
             report = grain.measure(read, chain, cfg, work)
             log.info("  %s", report.describe(denoising=cfg.grain.denoise_before_encode))
-            wanted = report.grainy
-        if wanted and not dry_run:
+            grainy = report.grainy
+        if grainy and not dry_run:
             table = grain.build_table(read, chain, cfg, report, work)
             if table is None:
                 log.warning("  no grain table; encoding without denoising to avoid losing grain")
@@ -496,6 +496,9 @@ def _transcode(
     # Never mux straight to the destination name. An interrupt partway through
     # would leave a short file there, and the next run's "output already exists"
     # check would read it as finished -- silently shipping a truncated film.
+    # The output's folders are made only now, so that a dry run or a skipped file
+    # leaves no empty ones behind in a mirrored output directory.
+    made = _make_folders(final.parent) if staged_out is None else []
     muxed = staged_out if staged_out is not None else final.with_name(final.name + ".part")
     muxed.unlink(missing_ok=True)
     mux.mux(video, read, muxed, chain, cfg)
@@ -505,6 +508,7 @@ def _transcode(
 
     if saving < cfg.output.min_saving_percent:
         muxed.unlink(missing_ok=True)
+        _remove_if_empty(made)
         _cleanup(work, cfg, table)
         raise NoSaving(
             f"only {saving:.1f}% smaller, below the {cfg.output.min_saving_percent:.0f}% threshold",
@@ -515,10 +519,11 @@ def _transcode(
     # run or a copy by hand may have put a file under this name since.
     # Neither file is thrown away: the encode goes beside it, and the file is
     # reported as failed so that someone decides which to keep.
-    wanted = final
-    if wanted.exists():
-        final = unused_name(wanted)
+    intended = final
+    if intended.exists():
+        final = unused_name(intended)
     if staged_out is not None:
+        _make_folders(final.parent)
         log.info("  writing %s to %s", human_size(output_bytes), final.parent)
         # shutil.move, not os.replace: staging is normally on a different
         # filesystem from the library, so this is a copy-and-delete.
@@ -534,10 +539,10 @@ def _transcode(
         # does not exist or is the complete file, never anything in between.
         os.replace(muxed, final)
 
-    if final != wanted:
+    if final != intended:
         _cleanup(work, cfg, table)
         raise OutputExists(
-            f"{wanted.name} appeared during the encode, so this encode was kept as "
+            f"{intended.name} appeared during the encode, so this encode was kept as "
             f"{final.name} beside it; keep one and delete the other"
         )
 
@@ -564,6 +569,25 @@ def _transcode(
         seconds=elapsed,
         finished_at=dt.datetime.now().isoformat(timespec="seconds"),
     )
+
+
+def _make_folders(folder: Path) -> list[Path]:
+    """mkdir -p, returning the folders it made, deepest first."""
+    made: list[Path] = []
+    for parent in (folder, *folder.parents):
+        if parent.exists():
+            break
+        made.append(parent)
+    folder.mkdir(parents=True, exist_ok=True)
+    return made
+
+
+def _remove_if_empty(folders: list[Path]) -> None:
+    for folder in folders:
+        try:
+            folder.rmdir()
+        except OSError:
+            return
 
 
 def _cleanup(work: Path, cfg: Config, table: Path | None) -> None:

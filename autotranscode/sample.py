@@ -1,7 +1,7 @@
 """Encode random minutes of random films, a few per resolution band, for the eye.
 
-Every setting in the resolution table was tuned on one film per band, so each
-row is only as good as that film was typical. This checks them against the rest
+Every resolution setting was tuned on one film per band, so each is only as
+good as that film was typical. This checks them against the rest
 of a library: pick a few titles at random from each band, cut a few minutes from
 a random point in each, run the real pipeline over them, and put the excerpt,
 its encode, the scores and snapshots of the worst frames side by side.
@@ -87,7 +87,6 @@ class Result:
 
     def kbps(self, size: int) -> float:
         return size * 8 / self.seconds_long / 1000 if self.seconds_long else 0.0
-
 
 
 def band_edges() -> list[int]:
@@ -264,6 +263,8 @@ def encode_pick(
                    pq=info.color_transfer == "smpte2084")
     except pipeline.SkipFile as exc:
         result.ok, result.error = False, f"skipped: {exc}"
+    except pipeline.OutputExists as exc:
+        result.ok, result.error = False, str(exc)
     except (CommandError, OSError, ValueError) as exc:
         result.ok, result.error = False, _reason(exc)
     saved.write_text(json.dumps(asdict(result), indent=1), encoding="utf-8")

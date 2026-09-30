@@ -188,9 +188,9 @@ class Estimate:
     min_samples: int = 3
     max_samples: int = 6
     sample_seconds: int = 10
-    # Probe grain first, so a grainy film is sampled on the denoise route it would
-    # really take. Costs a few seconds per file and changes the answer a lot on the
-    # files where grain synthesis is the whole point.
+    # With grain.denoise_before_encode on, probe grain first, so that a grainy film
+    # is sampled denoised, as the real run would encode it. Without that denoise the
+    # grain route changes nothing about size, and the probe does not run.
     grain_probe: bool = True
 
 
@@ -203,7 +203,9 @@ class Grain:
     denoise_filter: str = "hqdn3d"  # hqdn3d | nlmeans | atadenoise
     denoise_strength: str = "auto"  # "auto" or an explicit filter argument string
     # Mean PSNR (dB) between source and its denoised self, measured on samples.
-    # Lower => the denoiser removed more => more grain. Below this we take the grain route.
+    # Lower => the denoiser removed more => more grain. Below this the old detector
+    # takes the grain route; it only runs for the grav1synth estimator or a denoise
+    # before the encode (see grain.needs_probe). Otherwise calibration decides.
     threshold_db: float = 44.0
     keep_table: bool = True
     # Denoise the picture before encoding when a grain table will put grain back.
@@ -352,9 +354,11 @@ def _apply_section(obj: Any, values: dict[str, Any], where: str) -> None:
     for key, value in values.items():
         if key not in known:
             raise ConfigError(f"unknown option '{key}' in [{where}]")
+        # tomllib gives ints for whole numbers; widen to float where the field wants
+        # one. The annotation is a string here, not the type: this module defers them.
         expected = known[key].type
-        # tomllib gives ints for whole numbers; widen to float where the field wants one.
-        if expected is float and isinstance(value, int) and not isinstance(value, bool):
+        if expected in (float, "float") and isinstance(value, int) \
+                and not isinstance(value, bool):
             value = float(value)
         setattr(obj, key, value)
 

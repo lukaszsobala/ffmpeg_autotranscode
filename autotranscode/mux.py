@@ -13,6 +13,11 @@ from .util import log, run
 # Subtitle codecs that are plain text; the rest are bitmap (PGS, VobSub).
 TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 
+# Text subtitles Matroska cannot hold, and what each becomes instead. MP4's own
+# text track fails the mux ("Subtitle codec mov_text is not supported") -- after
+# the whole encode has been paid for.
+MKV_SUBTITLE_CONVERSIONS = {"mov_text": "srt"}
+
 # Formats where re-encoding to Opus is a clear win: lossless or legacy-bloated.
 WASTEFUL_AUDIO = {"truehd", "dts", "pcm_s16le", "pcm_s24le", "pcm_bluray", "mlp", "wmapro"}
 
@@ -81,17 +86,22 @@ def _audio_args(info: MediaInfo, cfg: Config) -> list[str]:
     return args
 
 
-def _subtitle_maps(info: MediaInfo, cfg: Config) -> tuple[list[str], list[str]]:
-    if cfg.subtitles.mode == "none" or not info.subtitles:
-        return [], []
-    if cfg.subtitles.mode == "copy":
-        return ["-map", "1:s?"], ["-c:s", "copy"]
+def _subtitle_args(info: MediaInfo, cfg: Config) -> tuple[list[str], list[str]]:
+    """(-map options, codec options) for the subtitle tracks kept.
 
+    Copied, except for a text format Matroska cannot hold, which is converted.
+    """
+    if cfg.subtitles.mode == "none":
+        return [], []
+    kept = [(position, stream) for position, stream in enumerate(info.subtitles)
+            if cfg.subtitles.mode == "copy" or stream.codec in TEXT_SUBTITLE_CODECS]
     maps: list[str] = []
-    for position, stream in enumerate(info.subtitles):
-        if stream.codec in TEXT_SUBTITLE_CODECS:
-            maps += ["-map", f"1:s:{position}"]
-    return (maps, ["-c:s", "copy"]) if maps else ([], [])
+    codecs: list[str] = ["-c:s", "copy"] if kept else []
+    for out, (position, stream) in enumerate(kept):
+        maps += ["-map", f"1:s:{position}"]
+        if (target := MKV_SUBTITLE_CONVERSIONS.get(stream.codec)) is not None:
+            codecs += [f"-c:s:{out}", target]
+    return maps, codecs
 
 
 # output.container -> ffmpeg muxer name.
@@ -112,7 +122,7 @@ def build_command(
     video: Path, info: MediaInfo, output: Path, chain: Toolchain, cfg: Config
 ) -> list[str]:
     """Mux the encoded video (input 0) with everything else from the source (input 1)."""
-    sub_maps, sub_codec = _subtitle_maps(info, cfg)
+    sub_maps, sub_codec = _subtitle_args(info, cfg)
     argv = [
         chain.ffmpeg, "-hide_banner", "-v", "warning", "-y",
         "-i", str(video),
@@ -122,6 +132,10 @@ def build_command(
     if info.audio:
         argv += ["-map", "1:a?"]
     argv += sub_maps
+    # Attachments: the fonts an ASS subtitle track is styled with. Without them
+    # a player falls back to its own font, and the subtitles lose their look.
+    if cfg.output.container == "mkv":
+        argv += ["-map", "1:t?"]
     argv += ["-c:v", "copy"]
     if aspect := display_aspect(info):
         # AV1 has no pixel-shape field for ffmpeg to copy, so without this a 4:3
@@ -131,8 +145,9 @@ def build_command(
     argv += sub_codec
     argv += [
         "-map_chapters", "1",
+        # Keep the title and tags. Track names and languages come with each mapped
+        # stream, and Jellyfin relies on them for selection.
         "-map_metadata", "1",
-        # Keep track names and languages, which Jellyfin relies on for selection.
         "-disposition:v:0", "default",
         # Named, not inferred: the pipeline writes to "<name>.part" and renames it
         # into place, and ffmpeg cannot pick a muxer from a .part extension.

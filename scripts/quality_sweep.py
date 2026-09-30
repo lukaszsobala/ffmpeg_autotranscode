@@ -457,8 +457,9 @@ def main() -> int:
                              "the cutting, for another round of variants on the same footage")
     parser.add_argument("--variant", action="append", default=[], metavar="SPEC",
                         help="an extra variant, as one quoted string: "
-                             "'NAME CRF GRAIN [SVT PARAMS...]', e.g. "
-                             "'H-crf30-qm 30 never --enable-qm 1'. Repeatable.")
+                             "'NAME CRF GRAIN [section.key=value...] [SVT PARAMS...]', e.g. "
+                             "'H-crf30-qm 30 never encode.ac_bias=0 --enable-qm 1'. "
+                             "Repeatable.")
     parser.add_argument("--rescore", action="store_true",
                         help="re-measure the outputs of an earlier sweep in --out, without "
                              "encoding anything: for when the measurements change")
@@ -501,8 +502,11 @@ def main() -> int:
             # and the worst for grain loss, which is a different scene more often
             # than not -- this film lost 30% of its grain in one place and 64% in
             # another.
-            margin = max(window, len(stage1.xpsnr) // 50)
-            blocky = verify.worst_windows(stage1.xpsnr, window, max(1, args.windows - 1), margin)
+            # Blocking by the low-pass measure: XPSNR forgives it under grain (see
+            # verify.lowpass_psnr), which is why verify ranks worst frames the same way.
+            structural = stage1.lowpass or stage1.xpsnr
+            margin = max(window, len(structural) // 50)
+            blocky = verify.worst_windows(structural, window, max(1, args.windows - 1), margin)
             grainless = (verify.worst_windows(stage1.grain_by_frame, window, 1, margin, blocky)
                          if stage1.grain_by_frame and args.windows > 1 else [])
             frames = sorted(blocky + grainless)
