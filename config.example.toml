@@ -50,7 +50,7 @@ state_file = "~/.cache/autotranscode/state.json"
 [encode]
 preset = 4          # SVT-AV1 preset, -1 (slowest) .. 13. Each step is ~1.5-2.2x speed.
 crf = 30            # 1..70. Lower is higher quality and bigger. This is the
-                    # value for a 4K source; crf_by_width shifts it elsewhere.
+                    # value for a 4K source, and the most any source gets.
 pix_format = "yuv420p10le"   # 10-bit even from 8-bit sources: cheap, and avoids banding.
 tune = 0            # 0 = VQ (subjective quality), 2 = SSIM. Use 0 for watching.
 variance_boost_curve = "auto" # "auto" uses SVT-AV1's PQ curve (2) for HDR10, else 0.
@@ -78,24 +78,28 @@ extra_svt_params = []
 
 # CRF is a quality target per coded pixel, and it is not resolution-neutral: a
 # pixel at 576p is magnified far more on the same screen than one at 2160p, so a
-# single CRF across a mixed library makes the small files look the worst. These
-# are shifts applied to `crf` above, keyed by the smallest width in each band.
-# Delete the table to encode everything at one CRF.
+# single CRF across a mixed library makes the small files look the worst. So the
+# CRF follows a curve over width, relative to `crf` above and never above it:
 #
-# Keyed by width, with slack, because a scope film is cropped to its picture: a
-# 4K print can be 3840x1600 or 3836x2072, and keying on height would file it as
-# 1080p and under-encode it. Cropping removes bars top and bottom, not the sides.
-# A picture narrower than 16:9 goes by its height instead (1440x1080 4:3 HD is
-# 1080p, 960x720 is 720p), and non-square pixels by their shown width.
-[encode.crf_by_width]
-3000 = 0            # 4K. crf 30 with variance boost: the highest free of blocks on 4K HDR.
-1700 = -1           # 1080p: 29, with the dark bias, ac-bias and tf strength below.
-                    # At 37 rain vanished and faces smeared; 30 fixed that, 29 is margin.
-1100 = -3           # 720p
-0 = -6              # 576p and below
+#   crf = clamp(24 + 3.5 * log2(width / 720), 23, 30)     at crf 30, in 0.25 steps
+#
+# SD (720 wide) 24, NTSC DVD 24.75, PAL DVD 25.75, 720p 27, 1080p 29, and 30 from
+# about 2360 wide up. 4K blocked in fog above 30; 1080p was blocky in a dark scene
+# at 32, held at 30, and has 29 for margin; 720p at 27 and SD at 24 looked like
+# their sources. Set both of the first two to 0 to encode everything at `crf`.
+#
+# Width, because a scope film is cropped to its picture: a 4K print can be
+# 3840x1600 or 3836x2072, and its height would place it at 1080p. Cropping removes
+# bars top and bottom, not the sides. A picture narrower than 16:9 goes by its
+# height instead (1440x1080 4:3 HD counts as 1920, 960x720 as 1280, a DVD as
+# 1024 or 853), and non-square pixels by their shown width.
+crf_per_doubling = 3.5   # CRF added per doubling of width
+crf_drop_at_720 = 6.0    # how far below `crf` the curve is at 720 wide
+crf_max_drop = 7.0       # never further below `crf` than this
 
-# The next two take either one number for everything or a table like the one
-# above, where a source gets the value of the band it falls in.
+# The next settings take either one number for everything or a table keyed by
+# width, where a source gets the value of the band it falls in: 3000 is 4K, 1700
+# 1080p, 1100 720p, 0 everything below.
 
 # Variance boost: 0 off, 1-4 on. Spends more bits on flat areas. The only setting
 # that removed blocking in fog and flat areas on a grainy 4K HDR film; more bits

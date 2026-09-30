@@ -68,7 +68,7 @@ class Result:
     id: str
     ok: bool = False
     error: str = ""
-    crf: int = 0
+    crf: float = 0
     svt: list[str] = field(default_factory=list)
     source_bytes: int = 0
     encoded_bytes: int = 0
@@ -90,20 +90,19 @@ class Result:
 
 
 
-def band_edges(cfg: Config) -> list[int]:
-    """Lower edges of the bands, widest first: the CRF ladder's, or the defaults'."""
-    keys = cfg.encode.crf_by_width or {str(edge): 0 for edge in BAND_NAMES}
-    return sorted((int(key) for key in keys), reverse=True)
+def band_edges() -> list[int]:
+    """Lower edges of the bands, widest first."""
+    return sorted(BAND_NAMES, reverse=True)
 
 
 def band_name(edge: int) -> str:
     return BAND_NAMES.get(edge, f"{edge}px+")
 
 
-def band_of(info: MediaInfo, cfg: Config) -> str:
-    """The band `info` is encoded as, named: the same rule the settings use."""
+def band_of(info: MediaInfo) -> str:
+    """The band `info` falls in, named, by the width the settings go by."""
     width = encode.band_width(info)
-    edges = band_edges(cfg)
+    edges = band_edges()
     return band_name(next((edge for edge in edges if width >= edge), edges[-1]))
 
 
@@ -165,7 +164,7 @@ def pick(
         except (CommandError, OSError, ValueError) as exc:
             log.debug("cannot probe %s: %s", path, exc)
             continue
-        band = band_of(info, cfg)
+        band = band_of(info)
         if not wanted.get(band):
             continue
         try:
@@ -337,7 +336,7 @@ def write_report(root: Path, header: list[str], picks: list[Pick],
         lines.append(
             f"| {p.id} | {film} | {what} | {human_duration(p.start)} "
             f"| {r.kbps(r.source_bytes):,.0f} | {r.kbps(r.encoded_bytes):,.0f} "
-            f"| {r.saving:.0f}% | {r.crf} | {_db(r.lowpass_mean)} | {_db(r.lowpass_p5)} "
+            f"| {r.saving:.0f}% | {encode.crf_text(r.crf)} | {_db(r.lowpass_mean)} | {_db(r.lowpass_p5)} "
             f"| {_db(r.lowpass_min)} | {grain} | {human_duration(r.encode_seconds)} |")
 
     by_band: dict[str, list[Result]] = defaultdict(list)

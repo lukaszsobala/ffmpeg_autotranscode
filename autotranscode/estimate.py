@@ -10,7 +10,7 @@ Two things make the result trustworthy enough to rank a library by:
 1. The comparison is against the source's *actual* bytes in those intervals,
    summed from the packet sizes, not against an average bitrate. Sampling a quiet
    stretch of a film with a bursty bitrate would otherwise flatter the result.
-2. The excerpts are encoded with the same CRF ladder, the same SVT parameters and
+2. The excerpts are encoded with the same CRF curve, the same SVT parameters and
    the same denoise decision as a real run, so the ratio comes from the pipeline
    being estimated rather than a generic one.
 
@@ -39,7 +39,7 @@ class Estimate:
     """What sampling `info` suggests a full encode would do."""
 
     info: MediaInfo
-    crf: int
+    crf: float
     denoise: str
     sample_seconds: float = 0.0
     source_sampled: int = 0
@@ -141,7 +141,7 @@ def _sampled_source_bytes(info: MediaInfo, chain: Toolchain, start: float, lengt
 
 def _encode_sample(
     info: MediaInfo, chain: Toolchain, cfg: Config, start: float, length: float,
-    crf: int, denoise: str, out: Path,
+    crf: float, denoise: str, out: Path,
 ) -> tuple[int, float]:
     """Encode one excerpt with the real settings. Returns (bytes, wall seconds).
 

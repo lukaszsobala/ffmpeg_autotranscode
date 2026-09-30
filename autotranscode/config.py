@@ -30,7 +30,7 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         # real step (4x4 blocks and compound inter prediction), at ~22h per 2h film.
         # crf 30 is the 4K anchor: with variance boost on, it was the highest that
         # kept a grainy 4K HDR film's fog and flat paper free of blocks (34 and 38
-        # brought them back). The resolution ladder shifts the other bands from it.
+        # brought them back). The resolution curve lowers it for smaller sources.
         "encode": {"preset": 4, "crf": 30, "chunk_method": "auto"},
         "grain": {"samples": 4, "sample_seconds": 2},
         "target_quality": {"enabled": False},
@@ -70,32 +70,41 @@ class Machine:
 @dataclass(slots=True)
 class Encode:
     preset: int = 6
-    # The CRF for a 4K source. Other resolutions shift from it by crf_by_width,
-    # so this one number still moves the whole library's quality.
+    # The CRF for a 4K source, and the most any source gets. Smaller sources get
+    # less along the curve below, which is relative to this, so this one number
+    # still moves the whole library's quality.
     crf: int = 30
     # CRF is not resolution-neutral: a coded pixel at 576p covers far more of the
     # screen than one at 2160p, so the same CRF looks progressively worse the
-    # smaller the source. Keys are the smallest width in each band, values the
-    # shift applied to `crf` there. An empty table disables the ladder.
+    # smaller the source. The curve: crf_drop_at_720 below `crf` at 720 wide,
+    # rising crf_per_doubling with each doubling of width, never above `crf` and
+    # never more than crf_max_drop below it, in the encoder's 0.25 steps. At the
+    # defaults that is
     #
-    # Width, not height, and with slack below each nominal size: a scope film is
-    # cropped to its picture, so a 4K print is 3840x1600 or even 3836x2072, and a
-    # height-keyed ladder would file it as 1080p and under-encode it. Cropping
-    # takes the bars off the top and bottom, so width is what stays put. A
-    # picture narrower than 16:9 is filed by its height instead; see
-    # encode.band_width.
+    #   crf = clamp(24 + 3.5 * log2(width / 720), 23, 30)
     #
-    # 1080p is one step below 4K. It once sat at 37 on the strength of the dark
-    # bias below, which held a dark scene together but not detail in motion: rain
-    # vanished and faces smeared on a second film. CRF 30 and what ac_bias
-    # describes fixed that; 29 is a step of margin, so every band steps down.
-    crf_by_width: dict[str, int] = field(
-        default_factory=lambda: {"3000": 0, "1700": -1, "1100": -3, "0": -6}
-    )
+    # SD 24, 720p 27, 1080p 29, and 30 from about 2360 wide up. Those are the
+    # points found by eye: 4K blocked in fog above 30; 1080p was blocky in a dark
+    # scene at 32 and held at 30, with 29 as margin; 720p at 27 and SD at 24
+    # looked like their sources (higher was not tried). The three lower points lie
+    # on a log line; 4K sits below it, which is what the cap is for. 1080p once
+    # sat at 37 on the strength of the dark bias below, which held a dark scene
+    # together but not detail in motion: rain vanished and faces smeared on a
+    # second film. See ac_bias for what fixed it. Both at 0 is one CRF for all.
+    #
+    # Width, not height: a scope film is cropped to its picture, so a 4K print is
+    # 3840x1600 or even 3836x2072, and height would place it at 1080p and
+    # under-encode it. Cropping takes the bars off the top and bottom, so width is
+    # what stays put. A picture narrower than 16:9 goes by its height instead;
+    # see encode.band_width.
+    crf_per_doubling: float = 3.5
+    crf_drop_at_720: float = 6.0
+    crf_max_drop: float = 7.0
     pix_format: str = "yuv420p10le"
     tune: int = 0  # 0=VQ (subjective), 2=SSIM
     # 0 = off, 1-4 = on at that strength. Either one number, or a table keyed by
-    # width like crf_by_width, taking the value of the band a source falls in.
+    # width, taking the value of the band a source falls in: "3000" is 4K, "1700"
+    # 1080p, "1100" 720p, "0" everything below.
     #
     # On at 4K only. The only setting that removed the flat 64px blocks in fog and
     # on paper on the grainy 4K test film: CRF 18 without it was as blocky as
@@ -413,6 +422,12 @@ def load(path: Path | None) -> Config:
     _merge_profile(cfg, profile)
     cfg.machine.profile = profile
 
+    if "crf_by_width" in raw.get("encode", {}):
+        raise ConfigError(
+            "encode.crf_by_width is gone: CRF now follows a curve over width "
+            "(encode.crf_per_doubling, crf_drop_at_720, crf_max_drop; see "
+            "config.example.toml). Delete the table to use the default curve"
+        )
     for section, values in raw.items():
         if not hasattr(cfg, section):
             raise ConfigError(f"unknown config section [{section}]")
@@ -452,14 +467,14 @@ def validate(cfg: Config) -> None:
         raise ConfigError("encode.preset must be between -1 and 13")
     if not 1 <= cfg.encode.crf <= 70:
         raise ConfigError("encode.crf must be between 1 and 70 (SVT-AV1 range)")
-    for width, shift in cfg.encode.crf_by_width.items():
-        if not str(width).isdigit():
-            raise ConfigError(f"encode.crf_by_width keys must be widths; got '{width}'")
-        if not 1 <= cfg.encode.crf + shift <= 70:
-            raise ConfigError(
-                f"encode.crf_by_width['{width}'] puts CRF outside 1-70 "
-                f"(encode.crf {cfg.encode.crf} {shift:+d})"
-            )
+    for name in ("crf_per_doubling", "crf_drop_at_720", "crf_max_drop"):
+        if getattr(cfg.encode, name) < 0:
+            raise ConfigError(f"encode.{name} must be 0 or more")
+    if cfg.encode.crf - cfg.encode.crf_max_drop < 1:
+        raise ConfigError(
+            f"encode.crf_max_drop lets CRF fall below 1 "
+            f"(encode.crf {cfg.encode.crf} - {cfg.encode.crf_max_drop:g})"
+        )
     _check_by_width(cfg.encode.variance_boost_strength, "encode.variance_boost_strength",
                     0, 4, "0 (off) to 4")
     _check_by_width(cfg.encode.luminance_qp_bias, "encode.luminance_qp_bias",

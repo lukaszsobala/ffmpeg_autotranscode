@@ -7,6 +7,7 @@ source properties into correct flags for Av1an and SvtAv1EncApp.
 
 from __future__ import annotations
 
+import math
 import os
 import shlex
 from collections.abc import Callable
@@ -73,23 +74,33 @@ def effective_color(info: MediaInfo, cfg: Config) -> tuple[str, str, str]:
     return info.color_primaries, info.color_transfer, info.color_space
 
 
-def effective_crf(info: MediaInfo, cfg: Config) -> int:
-    """`encode.crf` shifted for the source's resolution.
+def effective_crf(info: MediaInfo, cfg: Config) -> float:
+    """`encode.crf` lowered for the source's resolution, in 0.25 steps.
 
     A CRF is a quality target per coded pixel, and a pixel at 576p is magnified
     several times more on the same screen than one at 2160p, so holding CRF
-    constant across a library means the small files look the worst. The ladder in
-    `encode.crf_by_width` corrects for that; `encode.crf` remains the one knob
-    that moves everything, and the 4K band is what it means literally.
+    constant across a library means the small files look the worst. The curve
+    corrects for that: `crf_drop_at_720` below `encode.crf` at 720 wide, rising
+    `crf_per_doubling` per doubling of width, capped at `encode.crf` and floored
+    `crf_max_drop` below it. `encode.crf` remains the one knob that moves
+    everything, and 4K is what it means literally.
 
-    Bands are keyed by width because a scope film arrives cropped to its picture:
-    3836x2072 is a 4K source whose height would file it as 1080p. `band_width`
-    has the details, including 4:3 and non-square-pixel HD.
+    Width is `band_width`'s: a scope film arrives cropped to its picture, and
+    3836x2072 is a 4K source whose height would call it 1080p. It has the details,
+    including 4:3 and non-square-pixel HD.
     """
-    ladder = cfg.encode.crf_by_width
-    if not ladder:
-        return cfg.encode.crf
-    return max(1, min(70, cfg.encode.crf + by_width(ladder, info)))
+    enc = cfg.encode
+    width = band_width(info)
+    if width <= 0:
+        return float(enc.crf)
+    drop = enc.crf_drop_at_720 - enc.crf_per_doubling * math.log2(width / 720)
+    drop = min(enc.crf_max_drop, max(0.0, drop))
+    return max(1.0, round((enc.crf - drop) * 4) / 4)
+
+
+def crf_text(crf: float) -> str:
+    """A CRF as SvtAv1EncApp and a reader want it: 29, 25.75."""
+    return f"{crf:g}"
 
 
 def by_width(value: Number | dict[str, Number], info: MediaInfo) -> Number:
@@ -136,13 +147,13 @@ def variance_boost_curve(info: MediaInfo, cfg: Config) -> str:
 
 
 def svt_params(
-    info: MediaInfo, cfg: Config, chain: Toolchain, crf: int | None = None
+    info: MediaInfo, cfg: Config, chain: Toolchain, crf: float | None = None
 ) -> list[str]:
     """Encoder flags passed straight to SvtAv1EncApp (not FFmpeg syntax)."""
     enc = cfg.encode
     params: list[str] = [
         "--preset", str(enc.preset),
-        "--crf", str(crf if crf is not None else effective_crf(info, cfg)),
+        "--crf", crf_text(crf if crf is not None else effective_crf(info, cfg)),
         "--tune", str(enc.tune),
     ]
 

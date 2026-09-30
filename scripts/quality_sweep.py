@@ -150,7 +150,8 @@ def variant_config(base: config.Config, variant: Variant, root: Path, preset: in
         setattr(cfg, section.name, dataclasses.replace(getattr(base, section.name)))
     here = root / "runs" / variant.name
     cfg.encode.crf = variant.crf
-    cfg.encode.crf_by_width = {}              # the CRF named is the CRF used
+    cfg.encode.crf_per_doubling = 0           # the CRF named is the CRF used
+    cfg.encode.crf_drop_at_720 = 0
     cfg.encode.extra_svt_params = list(variant.svt)
     # The variant's own flags, not ours as well.
     if "--luminance-qp-bias" in variant.svt:

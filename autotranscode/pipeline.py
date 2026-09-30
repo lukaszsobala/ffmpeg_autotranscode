@@ -357,8 +357,8 @@ def process_one(
     info = probe(source, chain)
     log.info("%s", source.name)
     log.info("  %s, %s", info.describe(), human_size(info.size_bytes))
-    log.info("  %.3f bits/pixel, encoding at crf %d",
-             info.bits_per_pixel, encode.effective_crf(info, cfg))
+    log.info("  %.3f bits/pixel, encoding at crf %s",
+             info.bits_per_pixel, encode.crf_text(encode.effective_crf(info, cfg)))
 
     final = output_path(info, cfg, roots)
     check_skip(info, final, cfg)

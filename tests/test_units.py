@@ -948,83 +948,96 @@ class TestFfmpegShim(unittest.TestCase):
         self.assertEqual(self.argv_seen(*other), other)
 
 
-class TestCrfLadder(unittest.TestCase):
+class TestCrfCurve(unittest.TestCase):
     """CRF is per coded pixel, so the same number means less quality as size drops."""
-
-    # A step at every band, so a source filed in the wrong one shows in its CRF.
-    # The defaults put 4K and 1080p level, which would hide a 4K print filed as
-    # 1080p.
-    LADDER = {"3000": 0, "1700": 3, "1100": -3, "0": -6}
 
     def setUp(self):
         self.cfg = config.Config()
         self.cfg.encode.crf = 30
-        self.cfg.encode.crf_by_width = dict(self.LADDER)
 
-    def crf_at(self, width: int, height: int = 0) -> int:
+    def crf_at(self, width: int, height: int = 0) -> float:
         info = make_info(width=width, height=height or width * 9 // 16)
         return encode.effective_crf(info, self.cfg)
 
-    def test_each_band_shifts_from_the_4k_anchor(self):
-        widths = (3840, 2560, 1920, 1280, 854, 640)
-        self.assertEqual([self.crf_at(w) for w in widths], [30, 33, 33, 27, 24, 24])
+    def test_it_passes_through_the_values_found_by_eye(self):
+        # SD 24, 720p 27, 1080p 29, 4K 30.
+        widths = (720, 1280, 1920, 3840)
+        self.assertEqual([self.crf_at(w) for w in widths], [24, 27, 29, 30])
 
-    def test_the_default_ladder(self):
-        self.cfg.encode.crf_by_width = config.Config().encode.crf_by_width
-        widths = (3840, 1920, 1280, 854)
-        self.assertEqual([self.crf_at(w) for w in widths], [30, 29, 27, 24])
+    def test_between_the_known_points_it_follows_the_curve(self):
+        # NTSC DVD, PAL DVD, 1440p: 24 + 3.5 * log2(width / 720), in 0.25 steps.
+        self.assertEqual([self.crf_at(w) for w in (853, 1024, 2560)], [24.75, 25.75, 30])
+
+    def test_it_is_capped_at_crf_and_floored_below_it(self):
+        self.assertEqual(self.crf_at(7680), 30)
+        self.assertEqual(self.crf_at(320), 23)
+
+    def test_it_never_falls_as_width_grows(self):
+        crfs = [self.crf_at(w) for w in range(320, 4000, 16)]
+        self.assertEqual(crfs, sorted(crfs))
 
     def test_a_cropped_scope_print_is_still_its_real_resolution(self):
-        # The case that motivated keying on width: both of these are 4K sources
-        # cropped to the picture, and their heights would file them as 1080p.
-        self.cfg.encode.crf_by_width["3000"] = 2
-        self.assertEqual(self.crf_at(3836, height=2072), 32)
-        self.assertEqual(self.crf_at(3840, height=1600), 32)
-        # And the same crop one rung down stays 1080p rather than dropping to 720p.
-        self.assertEqual(self.crf_at(1920, height=800), 33)
+        # The case that motivated going by width: both of these are 4K sources
+        # cropped to the picture, and their heights would call them 1080p.
+        self.assertEqual(self.crf_at(3836, height=2072), 30)
+        self.assertEqual(self.crf_at(3840, height=1600), 30)
+        # And the same crop one step down stays 1080p rather than dropping to 720p.
+        self.assertEqual(self.crf_at(1920, height=800), 29)
 
-    def test_narrow_hd_is_filed_by_its_height(self):
-        # 4:3 HD and 960x720 would drop a band on width alone.
-        self.assertEqual(self.crf_at(1440, height=1080), 33)
+    def test_narrow_hd_goes_by_its_height(self):
+        self.assertEqual(self.crf_at(1440, height=1080), 29)
         self.assertEqual(self.crf_at(960, height=720), 27)
 
-    def test_non_square_pixels_are_filed_by_their_shown_width(self):
+    def test_non_square_pixels_go_by_their_shown_width(self):
         # HDV: 1440x1080 stored, shown 1920 wide. Only the shown width is 1080p
         # here, because the height is cut to a crop that on its own would not be.
         info = make_info(width=1440, height=800, sample_aspect="4:3")
-        self.assertEqual(encode.effective_crf(info, self.cfg), 33)
-        self.assertEqual(encode.effective_crf(replace(info, sample_aspect=""), self.cfg), 27)
+        self.assertEqual(encode.effective_crf(info, self.cfg), 29)
+        self.assertEqual(encode.effective_crf(replace(info, sample_aspect=""), self.cfg), 27.5)
 
-    def test_dvds_stay_sd_whatever_their_pixel_shape(self):
-        for width, height, sar in ((720, 576, "16:15"), (720, 576, "64:45"),
-                                   (720, 480, "32:27")):
+    def test_dvds_go_by_their_frame_height(self):
+        # 576 lines is 1024 wide at 16:9 whatever the pixel shape; 480 is 853.
+        for width, height, sar, crf in ((720, 576, "16:15", 25.75), (720, 576, "64:45", 25.75),
+                                        (720, 480, "32:27", 24.75)):
             info = make_info(width=width, height=height, sample_aspect=sar)
-            self.assertEqual(encode.effective_crf(info, self.cfg), 24, (width, height, sar))
+            self.assertEqual(encode.effective_crf(info, self.cfg), crf, (width, height, sar))
 
-    def test_the_anchor_moves_the_whole_ladder(self):
-        # One knob still controls the library: --crf 28 lowers every band by 2.
+    def test_crf_moves_the_whole_curve(self):
+        # One knob still controls the library: --crf 28 lowers every width by 2.
         self.cfg.encode.crf = 28
-        self.assertEqual([self.crf_at(w) for w in (3840, 1920, 1280)], [28, 31, 25])
+        self.assertEqual([self.crf_at(w) for w in (3840, 1920, 1280, 720, 320)],
+                         [28, 27, 25, 22, 21])
 
-    def test_an_empty_ladder_uses_the_plain_crf(self):
-        self.cfg.encode.crf_by_width = {}
+    def test_a_flat_curve_uses_the_plain_crf(self):
+        self.cfg.encode.crf_per_doubling = 0
+        self.cfg.encode.crf_drop_at_720 = 0
         self.assertEqual([self.crf_at(w) for w in (3840, 854)], [30, 30])
+
+    def test_the_encoder_gets_quarter_steps_as_written(self):
+        info = make_info(width=720, height=576, sample_aspect="64:45")
+        params = encode.svt_params(info, self.cfg, make_chain())
+        self.assertEqual(params[params.index("--crf") + 1], "25.75")
+        info = make_info(width=1920, height=1080)
+        params = encode.svt_params(info, self.cfg, make_chain())
+        self.assertEqual(params[params.index("--crf") + 1], "29")
 
     def test_rk3588_profile_puts_4k_at_the_measured_30(self):
         cfg = config.Config()
         config._merge_profile(cfg, "rk3588")
         self.assertEqual(encode.effective_crf(make_info(width=3836, height=2072), cfg), 30)
 
-    def test_a_ladder_that_leaves_the_valid_range_is_rejected(self):
-        self.cfg.encode.crf = 68
-        self.cfg.encode.crf_by_width = {"0": 5}
+    def test_a_curve_that_leaves_the_valid_range_is_rejected(self):
+        self.cfg.encode.crf = 5
+        self.cfg.encode.crf_max_drop = 5
         with self.assertRaises(config.ConfigError):
             config.validate(self.cfg)
 
-    def test_ladder_keys_must_be_widths(self):
-        self.cfg.encode.crf_by_width = {"wide": 1}
-        with self.assertRaises(config.ConfigError):
-            config.validate(self.cfg)
+    def test_the_old_ladder_table_is_refused_with_directions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text("[encode.crf_by_width]\n3000 = 0\n")
+            with self.assertRaisesRegex(config.ConfigError, "crf_per_doubling"):
+                config.load(path)
 
 
 class TestEfficiencyPrefilter(unittest.TestCase):
@@ -1630,13 +1643,12 @@ class TestLibrarySamples(unittest.TestCase):
     """Choosing what `sample` encodes: which files, and where in them."""
 
     def test_band_follows_the_encode_settings(self):
-        cfg = config.Config()
-        self.assertEqual(sample.band_of(make_info(width=3836, height=2072), cfg), "4K")
-        self.assertEqual(sample.band_of(make_info(width=1920, height=800), cfg), "1080p")
-        self.assertEqual(sample.band_of(make_info(width=1440, height=1080), cfg), "1080p")
-        self.assertEqual(sample.band_of(make_info(width=1280, height=720), cfg), "720p")
+        self.assertEqual(sample.band_of(make_info(width=3836, height=2072)), "4K")
+        self.assertEqual(sample.band_of(make_info(width=1920, height=800)), "1080p")
+        self.assertEqual(sample.band_of(make_info(width=1440, height=1080)), "1080p")
+        self.assertEqual(sample.band_of(make_info(width=1280, height=720)), "720p")
         self.assertEqual(sample.band_of(make_info(width=720, height=576,
-                                                  sample_aspect="64:45"), cfg), "SD")
+                                                  sample_aspect="64:45")), "SD")
 
     def test_a_failure_reports_what_the_tool_said(self):
         exc = CommandError(["/usr/bin/ffmpeg", "-i", "a long command line"], 234,

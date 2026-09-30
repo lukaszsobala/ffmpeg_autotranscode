@@ -98,16 +98,30 @@ screen: at 576p each one is magnified several times more than at 2160p. Hold CRF
 constant across a mixed library and the small files come out looking the worst,
 which is the usual reason people conclude AV1 is weak at low resolution.
 
-`encode.crf` is therefore the value for a 4K source, and `encode.crf_by_width`
-shifts it per band. Other settings change by band too, because what fixed
-blocking at one resolution lost at another:
+`encode.crf` is therefore the value for a 4K source and the most any source
+gets; smaller sources get less along a curve over width:
+
+```
+crf = clamp(24 + 3.5 * log2(width / 720), 23, 30)     at crf 30, in 0.25 steps
+```
+
+The points it passes through were found by eye. 4K blocked in fog above 30.
+1080p was blocky in a dark scene at 32 and held at 30; 29 is margin. 720p at 27
+and SD at 24 looked like their sources, though nothing higher was tried there.
+Those three lie on a log line, 3.4 to 3.6 CRF per doubling of width; 4K sits
+below it, which is what the cap at 30 is for. The curve reaches it at about 2360
+wide, so 1440p gets 30 too. The settings (`crf_per_doubling`, `crf_drop_at_720`,
+`crf_max_drop`) are relative to `encode.crf`.
+
+Other settings change by band, because what fixed blocking at one resolution lost
+at another:
 
 | source | CRF | variance boost | dark bias | ac-bias | temporal filter |
 |---|---|---|---|---|---|
 | 4K | 30 | 2 | off | 1 | 1 (weak) |
-| 1080p | 37 | off | 100 | off | default |
+| 1080p | 29 | off | 100 | 1 | 1 (weak) |
 | 720p | 27 | off | off | off | default |
-| 576p and below | 24 | off | off | off | default |
+| 576p and below | 23-25.75 | off | off | off | default |
 
 - **Variance boost** spends more bits on flat areas. It was the only thing that
   cleared blocking in fog and on flat paper in a grainy 4K HDR film. Below 4K it
@@ -117,8 +131,9 @@ blocking at one resolution lost at another:
   blocks in a dark scene at CRF 32, and neither more bits nor variance boost fixed
   it. Bias 100 at CRF 37 did, for 1.32x the size of CRF 32 without the bias. Bias
   25 or 50, at the lower CRFs needed to match it in that scene, cost more. The
-  bias works on whole frames, so a dim film pays for it on most of them. **1080p's
-  CRF 37 depends on it**: drop the bias and bring 1080p back to about 32.
+  bias works on whole frames, so a dim film pays for it on most of them. At the
+  CRF 1080p has now it still matters: that scene was blocky with bias 50 at CRF
+  30, and with 100 at CRF 32.
 - **ac-bias and a weak temporal filter** (`encode.ac_bias`, `encode.tf_strength`)
   finished the job variance boost started on the 4K film's fog, which it had
   left blotched: grain smeared into patches tens of pixels across, some of them
@@ -128,20 +143,22 @@ blocking at one resolution lost at another:
   variance boost did not; turning the filter off scored higher but looked worse
   in motion. The whole film came out 1.17x the size (82.5% saving instead of
   85%), better in 148 of its 159 three-second windows and never worse by more
-  than 0.2 dB. Neither has been tried below 4K yet. A tf strength of -1 leaves
+  than 0.2 dB. At 1080p the default filter wiped rain out of a second film, and
+  CRF 37 smeared faces; strength 1 and ac-bias 1 brought the rain back and CRF 30
+  the faces, for 2.5x the bits on its worst stretches. A tf strength of -1 leaves
   the encoder's own default.
 
-These settings take either one number for every source or a table keyed by width
-like the CRF ladder.
+These settings take either one number for every source or a table keyed by the
+lowest width of each band: 3000 for 4K, 1700 for 1080p, 1100 for 720p, 0 below.
 
-`--crf` still moves everything at once, because it sets the anchor the ladder
-shifts from. Bands are keyed by **width**: a scope film is cropped to its picture,
-so a 4K print can be 3840x1600 or 3836x2072, and keying on height would file it as
-1080p and under-encode it. A picture narrower than 16:9 is filed by its height
-instead: 4:3 HD at 1440x1080 counts as 1080p and 960x720 as 720p, where width
-alone would drop each a band. Non-square pixels count at their shown width, so
-HDV's 1440x1080 is 1920 wide, and a DVD, at 576 or 480 lines, stays SD whatever
-its shape. Empty the CRF table to go back to one CRF for everything.
+`--crf` still moves everything at once, because the curve is relative to it.
+Both the curve and the bands go by **width**: a scope film is cropped to its
+picture, so a 4K print can be 3840x1600 or 3836x2072, and going by height would
+treat it as 1080p and under-encode it. A picture narrower than 16:9 goes by its
+height instead: 4:3 HD at 1440x1080 counts as 1920 wide and 960x720 as 1280.
+Non-square pixels count at their shown width, so HDV's 1440x1080 is 1920 wide,
+and a DVD counts as 1024 (576 lines) or 853 (480) whatever its shape. Set
+`crf_per_doubling` and `crf_drop_at_720` to 0 for one CRF everywhere.
 
 Each row was tuned on one film, so it is only as good as that film was typical;
 `autotranscode sample` exists to check it against the rest of a library.

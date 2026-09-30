@@ -265,7 +265,7 @@ def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain)
         print(f"{name:<40} {human_size(result.info.size_bytes):>10} "
               f"{human_size(result.projected_bytes):>10} {result.saving_percent:>7.0f}% "
               f"{human_duration(result.projected_encode_seconds):>9} "
-              f"{human_size(int(result.saved_per_hour)):>9}  {result.crf}"
+              f"{human_size(int(result.saved_per_hour)):>9}  {encode.crf_text(result.crf)}"
               f"{' +grain' if result.denoise else ''}")
 
     saved = sum(r.saved_bytes for r in results)
@@ -362,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("%s", exc)
                 return 2
         out = args.out or cfg.work_dir / "samples" / f"{dt.datetime.now():%Y%m%d-%H%M}"
-        bands = args.band or [sample.band_name(edge) for edge in sample.band_edges(cfg)]
+        bands = args.band or [sample.band_name(edge) for edge in sample.band_edges()]
         try:
             return sample.run_samples(
                 args.inputs, chain, cfg, out.expanduser().resolve(),
@@ -389,8 +389,8 @@ def main(argv: list[str] | None = None) -> int:
         log.error("no media files found")
         return 1
 
-    crf = f"{cfg.encode.crf} at 4K, by resolution" if cfg.encode.crf_by_width \
-        else str(cfg.encode.crf)
+    curved = cfg.encode.crf_per_doubling or cfg.encode.crf_drop_at_720
+    crf = f"{cfg.encode.crf} at 4K, less below" if curved else str(cfg.encode.crf)
     log.info("%d file(s) queued, profile=%s preset=%d crf=%s grain=%s",
              len(sources), cfg.machine.profile, cfg.encode.preset, crf, cfg.grain.mode)
 
