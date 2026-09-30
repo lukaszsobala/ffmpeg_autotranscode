@@ -412,7 +412,6 @@ def load(path: Path | None) -> Config:
     _merge_profile(cfg, profile)
     cfg.machine.profile = profile
 
-    _refuse_retired(raw)
     for section, values in raw.items():
         if not hasattr(cfg, section):
             raise ConfigError(f"unknown config section [{section}]")
@@ -426,32 +425,6 @@ def load(path: Path | None) -> Config:
 
     validate(cfg)
     return cfg
-
-
-def _refuse_retired(raw: dict[str, Any]) -> None:
-    """Explain settings that were removed, rather than calling them unknown.
-
-    `output.container = "mkv"` is accepted and dropped: it was the default, and
-    it is still what every output is.
-    """
-    if "crf_by_width" in raw.get("encode", {}):
-        raise ConfigError(
-            "encode.crf_by_width is gone: CRF now follows a curve over width "
-            "(encode.crf_per_doubling, crf_drop_at_720, crf_max_drop; see "
-            "config.example.toml). Delete the table to use the default curve"
-        )
-    if "target_quality" in raw:
-        raise ConfigError(
-            "[target_quality] is gone: Av1an's metric search was never used here, and "
-            "a metric is what misjudged grainy films. Delete the section"
-        )
-    output = raw.get("output", {})
-    if isinstance(output, dict) and "container" in output:
-        if output.pop("container") != "mkv":
-            raise ConfigError(
-                "output.container is gone and outputs are always Matroska: WebM cannot "
-                "hold copied AAC, AC-3 or FLAC audio, PGS or ASS subtitles, or fonts"
-            )
 
 
 def _check_by_width(

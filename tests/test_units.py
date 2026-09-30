@@ -151,17 +151,6 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
             config.validate(cfg)
 
-    def test_retired_settings_are_explained(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "c.toml"
-            for text, message in (("[target_quality]\nenabled = false\n", "target_quality"),
-                                  ('[output]\ncontainer = "webm"\n', "Matroska")):
-                path.write_text(text)
-                with self.assertRaisesRegex(config.ConfigError, message):
-                    config.load(path)
-            path.write_text('[output]\ncontainer = "mkv"\n')
-            config.load(path)   # the old default is still accepted
-
 
 class TestSkipRules(unittest.TestCase):
     def setUp(self):
@@ -1071,13 +1060,6 @@ class TestCrfCurve(unittest.TestCase):
             cfg = config.load(path)
         self.assertIsInstance(cfg.encode.crf_per_doubling, float)
         self.assertIsInstance(cfg.output.min_saving_percent, float)
-
-    def test_the_old_ladder_table_is_refused_with_directions(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "c.toml"
-            path.write_text("[encode.crf_by_width]\n3000 = 0\n")
-            with self.assertRaisesRegex(config.ConfigError, "crf_per_doubling"):
-                config.load(path)
 
 
 class TestEfficiencyPrefilter(unittest.TestCase):
