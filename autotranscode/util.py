@@ -155,6 +155,9 @@ def run(
     return result
 
 
+MIB = 1024 * 1024
+
+
 def human_size(num_bytes: int) -> str:
     value = float(num_bytes)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):

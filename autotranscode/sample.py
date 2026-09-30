@@ -216,6 +216,7 @@ def sample_config(cfg: Config, directory: Path, work: Path) -> Config:
     local = copy.deepcopy(cfg)
     local.output.directory = str(directory)
     local.output.min_saving_percent = -1e9   # keep every result, however it turns out
+    local.output.min_saving_mib = -1e9
     local.output.replace_source = False
     local.library.min_duration_sec = 0.0      # the excerpt is short by design
     local.library.min_bits_per_pixel = 0.0    # the whole file already passed this

@@ -171,6 +171,7 @@ def variant_config(base: config.Config, variant: Variant, root: Path, preset: in
         setattr(target, name, value)
     cfg.output.directory = str(here)
     cfg.output.min_saving_percent = -1e9      # keep every result, however it turns out
+    cfg.output.min_saving_mib = -1e9
     cfg.output.replace_source = False
     cfg.library.min_duration_sec = 0.0
     cfg.library.min_bits_per_pixel = 0.0

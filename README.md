@@ -296,7 +296,7 @@ that file's directory under `work_dir` first.
 An encode reads its source many times over many hours. If the library lives on a
 NAS or a spinning disk, staging lets that drive idle: each file is copied to local
 storage once, encoded from there, and the result moved to its destination only
-once it passes the `output.min_saving_percent` check.
+once it passes the `output.min_saving_percent` and `output.min_saving_mib` checks.
 
 ```toml
 [staging]
@@ -332,14 +332,14 @@ converts it to SDR with `tonemapx` instead of skipping it. Set
 
 - **Dolby Vision profile 5**, unless you opt into SDR conversion (above).
 - Files already in AV1, clips shorter than `library.min_duration_sec`, and any result
-  that saves less than `output.min_saving_percent` (the output is deleted and the file
-  is marked skipped).
+  that saves less than `output.min_saving_percent` or `output.min_saving_mib`
+  (100 MiB by default; the output is deleted and the file is marked skipped).
 - **Encodes heading for too little saving.** Once `output.check_saving_after_percent`
   of the frames are encoded (10 by default), the encode stops as soon as the
-  projected result misses `min_saving_percent`. Progress lines in the log show where
+  projected result misses either minimum. Progress lines in the log show where
   each file is heading.
 - **Files that did not save enough before**, while the settings that decide size
-  (the `encode`, `grain` and `audio` sections, `min_saving_percent`, the SVT-AV1
+  (the `encode`, `grain` and `audio` sections, both minimum savings, the SVT-AV1
   version) are unchanged. Change any of them, `--crf` included, and the file gets
   another try.
 - **Sources already below `library.min_bits_per_pixel`** (bitrate / (width x height x

@@ -280,8 +280,11 @@ class Output:
     suffix: str = ".av1"   # always Matroska: it holds every track the mux carries over
     directory: str = ""  # empty => write next to the source
     min_saving_percent: float = 10.0
+    # And at least this much smaller in absolute terms, in MiB. A 10% saving on a
+    # 600 MiB episode is 60 MiB: not worth a generation of loss or the hours.
+    min_saving_mib: float = 100.0
     # Once this share of the frames is encoded, project the final size from the
-    # chunks so far and stop when it misses min_saving_percent. 0 never checks.
+    # chunks so far and stop when it misses either minimum. 0 never checks.
     check_saving_after_percent: float = 10.0
     replace_source: bool = False
 

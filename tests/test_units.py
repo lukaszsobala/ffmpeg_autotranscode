@@ -27,7 +27,7 @@ from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
 from autotranscode.state import Ledger, Record
 from autotranscode.tools import Toolchain
-from autotranscode.util import CommandError
+from autotranscode.util import MIB, CommandError
 
 TABLE = """filmgrn1
 E 0 3000000 1 7391 1
@@ -518,6 +518,7 @@ class TestStaging(unittest.TestCase):
         self.cfg = config.Config()
         self.cfg.staging.enabled = True
         self.cfg.staging.directory = str(self.root / "staging")
+        self.cfg.output.min_saving_mib = 0.0   # the test files are a few KiB
 
     def _info(self) -> MediaInfo:
         return make_info(path=self.source, size_bytes=self.source.stat().st_size)
@@ -680,6 +681,7 @@ class TestStopAndResume(unittest.TestCase):
         self.cfg = config.Config()
         self.cfg.grain.mode = "never"
         self.cfg.paths.work_dir = str(self.root / "work")
+        self.cfg.output.min_saving_mib = 0.0   # the test files are a few KiB
         self.cfg.staging.enabled = True
         self.cfg.staging.directory = str(self.root / "staging")
 
@@ -1814,8 +1816,9 @@ class TestEarlySavingCheck(unittest.TestCase):
                                         [watch.Chunk(0, 100, 1000)], [10] * 100))
         self.assertEqual(without.output_bytes - with_audio.output_bytes, saved)
 
-    def _watch(self, sizes: list[int], temp: Path) -> watch.SavingWatch:
+    def _watch(self, sizes: list[int], temp: Path, min_mib: float = 0.0) -> watch.SavingWatch:
         cfg = config.Config()
+        cfg.output.min_saving_mib = min_mib
         cfg.output.min_saving_percent = 10.0
         cfg.output.check_saving_after_percent = 10.0
         info = make_info(size_bytes=sum(sizes), duration=40.0)
@@ -1833,6 +1836,14 @@ class TestEarlySavingCheck(unittest.TestCase):
         check = self._watch([10] * 1000, self._av1an_temp(scenes, {0: 2000, 1: 2000}))
         self.assertRegex(present(check()), r"stopped at 20% of the frames: heading for "
                                            r"100\.0% larger, below the 10% threshold")
+
+    def test_an_encode_saving_too_few_bytes_is_stopped(self):
+        # 70% smaller clears the percentage, but on a 10 KB file that is nothing.
+        scenes = [(i * 100, i * 100 + 100) for i in range(10)]
+        check = self._watch([10] * 1000, self._av1an_temp(scenes, {0: 300, 1: 300}),
+                            min_mib=1.0)
+        self.assertRegex(present(check()), r"stopped at 20% of the frames: heading for "
+                                           r"6\.8 KiB smaller, below the 1 MiB threshold")
 
     def test_an_encode_heading_for_a_good_saving_carries_on(self):
         scenes = [(i * 100, i * 100 + 100) for i in range(10)]
@@ -2078,3 +2089,35 @@ class TestInsideAContainer(unittest.TestCase):
             # Limited to one kind of core: nothing to choose between.
             with unittest.mock.patch.object(os, "sched_getaffinity", return_value={4, 5}):
                 self.assertEqual(tools._big_cores(cpus), "")
+
+
+class TestShortfall(unittest.TestCase):
+    """A result has to clear both minimums: the share and the absolute amount."""
+
+    def setUp(self):
+        self.cfg = config.Config()
+        self.cfg.output.min_saving_percent = 10.0
+        self.cfg.output.min_saving_mib = 100.0
+
+    def test_default_is_100_mib(self):
+        self.assertEqual(config.Config().output.min_saving_mib, 100.0)
+
+    def test_a_large_saving_on_a_large_file_passes(self):
+        self.assertIsNone(watch.shortfall(self.cfg, 2000 * MIB, 1000 * MIB))
+
+    def test_a_large_share_of_a_small_file_is_not_enough(self):
+        reason = watch.shortfall(self.cfg, 150 * MIB, 75 * MIB)
+        self.assertEqual(reason, "75.0 MiB smaller, below the 100 MiB threshold")
+
+    def test_a_small_share_of_a_large_file_is_not_enough(self):
+        reason = watch.shortfall(self.cfg, 20000 * MIB, 19000 * MIB)
+        self.assertEqual(reason, "5.0% smaller, below the 10% threshold")
+
+    def test_zero_turns_the_absolute_check_off(self):
+        self.cfg.output.min_saving_mib = 0.0
+        self.assertIsNone(watch.shortfall(self.cfg, 150 * MIB, 75 * MIB))
+
+    def test_it_decides_whether_a_file_is_retried(self):
+        before = pipeline.settings_key(self.cfg, make_chain())
+        self.cfg.output.min_saving_mib = 50.0
+        self.assertNotEqual(before, pipeline.settings_key(self.cfg, make_chain()))

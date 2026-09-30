@@ -26,7 +26,7 @@ from . import mux
 from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
-from .util import child_env, log
+from .util import MIB, child_env, human_size, log
 
 
 @dataclass(slots=True)
@@ -167,6 +167,23 @@ def describe_saving(percent: float) -> str:
     return f"{percent:.1f}% smaller" if percent >= 0 else f"{-percent:.1f}% larger"
 
 
+def shortfall(cfg: Config, source_bytes: int, output_bytes: int) -> str | None:
+    """Why an output of `output_bytes` is not worth keeping, or None if it is.
+
+    It has to clear both minimums: the percentage and the absolute amount.
+    """
+    saved = source_bytes - output_bytes
+    percent = 100.0 * saved / source_bytes if source_bytes else 0.0
+    if percent < cfg.output.min_saving_percent:
+        return (f"{describe_saving(percent)}, "
+                f"below the {cfg.output.min_saving_percent:.0f}% threshold")
+    if saved < cfg.output.min_saving_mib * MIB:
+        change = "smaller" if saved >= 0 else "larger"
+        return (f"{human_size(abs(saved))} {change}, "
+                f"below the {cfg.output.min_saving_mib:g} MiB threshold")
+    return None
+
+
 class SavingWatch:
     """Asked during the encode whether to stop it: a reason, or None to carry on."""
 
@@ -202,17 +219,15 @@ class SavingWatch:
         after = self.cfg.output.check_saving_after_percent
         if projection is None or projection.done_percent < after:
             return None
-        threshold = self.cfg.output.min_saving_percent
         if projection.done_percent >= self._next_log:
             self._next_log = projection.done_percent + self.LOG_EVERY
             log.info("  %.0f%% of the frames encoded, at %.2fx the source's bytes: "
                      "heading for %s", projection.done_percent, projection.ratio,
                      describe_saving(projection.saving_percent))
-        if projection.saving_percent >= threshold:
+        reason = shortfall(self.cfg, self.info.size_bytes, projection.output_bytes)
+        if reason is None:
             return None
-        return (f"stopped at {projection.done_percent:.0f}% of the frames: heading for "
-                f"{describe_saving(projection.saving_percent)}, "
-                f"below the {threshold:.0f}% threshold")
+        return f"stopped at {projection.done_percent:.0f}% of the frames: heading for {reason}"
 
     def close(self) -> None:
         self.source.close()

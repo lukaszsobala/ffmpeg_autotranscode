@@ -62,6 +62,7 @@ def settings_key(cfg: Config, chain: Toolchain) -> str:
         "grain": asdict(cfg.grain),
         "audio": asdict(cfg.audio),
         "min_saving_percent": cfg.output.min_saving_percent,
+        "min_saving_mib": cfg.output.min_saving_mib,
         "svt_av1": chain.svtav1_version,
     }
     return hashlib.sha256(json.dumps(decisive, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -504,16 +505,12 @@ def _transcode(
     mux.mux(video, read, muxed, chain, cfg)
 
     output_bytes = muxed.stat().st_size
-    saving = 100.0 * (1 - output_bytes / info.size_bytes) if info.size_bytes else 0.0
-
-    if saving < cfg.output.min_saving_percent:
+    reason = watch.shortfall(cfg, info.size_bytes, output_bytes)
+    if reason is not None:
         muxed.unlink(missing_ok=True)
         _remove_if_empty(made)
         _cleanup(work, cfg, table)
-        raise NoSaving(
-            f"only {saving:.1f}% smaller, below the {cfg.output.min_saving_percent:.0f}% threshold",
-            settings_key(cfg, chain),
-        )
+        raise NoSaving(f"came out {reason}", settings_key(cfg, chain))
 
     # Checked again now, not only before the encode: hours have passed, and another
     # run or a copy by hand may have put a file under this name since.
@@ -548,8 +545,9 @@ def _transcode(
 
     elapsed = time.monotonic() - started
     log.info(
-        "  done in %s: %s -> %s (%.1f%% smaller)",
-        human_duration(elapsed), human_size(info.size_bytes), human_size(output_bytes), saving,
+        "  done in %s: %s -> %s (%s)",
+        human_duration(elapsed), human_size(info.size_bytes), human_size(output_bytes),
+        watch.describe_saving(100.0 * (1 - output_bytes / info.size_bytes)),
     )
 
     if cfg.output.replace_source:
