@@ -88,7 +88,7 @@ the easy way onto a Mac, and an alternative to a native install on Linux.
 |---|---|---|
 | RK3588 and other arm64 Linux | arm64 | Built and tested on an RK3588. Add `compose.rk3588.yaml` on those boards. |
 | Apple silicon Mac | arm64 | Docker runs containers in an arm64 Linux VM. Intel Macs are not a target. |
-| x86-64 Linux | amd64 | The Dockerfile has nothing arm-specific, but this build is untested. |
+| x86-64 Linux | amd64 | Built and tested on an Intel Core Ultra 7 258V (Lunar Lake). |
 
 Set up once:
 
@@ -118,7 +118,7 @@ Then use it as the native command:
 
 ```bash
 docker compose run --rm autotranscode sample --minutes 5 -n 1 --out /data/samples "$LIBRARY"
-docker compose run --rm -d --name transcode autotranscode run --log-file /data/logs/run.log "$LIBRARY"
+docker compose run --rm -d --name transcode autotranscode --log-file /data/logs/run.log run "$LIBRARY"
 docker logs -f transcode
 docker stop transcode          # SIGTERM: a checkpoint, as Ctrl-C is natively
 ```
