@@ -158,6 +158,21 @@ def run(
 MIB = 1024 * 1024
 
 
+def available_memory(meminfo: Path = Path("/proc/meminfo")) -> int:
+    """Bytes the kernel could hand out now without swapping, or 0 when unknown.
+
+    Linux's MemAvailable: free memory plus the caches it would drop for it.
+    """
+    try:
+        for line in meminfo.read_text(encoding="ascii").splitlines():
+            name, _, value = line.partition(":")
+            if name == "MemAvailable":
+                return int(value.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 def human_size(num_bytes: int) -> str:
     value = float(num_bytes)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):

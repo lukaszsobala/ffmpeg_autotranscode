@@ -124,13 +124,21 @@ class TestConfig(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.toml"
             path.write_text('[machine]\nprofile = "auto"\n')
-            for board, profile, preset in ((b"radxa,rock-5b\0rockchip,rk3588\0", "rk3588", 4),
-                                           (None, "generic", 6)):
+            for board, profile, workers in ((b"radxa,rock-5b\0rockchip,rk3588\0", "rk3588", 1),
+                                            (None, "generic", 0)):
                 read = unittest.mock.Mock(return_value=board, side_effect=None if board
                                           else FileNotFoundError())
                 with unittest.mock.patch.object(Path, "read_bytes", read):
                     cfg = config.load(path)
-                self.assertEqual((cfg.machine.profile, cfg.encode.preset), (profile, preset))
+                self.assertEqual((cfg.machine.profile, cfg.machine.workers), (profile, workers))
+
+    def test_every_profile_encodes_at_preset_4(self):
+        # The settings were all judged at preset 4, so no profile may leave it.
+        for profile in config.PROFILES:
+            with self.subTest(profile=profile):
+                cfg = config.Config()
+                config._merge_profile(cfg, profile)
+                self.assertEqual(cfg.encode.preset, 4)
 
     def test_a_config_without_a_profile_is_auto(self):
         self.assertEqual(config.Config().machine.profile, "auto")
@@ -614,6 +622,10 @@ class TestStaging(unittest.TestCase):
         pipeline.encode.run_encode = fake_encode
         self.addCleanup(setattr, pipeline.mux, "mux", original_mux)
         self.addCleanup(setattr, pipeline.encode, "run_encode", original_encode)
+        # Its frame timing is checked with ffprobe, which a fake encode cannot pass.
+        timing = pipeline.encode.keep_source_timing
+        pipeline.encode.keep_source_timing = lambda *_args: None
+        self.addCleanup(setattr, pipeline.encode, "keep_source_timing", timing)
         return work
 
     def test_a_result_that_fails_the_size_check_never_reaches_the_destination(self):
@@ -692,6 +704,9 @@ class TestStopAndResume(unittest.TestCase):
         original = pipeline.encode.run_encode
         pipeline.encode.run_encode = behaviour
         self.addCleanup(setattr, pipeline.encode, "run_encode", original)
+        timing = pipeline.encode.keep_source_timing
+        pipeline.encode.keep_source_timing = lambda *_args: None
+        self.addCleanup(setattr, pipeline.encode, "keep_source_timing", timing)
 
     def _stub_probe(self):
         """process_one probes for real; these tests are about what happens after."""
@@ -2036,6 +2051,108 @@ class TestChunkMethod(unittest.TestCase):
         self.assertIn("/opt/vs/bin", chain.bin_dirs)
 
 
+class TestSourceTiming(unittest.TestCase):
+    """A phone clip at a variable frame rate must keep its length, and with it
+    its sync with the audio, and its full-range picture must be signalled so."""
+
+    def test_full_range_frames_win_over_a_limited_range_tag(self):
+        self.assertEqual(probe._color_range({"color_range": "tv"}, "yuvj420p"), "pc")
+        self.assertEqual(probe._color_range({"color_range": "tv"}, "yuv420p"), "tv")
+        self.assertEqual(probe._color_range({}, "yuv420p10le"), "")
+
+    def test_full_range_is_signalled_to_the_encoder(self):
+        info = make_info(pix_fmt="yuvj420p", color_range="pc")
+        params = encode.svt_params(info, config.Config(), make_chain())
+        self.assertEqual(params[params.index("--color-range") + 1], "1")
+
+    def test_a_track_s_duration_comes_from_mp4_or_the_matroska_tag(self):
+        self.assertEqual(probe._stream_duration({"duration": "124.070967"}), 124.070967)
+        self.assertAlmostEqual(
+            probe._stream_duration({"tags": {"DURATION": "01:01:51.649000000"}}), 3711.649)
+        self.assertAlmostEqual(
+            probe._stream_duration({"tags": {"DURATION-eng": "00:00:02.5"}}), 2.5)
+        self.assertEqual(probe._stream_duration({"duration": "N/A"}), 0.0)
+        self.assertEqual(probe._stream_duration({}), 0.0)
+
+    def test_only_a_real_difference_in_length_counts_as_drift(self):
+        self.assertTrue(encode.drifted(124.071, 111.649))
+        self.assertFalse(encode.drifted(7200.000, 7200.042))   # a frame of rounding
+        self.assertFalse(encode.drifted(0.0, 111.6))           # source length unknown
+
+    def test_timestamps_are_written_for_mkvmerge_in_milliseconds(self):
+        self.assertEqual(encode.timestamps_v2([0.0, 0.0185, 0.037]),
+                         "# timestamp format v2\n0.000\n18.500\n37.000\n")
+
+    def test_a_constant_rate_encode_is_left_alone(self):
+        info = make_info(video_duration=7200.0)
+        with unittest.mock.patch.object(encode, "_duration", return_value=7200.04), \
+                unittest.mock.patch.object(encode, "frame_times") as times:
+            encode.keep_source_timing(info, Path("/w/encoded.mkv"), make_chain(), Path("/w"))
+        times.assert_not_called()
+
+    def test_frames_that_cannot_take_the_source_s_times_fail_the_file(self):
+        info = make_info(video_duration=124.07)
+        with unittest.mock.patch.object(encode, "_duration", return_value=111.65), \
+                unittest.mock.patch.object(encode, "frame_times", return_value=[0.0] * 6698), \
+                unittest.mock.patch.object(encode, "_frame_count", return_value=6699), \
+                self.assertRaises(ValueError):
+            encode.keep_source_timing(info, Path("/w/encoded.mkv"), make_chain(), Path("/w"))
+
+
+class TestWorkers(unittest.TestCase):
+    """How many encodes run at once: as many as the cores keep busy and the free
+    memory holds."""
+
+    GB = 1_000_000_000
+    UHD = dict(width=3840, height=2160)   # 8.3 megapixels
+
+    def test_a_configured_count_wins(self):
+        cfg = config.Config()
+        cfg.machine.workers = 3
+        self.assertEqual(encode.workers(make_info(), cfg, make_chain(), memory=1, cores=1), 3)
+
+    def test_free_memory_limits_4k(self):
+        # hybrid: 1.3 GB per megapixel, so 10.8 GB per 4K worker.
+        cfg, chain, info = config.Config(), make_chain(), make_info(**self.UHD)
+        self.assertEqual(encode.workers(info, cfg, chain, memory=18 * self.GB, cores=32), 1)
+        self.assertEqual(encode.workers(info, cfg, chain, memory=22 * self.GB, cores=32), 2)
+
+    def test_lsmash_needs_more_memory_per_worker(self):
+        # 1.5 GB per megapixel: two 4K workers need 24.9 GB.
+        cfg, info = config.Config(), make_info(**self.UHD)
+        lsmash = make_chain(vspipe="/v/vspipe", vapoursynth_plugins={"lsmas"})
+        self.assertEqual(encode.workers(info, cfg, lsmash, memory=22 * self.GB, cores=32), 1)
+
+    def test_cores_limit_when_memory_is_plentiful(self):
+        cfg, chain = config.Config(), make_chain()
+        self.assertEqual(encode.workers(make_info(), cfg, chain, memory=64 * self.GB, cores=8), 1)
+        self.assertEqual(encode.workers(make_info(), cfg, chain, memory=64 * self.GB, cores=24), 4)
+
+    def test_never_fewer_than_one(self):
+        cfg, chain = config.Config(), make_chain()
+        info = make_info(**self.UHD)
+        self.assertEqual(encode.workers(info, cfg, chain, memory=self.GB, cores=2), 1)
+
+    def test_unknown_memory_leaves_it_to_the_cores(self):
+        cfg, chain = config.Config(), make_chain()
+        info = make_info(**self.UHD)
+        self.assertEqual(encode.workers(info, cfg, chain, memory=0, cores=24), 4)
+
+    def test_the_count_reaches_av1an(self):
+        cfg = config.Config()
+        with unittest.mock.patch.object(encode, "available_memory", return_value=0), \
+                unittest.mock.patch.object(os, "sched_getaffinity", return_value=set(range(12))):
+            argv = encode.build_command(make_info(), Path("/o.mkv"), make_chain(), cfg, Path("/t"))
+        self.assertEqual(argv[argv.index("-w") + 1], "2")
+
+    def test_available_memory_reads_memavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            meminfo = Path(tmp) / "meminfo"
+            meminfo.write_text("MemTotal:  32000000 kB\nMemAvailable:  18183912 kB\n")
+            self.assertEqual(util.available_memory(meminfo), 18183912 * 1024)
+            self.assertEqual(util.available_memory(Path(tmp) / "missing"), 0)
+
+
 class TestChildPath(unittest.TestCase):
     """VapourSynth's embedded Python must not find our virtualenv's python3."""
 
@@ -2089,6 +2206,20 @@ class TestInsideAContainer(unittest.TestCase):
             # Limited to one kind of core: nothing to choose between.
             with unittest.mock.patch.object(os, "sched_getaffinity", return_value={4, 5}):
                 self.assertEqual(tools._big_cores(cpus), "")
+
+    def test_cores_close_in_speed_are_all_used(self):
+        # A Core Ultra 7 258V: two favoured P-cores read a little higher than the
+        # other two, and the E-cores have two-thirds of their capacity.
+        with tempfile.TemporaryDirectory() as tmp:
+            cpus = self._cpus(Path(tmp), [1005, 1024, 1005, 1024, 676, 676, 676, 676])
+            with unittest.mock.patch.object(os, "sched_getaffinity", return_value=set(range(8))):
+                self.assertEqual(tools._big_cores(cpus), "")
+
+    def test_big_cores_need_not_be_exactly_equal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cpus = self._cpus(Path(tmp), [414] * 4 + [1024, 1024, 981, 981])
+            with unittest.mock.patch.object(os, "sched_getaffinity", return_value=set(range(8))):
+                self.assertEqual(tools._big_cores(cpus), "4,5,6,7")
 
 
 class TestShortfall(unittest.TestCase):

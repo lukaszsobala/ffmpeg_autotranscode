@@ -53,8 +53,8 @@ class Toolchain:
     # Rockchip MPP decoders ("h264_rkmpp", "av1_rkmpp"...). verify decodes with
     # them where they give the same frames as software; see verify.decode_args.
     rkmpp_decoders: set[str] = field(default_factory=set)
-    # The fastest cores, as a taskset list ("4-7" on an RK3588), when the CPU
-    # mixes big and little ones. Empty on a uniform CPU. See verify.ffmpeg_argv.
+    # The fast cores, as a taskset list ("4,5,6,7" on an RK3588), when the CPU
+    # has some much slower ones. Empty otherwise. See _big_cores, verify.ffmpeg_argv.
     big_cores: str = ""
     filters: set[str] = field(default_factory=set)
     encoders: set[str] = field(default_factory=set)
@@ -135,11 +135,21 @@ def _rockchip_video_engine() -> bool:
     return os.access(MPP_DEVICE, os.R_OK | os.W_OK)
 
 
-def _big_cores(cpus: Path = Path("/sys/devices/system/cpu")) -> str:
-    """The highest-capacity cores as "a,b,c", or "" when all cores are alike.
+# A core counts as big when it has at least this share of the fastest core's
+# capacity. An RK3588's A55s have about 0.4 of an A76, and pinning to the A76s
+# made verify 2.8x faster. A Core Ultra 7 258V's E-cores have 0.66 of its P-cores,
+# close enough that leaving them out would cost more than it saves. A share
+# rather than equality, too, because Intel reports its favoured cores a little
+# higher (1024 against 1005 on that chip): equality picked two P-cores of four.
+BIG_CORE_SHARE = 0.5
 
-    Only cores this process may run on: taskset refuses any other, and a
-    container or service limited to some cores would fail every measurement.
+
+def _big_cores(cpus: Path = Path("/sys/devices/system/cpu")) -> str:
+    """The cores worth pinning to as "a,b,c", or "" when every core is.
+
+    Those with at least BIG_CORE_SHARE of the highest capacity; "" when that is
+    all of them. Only cores this process may run on: taskset refuses any other,
+    and a container or service limited to some cores would fail every measurement.
     """
     try:
         allowed = os.sched_getaffinity(0)
@@ -153,10 +163,11 @@ def _big_cores(cpus: Path = Path("/sys/devices/system/cpu")) -> str:
             continue
     if allowed is not None:
         capacity = {cpu: value for cpu, value in capacity.items() if cpu in allowed}
-    if len(set(capacity.values())) < 2:
+    if not capacity:
         return ""
-    top = max(capacity.values())
-    return ",".join(str(cpu) for cpu in sorted(capacity) if capacity[cpu] == top)
+    floor = BIG_CORE_SHARE * max(capacity.values())
+    big = [cpu for cpu in sorted(capacity) if capacity[cpu] >= floor]
+    return "" if len(big) == len(capacity) else ",".join(map(str, big))
 
 
 def detect(cfg: Config) -> Toolchain:
@@ -350,6 +361,6 @@ def describe(chain: Toolchain) -> str:
         "(this build's decoders; unused -- the encode is CPU-only)",
         f"rkmpp       {', '.join(sorted(chain.rkmpp_decoders)) or 'none'}  "
         f"(usable decoders, for verify; needs {MPP_DEVICE})",
-        f"big cores   {chain.big_cores or 'none'}  (verify's filter passes run there)",
+        f"big cores   {chain.big_cores or 'all'}  (verify's filter passes run there)",
     ]
     return "\n".join(lines)

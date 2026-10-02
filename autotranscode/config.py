@@ -32,13 +32,11 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
         # kept a grainy 4K HDR film's fog and flat paper free of blocks (34 and 38
         # brought them back). The resolution curve lowers it for smaller sources.
         "encode": {"preset": 4, "crf": 30, "chunk_method": "auto"},
-        "grain": {"samples": 4, "sample_seconds": 2},
     },
     "generic": {},
     "workstation": {
         "machine": {"workers": 0},
         "encode": {"preset": 4, "crf": 28, "chunk_method": "auto"},
-        "grain": {"samples": 6, "sample_seconds": 3},
     },
 }
 
@@ -62,13 +60,15 @@ class Paths:
 class Machine:
     # "auto" picks rk3588 on an RK3588 board and generic anywhere else.
     profile: str = "auto"
-    workers: int = 0  # 0 => let Av1an decide
+    workers: int = 0  # 0 => by cores and available memory; see encode.workers
     nice: int = 10
 
 
 @dataclass(slots=True)
 class Encode:
-    preset: int = 6
+    # Every setting below was judged at preset 4; see the rk3588 profile for how
+    # the presets compare.
+    preset: int = 4
     # The CRF for a 4K source, and the most any source gets. Smaller sources get
     # less along the curve below, which is relative to this, so this one number
     # still moves the whole library's quality.
@@ -186,7 +186,11 @@ class Estimate:
 class Grain:
     mode: str = "auto"  # auto | always | never
     analysis: str = "sampled"  # sampled | full
-    samples: int = 6
+    # Excerpts for the grain table and its calibration, spread over the film. The
+    # same everywhere: they cost minutes against an encode of hours, and more of
+    # them give the table more scenes to be typical of and calibration more of the
+    # film to match.
+    samples: int = 10
     sample_seconds: int = 3
     denoise_filter: str = "hqdn3d"  # hqdn3d | nlmeans | atadenoise
     denoise_strength: str = "auto"  # "auto" or an explicit filter argument string

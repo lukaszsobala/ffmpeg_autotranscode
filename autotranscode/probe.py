@@ -155,6 +155,9 @@ class MediaInfo:
     frames: int
     video_bitrate: int
     video_bytes: int = 0   # exact, from container tags; 0 when unknown
+    # The video track's own length, which can differ from `duration` (the
+    # longest track's). 0 when the container does not say.
+    video_duration: float = 0.0
     # Pixel shape, "16:15" for 4:3 PAL, "64:45" for a 16:9 DVD. Empty when the
     # pixels are square. The encode carries none of it, so the mux restores it.
     sample_aspect: str = ""
@@ -257,6 +260,21 @@ def _tag_int(stream: dict, name: str) -> int:
         if key.upper() == name or key.upper().startswith(f"{name}-"):
             return _int(value)
     return 0
+
+
+def _stream_duration(stream: dict) -> float:
+    """A stream's length in seconds: MP4 states it, Matroska tags it per track
+    ("DURATION": "00:01:51.649000000"). 0.0 when neither does."""
+    try:
+        if seconds := float(stream.get("duration") or 0):
+            return seconds
+    except ValueError:
+        pass
+    for key, value in (stream.get("tags") or {}).items():
+        if key.upper() == "DURATION" or key.upper().startswith("DURATION-"):
+            if match := re.fullmatch(r"(\d+):(\d+):(\d+(?:\.\d+)?)", str(value).strip()):
+                return int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3])
+    return 0.0
 
 
 def _bit_depth(pix_fmt: str, stream: dict) -> int:
@@ -373,6 +391,20 @@ def _hdr10_metadata(
     return mastering, content_light
 
 
+def _color_range(video: dict, pix_fmt: str) -> str:
+    """"tv" or "pc", as the decoder will hand the frames over.
+
+    A yuvj pixel format means the bitstream itself says full range, and that is
+    what every decoder delivers, whatever the container says. Phones write both:
+    a 1080p HEVC clip tagged color_range=tv in the MP4 decoded to yuvj420p frames
+    spanning 0-255, and an encode signalled as limited range crushed its shadows
+    and clipped its highlights.
+    """
+    if pix_fmt.startswith("yuvj"):
+        return "pc"
+    return video.get("color_range", "")
+
+
 def _sample_aspect(value: str) -> str:
     """ffprobe's sample_aspect_ratio, or "" for square or unknown pixels."""
     match = re.fullmatch(r"(\d+):(\d+)", value or "")
@@ -433,6 +465,7 @@ def probe(path: Path, chain: Toolchain) -> MediaInfo:
     return MediaInfo(
         path=path,
         video_bytes=video_bytes,
+        video_duration=_stream_duration(video),
         size_bytes=_int(fmt.get("size")) or path.stat().st_size,
         duration=duration,
         container=fmt.get("format_name", ""),
@@ -448,7 +481,7 @@ def probe(path: Path, chain: Toolchain) -> MediaInfo:
         color_primaries=video.get("color_primaries", ""),
         color_transfer=video.get("color_transfer", ""),
         color_space=video.get("color_space", ""),
-        color_range=video.get("color_range", ""),
+        color_range=_color_range(video, pix_fmt),
         dolby_vision=dolby_vision,
         mastering_display=mastering,
         content_light=content_light,

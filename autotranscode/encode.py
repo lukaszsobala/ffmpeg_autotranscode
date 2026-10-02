@@ -16,7 +16,7 @@ from typing import TypeVar
 from .config import Config
 from .probe import MediaInfo
 from .tools import VAPOURSYNTH_CHUNK_METHODS, Toolchain
-from .util import log, run, run_watched
+from .util import available_memory, log, run, run_watched
 
 # ITU-T H.273 code points, which is what AV1 signals and what SvtAv1EncApp expects.
 # ffprobe reports the names on the left.
@@ -239,6 +239,45 @@ def chunk_method(cfg: Config, chain: Toolchain) -> str:
     return method
 
 
+# Av1an's own estimate of a worker's memory, in GB per megapixel of picture:
+# SVT-AV1's, plus the chunk method's (av1an-core 0.5.2, determine_workers).
+SVT_GB_PER_MEGAPIXEL = 1.2
+CHUNK_GB_PER_MEGAPIXEL = {"lsmash": 0.3, "ffms2": 0.3, "bestsource": 0.3}
+OTHER_CHUNK_GB_PER_MEGAPIXEL = 0.1
+# How many cores Av1an counts one SVT-AV1 worker as keeping busy.
+CORES_PER_WORKER = 6
+
+
+def workers(
+    info: MediaInfo, cfg: Config, chain: Toolchain,
+    *, memory: int | None = None, cores: int | None = None,
+) -> int:
+    """How many Av1an workers to run: `machine.workers`, or else as many as the
+    cores keep busy and the memory free right now can hold.
+
+    Av1an decides the same way but against total memory, as if the machine had
+    nothing else to do. On a desktop that is far from true, and with no swap an
+    extra 4K worker gets the encode killed rather than slowed. The memory is
+    measured once, as the encode starts. `memory` and `cores` default to this
+    machine's; with memory unknown, the cores alone decide.
+    """
+    if cfg.machine.workers > 0:
+        return cfg.machine.workers
+    if cores is None:
+        try:
+            cores = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cores = os.cpu_count() or 1
+    count = max(1, cores // CORES_PER_WORKER)
+    memory = available_memory() if memory is None else memory
+    megapixels = info.width * info.height / 1e6
+    if memory > 0 and megapixels > 0:
+        per_mp = SVT_GB_PER_MEGAPIXEL + CHUNK_GB_PER_MEGAPIXEL.get(
+            chunk_method(cfg, chain), OTHER_CHUNK_GB_PER_MEGAPIXEL)
+        count = min(count, int(memory / 1e9 / (megapixels * per_mp)))
+    return max(1, count)
+
+
 def build_command(
     info: MediaInfo,
     output: Path,
@@ -274,8 +313,7 @@ def build_command(
         "-y",
     ]
 
-    if cfg.machine.workers > 0:
-        argv += ["-w", str(cfg.machine.workers)]
+    argv += ["-w", str(workers(info, cfg, chain))]
     if method in VAPOURSYNTH_CHUNK_METHODS:
         # The index goes next to the source by default: into the library.
         argv += ["--cache-mode", "temp"]
@@ -309,6 +347,82 @@ def run_encode(
         return None
     shim_dir = str(write_ffmpeg_shim(cfg.work_dir / "bin", chain.ffmpeg))
     return run_watched(argv, check or (lambda: None), extra_path=[shim_dir, *chain.bin_dirs])
+
+
+# More than this between the encode's length and the source video's is not
+# Matroska's millisecond rounding: the encode has lost the source's timing.
+DRIFT_SECONDS = 0.1
+
+
+def drifted(expected: float, actual: float) -> bool:
+    return expected > 0 and actual > 0 and abs(actual - expected) > DRIFT_SECONDS
+
+
+def timestamps_v2(times: list[float]) -> str:
+    """mkvmerge's timestamp file: one presentation time per frame, in ms."""
+    return "# timestamp format v2\n" + "".join(f"{t * 1000:.3f}\n" for t in times)
+
+
+def frame_times(chain: Toolchain, path: Path) -> list[float]:
+    """The video's presentation times in seconds, in display order."""
+    out = run([chain.ffprobe, "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path)]).stdout
+    lines = [line.strip().rstrip(",") for line in out.splitlines() if line.strip()]
+    try:
+        return sorted(float(line) for line in lines)
+    except ValueError:
+        raise ValueError(f"{path.name} has video packets without timestamps") from None
+
+
+def _duration(chain: Toolchain, path: Path) -> float:
+    out = run([chain.ffprobe, "-v", "error", "-show_entries", "format=duration",
+               "-of", "csv=p=0", str(path)]).stdout.strip()
+    try:
+        return float(out)
+    except ValueError:
+        return 0.0
+
+
+def _frame_count(chain: Toolchain, path: Path) -> int:
+    out = run([chain.ffprobe, "-v", "error", "-select_streams", "v:0", "-count_packets",
+               "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0",
+               str(path)]).stdout.strip()
+    return int(out) if out.isdigit() else 0
+
+
+def keep_source_timing(info: MediaInfo, encoded: Path, chain: Toolchain, work: Path) -> None:
+    """Give `encoded` the source's frame times, if the encode lost them.
+
+    Av1an hands the encoder frames and nothing else, and the result plays them
+    at one constant rate. A source with a variable frame rate -- a phone's,
+    which drops frames in low light -- then runs short against its own audio:
+    6,699 frames that span 124 s at an average 54 fps played in 111.6 s at 60,
+    and the sound drifted 12 s ahead by the end. Every frame survives, so the
+    source's timestamps fit the encode one for one, and mkvmerge writes them in.
+    grav1synth and the mux keep them from there.
+
+    Nothing is done for a constant frame rate: the lengths already agree.
+    """
+    expected = info.video_duration or info.duration
+    actual = _duration(chain, encoded)
+    if not drifted(expected, actual):
+        return
+    if not chain.mkvmerge:
+        raise ValueError(f"the encode runs {actual:.1f}s against the source's {expected:.1f}s "
+                         "and needs mkvmerge to put the source's timing back")
+    times = frame_times(chain, info.path)
+    frames = _frame_count(chain, encoded)
+    if len(times) != frames:
+        raise ValueError(f"the encode runs {actual:.1f}s against the source's {expected:.1f}s, "
+                         f"and its {frames} frames cannot take the source's "
+                         f"{len(times)} timestamps")
+    stamps = work / "timestamps.txt"
+    stamps.write_text(timestamps_v2(times), encoding="ascii")
+    retimed = work / "retimed.mkv"
+    run([chain.mkvmerge, "-q", "-o", str(retimed), "--timestamps", f"0:{stamps}", str(encoded)])
+    os.replace(retimed, encoded)
+    log.info("  variable frame rate: the encode ran %.1fs; given the source's frame times "
+             "(%.1fs)", actual, expected)
 
 
 # Av1an 0.5.2 (and master as of 2026-09) cuts each chunk out of a split segment

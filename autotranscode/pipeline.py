@@ -504,6 +504,9 @@ def _transcode(
 
     if not encoded.is_file() or not encoded.stat().st_size:
         raise CommandError(argv, 1, "Av1an produced no output")
+    # Before the grain step, whose calibration compares the encode with the
+    # source at the same times.
+    encode.keep_source_timing(read, encoded, chain, work)
 
     video = encoded
     if table:

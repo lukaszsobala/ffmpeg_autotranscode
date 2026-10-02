@@ -325,7 +325,8 @@ stage_grav1synth() {
   # Patched, so not `cargo install grav1synth`: 0.2.0 (the latest release, and main
   # as of 2026-09) corrupts the sequence header when its last field ends a byte,
   # which with the usual flags means widths 513-1024 at heights 257-512 -- 640x480,
-  # NTSC DVD, 854x480 -- and every such file fails at the grain step. See the patch.
+  # NTSC DVD, 854x480 -- and every such file fails at the grain step. It also clamps
+  # full-range video to 16-235 wherever it applies grain. See the patch.
   local src="$BUILD_DIR/grav1synth-${GRAV1SYNTH_VERSION}"
   mkdir -p "$BUILD_DIR"
   rm -rf "$src"

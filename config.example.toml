@@ -16,12 +16,14 @@
 # The preset and crf set under [encode] below win over any profile's.
 profile = "auto"
 
-# Av1an parallel workers. 0 lets Av1an choose from core count.
+# Av1an parallel workers. 0 runs one per six cores, and no more than the memory
+# free when the encode starts can hold, by Av1an's own estimate of a worker's
+# memory (about 11-12 GB for 4K, 3 GB for 1080p).
 #
 # On RK3588 use 1. The binding constraint is memory, not cores: at 4K 10-bit a
 # single SVT-AV1 instance is already several GB, and two of them drive a 16 GB
 # board into swap, while one worker already keeps the cores busy. The rk3588
-# profile sets 1 and the others leave it to Av1an, so this stays commented out
+# profile sets 1 and the others leave it at 0, so this stays commented out
 # unless you want to override that.
 # workers = 1
 
@@ -152,8 +154,8 @@ mode = "auto"
 # "full" analyses the entire film: more faithful, but needs lossless scratch space
 # proportional to the whole runtime. Expect tens of GiB.
 analysis = "sampled"
-samples = 4
-sample_seconds = 2
+samples = 10           # excerpts for the grain table and its calibration
+sample_seconds = 3
 
 denoise_filter = "hqdn3d"
 denoise_strength = "auto"    # "auto" picks from the measured score; or set e.g. "hqdn3d=1.4:1.0:6:6"

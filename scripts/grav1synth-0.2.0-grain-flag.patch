@@ -47,3 +47,21 @@
                  }
  
                  Ok((input, Some(Obu::SequenceHeader(header))))
+--- a/src/parser/frame.rs
++++ b/src/parser/frame.rs
+@@ -735,8 +735,13 @@
+         }
+         // overlap flag (1 bit)
+         data.push(params.overlap_flag);
+-        // clip_to_restricted_range flag (1 bit)
+-        data.push(params.clip_to_restricted_range);
++        // clip_to_restricted_range flag (1 bit). Tables carry no such flag, so
++        // follow the stream: clipping a full-range picture to 16-235 crushes its
++        // shadows and highlights wherever grain is applied.
++        data.push(
++            params.clip_to_restricted_range
++                && color_config.color_range == super::sequence::ColorRange::Limited,
++        );
+ 
+         self.packet_out.extend_from_slice(data.as_raw_slice());
+ 

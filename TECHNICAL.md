@@ -33,7 +33,9 @@ source's, and that took three attempts to get right:
    default. The samples are encoded with `--film-grain`, ffmpeg's decoder reads back
    every frame's parameters, the most typical frame's become the table (its medoid:
    one atypical frame drew faint stripes), and grav1synth writes it into the
-   finished stream. About five minutes per film, whatever its length.
+   finished stream. Minutes per film, whatever its length: five on an RK3588 with
+   four 2-second samples, the old setting there. Ten 3-second samples, the default
+   now, took 1m47s for a 1080p clip on a Core Ultra 7 258V.
 
 The table is then **calibrated**: the grain in the result is measured against the
 source's, plane by plane, and the table rescaled to match — in seconds, since only
@@ -238,7 +240,10 @@ wrongly: 14,487 of 14,584 frames differed from dav1d's, at 20-28 dB. A
 Decoding was never the bottleneck anyway. The blur and PSNR filters are, and the
 kernel keeps their threads on the A55 cores. Pinned to the A76s with a thread
 each, 3,000 SD frames took 52 s instead of 144 s. Hardware decoding contributed
-only about 8% of that.
+only about 8% of that. Only cores with less than half the fastest one's
+capacity are left out, though: an A55 has about 0.4 of an A76, but an Intel
+Core Ultra 7 258V's E-cores have two-thirds of its P-cores, and there `verify`
+runs on all eight.
 
 ### Film grain on the RK3588's AV1 decoder
 
@@ -276,8 +281,15 @@ RK3588, where 4.1 and 4.2 added NEON kernels.
 0.2.0, the latest release, writes a broken sequence header whenever the header's
 last field ends a byte. With the usual flags that is any width from 513 to 1024 at
 a height from 257 to 512 -- 640x480, NTSC DVD, 854x480 -- and every such file
-failed at the grain step with "Error when reformatting data of a packet". A
-grav1synth from plain `cargo install` still works for everything else.
+failed at the grain step with "Error when reformatting data of a packet".
+
+It also marks every frame's grain `clip_to_restricted_range`, which tells the
+decoder to clamp the picture to 16-235 wherever it adds grain. Harmless on a
+limited-range film; on a full-range phone clip it crushed the shadows and clipped
+the highlights. The patch clips only when the stream is limited range.
+
+A grav1synth from plain `cargo install` still works for limited-range sources at
+any other size.
 
 ### Why chunks come from L-SMASH-Works
 
