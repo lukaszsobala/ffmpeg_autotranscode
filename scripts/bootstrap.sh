@@ -44,12 +44,23 @@ LSMASH_WORKS_COMMIT="${LSMASH_WORKS_COMMIT:-7e63c8400a252f4dbbeea80cc3bfec895abf
 PREFIX="${PREFIX:-$HOME/.local}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$HOME/.cache/autotranscode-build}"
+# Sources and build trees are deleted once a stage has installed: nothing that runs
+# needs them, and they come to over 500 MB. KEEP_BUILD_DIR=1 keeps them, to look
+# into a failed build or to rebuild without fetching again.
+KEEP_BUILD_DIR="${KEEP_BUILD_DIR:-0}"
 
 log()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 # sudo, except as root: root has no need of it, and a container has no sudo.
 as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+# Delete what a stage built from, and BUILD_DIR once nothing else is in it. Only
+# the stage's own trees: another bootstrap may be building in BUILD_DIR meanwhile.
+done_with() {
+  [[ $KEEP_BUILD_DIR == 1 ]] && return
+  rm -rf "$@"
+  rmdir "$BUILD_DIR" 2>/dev/null || true
+}
 
 case "$(uname -s)" in
   Linux)
@@ -197,6 +208,7 @@ stage_svtav1() {
     as_root cmake --install "$src/Build"
     [[ $OS == linux ]] && as_root ldconfig
   fi
+  done_with "$src"
 
   local svt="$PREFIX/bin/SvtAv1EncApp"
   [[ -x $svt ]] || die "SvtAv1EncApp not found at ${svt} after install"
@@ -253,6 +265,7 @@ stage_vapoursynth() {
 
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion vapoursynth \
     || die "vapoursynth.pc not found under ${PREFIX}"
+  done_with "$zimg" "$vs" "$venv"
 }
 
 stage_lsmash() {
@@ -289,6 +302,7 @@ stage_lsmash() {
   mkdir -p "$plugins"
   install -m 755 "$built" "$plugins/"
   log "Installed $(basename "$built") into ${plugins}"
+  done_with "$src"
 }
 
 ensure_cargo() {
@@ -335,6 +349,7 @@ stage_grav1synth() {
   patch -d "$src" -p1 < "$SCRIPT_DIR/grav1synth-${GRAV1SYNTH_VERSION}-grain-flag.patch"
   cargo install --path "$src" --locked --force
   grav1synth --help >/dev/null 2>&1 || warn "grav1synth installed but --help failed"
+  done_with "$src"
 }
 
 # The first Python on PATH that is 3.11 or newer (tomllib), or nothing.
