@@ -51,17 +51,49 @@ class NoSaving(SkipFile):
         self.settings = settings
 
 
-def _size_settings(cfg: Config, chain: Toolchain) -> dict[str, object]:
+# How many grain samples, and how long. They shape the grain table, which adds
+# nothing measurable to the size, so they do not decide size -- unless a denoise
+# before the encode is on, which the grain probe they feed switches on and off.
+GRAIN_SAMPLING = ("samples", "sample_seconds")
+# The sampling shipped while it was still part of the digests, the RK3588's and
+# everyone else's. Digests stored then are matched as if made with one of these,
+# so that leaving the sampling out did not throw away a library's estimates.
+EARLIER_GRAIN_SAMPLING = ((4, 2), (6, 3))
+
+
+def _size_settings(cfg: Config, chain: Toolchain,
+                   sampling: tuple[int, int] | None = None) -> dict[str, object]:
+    """What decides size. `sampling` puts the grain sampling back in, as digests
+    made before it left had it."""
+    grain = asdict(cfg.grain)
+    if not cfg.grain.denoise_before_encode:
+        for name in GRAIN_SAMPLING:
+            del grain[name]
+        if sampling is not None:
+            grain.update(zip(GRAIN_SAMPLING, sampling, strict=True))
     return {
         "encode": asdict(cfg.encode),
-        "grain": asdict(cfg.grain),
+        "grain": grain,
         "audio": asdict(cfg.audio),
         "svt_av1": chain.svtav1_version,
     }
 
 
+def _savings(cfg: Config) -> dict[str, object]:
+    return {
+        "min_saving_percent": cfg.output.min_saving_percent,
+        "min_saving_mib": cfg.output.min_saving_mib,
+    }
+
+
 def _digest(settings: dict[str, object]) -> str:
     return hashlib.sha256(json.dumps(settings, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _earlier(cfg: Config) -> tuple[tuple[int, int] | None, ...]:
+    """Grain sampling to try besides the current digest's: none with a denoise on,
+    since its digest still holds the sampling it was made with."""
+    return () if cfg.grain.denoise_before_encode else EARLIER_GRAIN_SAMPLING
 
 
 def size_key(cfg: Config, chain: Toolchain) -> str:
@@ -72,17 +104,27 @@ def size_key(cfg: Config, chain: Toolchain) -> str:
     return _digest(_size_settings(cfg, chain))
 
 
+def size_keys(cfg: Config, chain: Toolchain) -> set[str]:
+    """`size_key`, and the digests an estimate made before the grain sampling
+    left it may carry."""
+    return {size_key(cfg, chain),
+            *(_digest(_size_settings(cfg, chain, s)) for s in _earlier(cfg))}
+
+
 def settings_key(cfg: Config, chain: Toolchain) -> str:
     """`size_key` plus the minimum savings.
 
     A file that did not save enough is skipped while this stays the same: trying
     again would spend the same hours to reach the same size.
     """
-    return _digest({
-        **_size_settings(cfg, chain),
-        "min_saving_percent": cfg.output.min_saving_percent,
-        "min_saving_mib": cfg.output.min_saving_mib,
-    })
+    return _digest({**_size_settings(cfg, chain), **_savings(cfg)})
+
+
+def settings_keys(cfg: Config, chain: Toolchain) -> set[str]:
+    """`settings_key`, and its digests from before the grain sampling left it."""
+    return {settings_key(cfg, chain),
+            *(_digest({**_size_settings(cfg, chain, s), **_savings(cfg)})
+              for s in _earlier(cfg))}
 
 
 def by_estimate(sources: list[Path], ledger: Ledger, cfg: Config,
@@ -92,9 +134,9 @@ def by_estimate(sources: list[Path], ledger: Ledger, cfg: Config,
 
     A run that is stopped early has then spent its hours where they bought the most.
     """
-    key = size_key(cfg, chain)
+    keys = size_keys(cfg, chain)
     rate = {source: guess.saved_per_hour
-            for source in sources if (guess := ledger.guess(source, key))}
+            for source in sources if (guess := ledger.guess(source, keys))}
     ordered = sorted(sources, key=lambda source: (source not in rate, -rate.get(source, 0.0)))
     return ordered, len(rate)
 
@@ -651,8 +693,8 @@ def _process_all(
 ) -> int:
     failures = 0
     total = len(sources)
-    settings = settings_key(cfg, chain)
-    sizes = size_key(cfg, chain)
+    settings = settings_keys(cfg, chain)
+    sizes = size_keys(cfg, chain)
 
     for index, source in enumerate(sources, start=1):
         log.info("[%d/%d] %s", index, total, source)
@@ -660,7 +702,7 @@ def _process_all(
         if done := ledger.already_done(source):
             log.info("  skipping, already transcoded to %s", done.output)
             continue
-        if (tried := ledger.no_saving(source)) and tried.settings == settings:
+        if (tried := ledger.no_saving(source)) and tried.settings in settings:
             log.info("  skipping, did not save enough with the same settings before (%s)",
                      tried.reason)
             continue

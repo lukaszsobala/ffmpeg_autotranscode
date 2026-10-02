@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Collection
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -133,10 +134,12 @@ class Ledger:
         self.records[_key(source)] = record
         self.save()
 
-    def guess(self, source: Path, settings: str) -> Guess | None:
-        """The estimate for `source` made with these settings, if there is one."""
+    def guess(self, source: Path, settings: str | Collection[str]) -> Guess | None:
+        """The estimate for `source` made with these settings, if there is one.
+        `settings` is a digest, or several that count as the same settings."""
+        accepted = {settings} if isinstance(settings, str) else set(settings)
         guess = self.guesses.get(_key(source))
-        return guess if guess and guess.settings == settings else None
+        return guess if guess and guess.settings in accepted else None
 
     def record_guess(self, source: Path, guess: Guess) -> None:
         self.guesses[_key(source)] = guess

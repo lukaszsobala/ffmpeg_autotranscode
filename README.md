@@ -223,6 +223,8 @@ Each result is kept in the state file, and `run` uses it:
   made with (the `encode`, `grain` and `audio` sections and the SVT-AV1 version) and
   the file is unchanged. Change any of them and estimate again; until then those
   files are encoded in their usual order, the early saving check still watching.
+  `grain.samples` and `grain.sample_seconds` do not count: they shape the grain
+  table, not the size, unless `grain.denoise_before_encode` is on.
 
 `plan` shows the same order and the same skips.
 
@@ -355,8 +357,8 @@ converts it to SDR with `tonemapx` instead of skipping it. Set
   each file is heading.
 - **Files that did not save enough before**, while the settings that decide size
   (the `encode`, `grain` and `audio` sections, both minimum savings, the SVT-AV1
-  version) are unchanged. Change any of them, `--crf` included, and the file gets
-  another try.
+  version) are unchanged, grain sampling aside. Change any of them, `--crf`
+  included, and the file gets another try.
 - **Sources already below `library.min_bits_per_pixel`** (bitrate / (width x height x
   fps)). The default of 0.03 rejects only the hopeless: a 4K HDR remux measures
   ~0.15, a 1080p web release ~0.08, a good 4K AV1 encode ~0.01. A source whose

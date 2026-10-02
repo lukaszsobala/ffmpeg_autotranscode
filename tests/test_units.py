@@ -6,6 +6,8 @@ Deliberately stdlib-only (unittest, no pytest) so this runs on a bare board:
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import locale
 import os
@@ -2302,6 +2304,49 @@ class TestEstimatesSteerTheRun(unittest.TestCase):
         self.assertNotEqual(before[1], pipeline.settings_key(self.cfg, self.chain))
         self.cfg.encode.crf = 25
         self.assertNotEqual(before[0], pipeline.size_key(self.cfg, self.chain))
+
+    def test_grain_sampling_does_not_invalidate_an_estimate(self):
+        before = pipeline.size_key(self.cfg, self.chain), pipeline.settings_key(self.cfg, self.chain)
+        self.cfg.grain.samples, self.cfg.grain.sample_seconds = 20, 5
+        self.assertEqual(before, (pipeline.size_key(self.cfg, self.chain),
+                                  pipeline.settings_key(self.cfg, self.chain)))
+
+    def test_with_a_denoise_the_grain_sampling_decides_size(self):
+        # The probe the samples feed then switches the denoise on and off.
+        self.cfg.grain.denoise_before_encode = True
+        before = pipeline.size_key(self.cfg, self.chain)
+        self.cfg.grain.samples = 20
+        self.assertNotEqual(before, pipeline.size_key(self.cfg, self.chain))
+
+    def _digest_before_sampling_left(self, samples: int, seconds: int,
+                                     savings: bool = False) -> str:
+        # Exactly what size_key and settings_key wrote until then.
+        grain = dataclasses.asdict(self.cfg.grain)
+        grain.update(samples=samples, sample_seconds=seconds)
+        settings = {"encode": dataclasses.asdict(self.cfg.encode), "grain": grain,
+                    "audio": dataclasses.asdict(self.cfg.audio),
+                    "svt_av1": self.chain.svtav1_version}
+        if savings:
+            settings.update(min_saving_percent=self.cfg.output.min_saving_percent,
+                            min_saving_mib=self.cfg.output.min_saving_mib)
+        return hashlib.sha256(json.dumps(settings, sort_keys=True, default=str)
+                              .encode()).hexdigest()[:16]
+
+    def test_estimates_from_before_the_sampling_left_still_count(self):
+        a, b, c, _ = self.files
+        self._guess(a, 2000, 1000, 1, settings=self._digest_before_sampling_left(4, 2))
+        self._guess(b, 2000, 1000, 1, settings=self._digest_before_sampling_left(6, 3))
+        self._guess(c, 2000, 1000, 1, settings=self._digest_before_sampling_left(8, 2))
+        keys = pipeline.size_keys(self.cfg, self.chain)
+        self.assertIsNotNone(self.ledger.guess(a, keys))   # the RK3588's 4 x 2 s
+        self.assertIsNotNone(self.ledger.guess(b, keys))   # everyone else's 6 x 3 s
+        self.assertIsNone(self.ledger.guess(c, keys))      # never shipped
+
+    def test_a_no_saving_skip_from_before_the_sampling_left_still_counts(self):
+        old = self._digest_before_sampling_left(4, 2, savings=True)
+        self.assertIn(old, pipeline.settings_keys(self.cfg, self.chain))
+        self.cfg.encode.crf = 25
+        self.assertNotIn(old, pipeline.settings_keys(self.cfg, self.chain))
 
     def test_estimated_files_go_first_best_saving_per_hour_on_top(self):
         a, b, c, d = self.files

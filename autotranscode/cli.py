@@ -306,7 +306,7 @@ def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> 
     roots = pipeline.library_roots(inputs)
     ledger = Ledger(cfg.state_path)
     sources, _ = pipeline.by_estimate(sources, ledger, cfg, chain)
-    key = pipeline.size_key(cfg, chain)
+    keys = pipeline.size_keys(cfg, chain)
 
     for source in sources:
         print(f"\n=== {source}")
@@ -322,7 +322,7 @@ def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> 
         except pipeline.SkipFile as exc:
             print(f"  SKIP: {exc}")
             continue
-        if guess := ledger.guess(source, key):
+        if guess := ledger.guess(source, keys):
             if short := watch.shortfall(cfg, guess.source_bytes, guess.projected_bytes):
                 print(f"  SKIP: estimated to come out {short}")
                 continue
