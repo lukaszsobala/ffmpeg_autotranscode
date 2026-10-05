@@ -2373,3 +2373,72 @@ class TestEstimatesSteerTheRun(unittest.TestCase):
                                   pipeline.StopRequest())
         self.assertEqual(encoded, [c, d])
         self.assertIsNone(self.ledger.get(a), "a guess is not a verdict: nothing is recorded")
+
+
+class TestGrainStepResumes(unittest.TestCase):
+    """A restart resumes Av1an's chunks; it must not redo the grain step before
+    them unless a setting that step depends on has changed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = config.Config()
+        self.chain = make_chain()
+        self.info = make_info()
+        self.built = 0
+        self.measured = 0
+
+        def fake_build(_info, _chain, _cfg, _report, work):
+            self.built += 1
+            table = work / "grain.tbl"
+            table.write_text(TABLE, encoding="utf-8")
+            return table
+
+        def fake_measure(*_args):
+            self.measured += 1
+            return GrainReport(38.0, [38.0], [1.0], grainy=True, denoise_filter="hqdn3d")
+
+        for name, fake in (("build_table", fake_build), ("measure", fake_measure)):
+            patcher = unittest.mock.patch.object(grain, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _step(self):
+        return pipeline._grain_step(self.info, self.chain, self.cfg, self.work, dry_run=False)
+
+    def test_a_restart_keeps_the_table(self):
+        _, first = self._step()
+        _, again = self._step()
+        self.assertEqual((self.built, again), (1, first))
+
+    def test_a_changed_grain_setting_rebuilds_it(self):
+        self._step()
+        self.cfg.grain.samples += 1
+        self._step()
+        self.assertEqual(self.built, 2)
+
+    def test_settings_used_only_after_the_encode_do_not_rebuild_it(self):
+        self._step()
+        self.cfg.grain.calibrate = not self.cfg.grain.calibrate
+        self.cfg.grain.keep_table = not self.cfg.grain.keep_table
+        self._step()
+        self.assertEqual(self.built, 1)
+
+    def test_the_probe_report_is_kept_with_the_table(self):
+        self.cfg.grain.estimator = "grav1synth"
+        first, _ = self._step()
+        again, _ = self._step()
+        self.assertEqual((self.measured, again), (1, first))
+
+    def test_a_missing_table_is_rebuilt(self):
+        _, table = self._step()
+        present(table).unlink()
+        self._step()
+        self.assertEqual(self.built, 2)
+
+    def test_a_failed_table_is_tried_again(self):
+        with unittest.mock.patch.object(grain, "build_table", lambda *_args: None):
+            self.assertEqual(self._step(), (None, None))
+        self._step()
+        self.assertEqual(self.built, 1)

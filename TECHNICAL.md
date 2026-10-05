@@ -325,6 +325,9 @@ starts is given a locale verified to exist, so transcodes are immune.
 
 - **Within a file**: Av1an keeps completed chunks under `work_dir`, so an
   interrupted encode restarts from the chunk it was on.
+- **The grain probe and table** are kept beside the chunks, with a digest of the
+  grain settings, the encoder flags SVT's estimate uses, and the source's size and
+  duration. A rerun reuses them unless one of those changed.
 - **The staged copy** is kept when a run does not finish; the next run checks the
   size still matches and reuses it.
 - **Across a library**: a JSON ledger records every finished file. A source that

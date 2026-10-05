@@ -485,6 +485,65 @@ def _drop_staged(staged: Path | None, staged_out: Path | None, cfg: Config) -> N
         log.debug("staged copy removed: %s", staged)
 
 
+def _grain_key(read: MediaInfo, chain: Toolchain, cfg: Config) -> str:
+    """A digest of everything the grain probe and table depend on."""
+    settings = asdict(cfg.grain)
+    # Both act on the finished encode, after the table is made.
+    del settings["keep_table"], settings["calibrate"]
+    if cfg.grain.estimator == "svt":
+        # SVT's estimate is an encode of the samples with the real encode's flags.
+        settings["svt"] = [*encode.svt_params(read, cfg, chain),
+                           encode.pix_format(read, cfg), chain.svtav1_version]
+    return _digest({"grain": settings, "source": [read.size_bytes, read.duration]})
+
+
+def _grain_step(
+    read: MediaInfo, chain: Toolchain, cfg: Config, work: Path, *, dry_run: bool,
+) -> tuple[grain.GrainReport | None, Path | None]:
+    """The grain probe and table, or the ones an interrupted run left in `work`.
+
+    Av1an resumes from its finished chunks, and the grain step before it should not
+    be paid for again on every restart either. It is redone only when a setting it
+    depends on has changed since.
+    """
+    if cfg.grain.mode == "never":
+        return None, None
+    saved = work / "grain.json"
+    key = _grain_key(read, chain, cfg)
+    try:
+        earlier = json.loads(saved.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        earlier = None
+    if isinstance(earlier, dict) and earlier.get("key") == key:
+        report = grain.GrainReport(**earlier["report"]) if earlier.get("report") else None
+        table = work / "grain.tbl" if earlier.get("table") else None
+        if table is None or table.is_file():
+            log.info("  grain probe and table kept from an earlier run (settings unchanged)")
+            return report, table
+
+    report = None
+    table = None
+    grainy = True
+    if grain.needs_probe(cfg):
+        report = grain.measure(read, chain, cfg, work)
+        log.info("  %s", report.describe(denoising=cfg.grain.denoise_before_encode))
+        grainy = report.grainy
+    if dry_run:
+        return report, None
+    if grainy:
+        table = grain.build_table(read, chain, cfg, report, work)
+        if table is None:
+            # Not saved: a missing tool or a failed run may well be fixed by the next.
+            log.warning("  no grain table; encoding without denoising to avoid losing grain")
+            return report, None
+    saved.write_text(json.dumps({
+        "key": key,
+        "report": asdict(report) if report else None,
+        "table": table is not None,
+    }), encoding="utf-8")
+    return report, table
+
+
 def _transcode(
     source: Path,
     info: MediaInfo,
@@ -503,19 +562,7 @@ def _transcode(
     `info` describes the source, `read` says where to read it, and `staged_out` --
     when set -- says where to write the result before moving it to `final`.
     """
-    report: grain.GrainReport | None = None
-    table: Path | None = None
-
-    if cfg.grain.mode != "never":
-        grainy = True
-        if grain.needs_probe(cfg):
-            report = grain.measure(read, chain, cfg, work)
-            log.info("  %s", report.describe(denoising=cfg.grain.denoise_before_encode))
-            grainy = report.grainy
-        if grainy and not dry_run:
-            table = grain.build_table(read, chain, cfg, report, work)
-            if table is None:
-                log.warning("  no grain table; encoding without denoising to avoid losing grain")
+    report, table = _grain_step(read, chain, cfg, work, dry_run=dry_run)
 
     # Only ever denoise when there is a table to put the grain back with, and by
     # default not even then: see grain.denoise_before_encode.
