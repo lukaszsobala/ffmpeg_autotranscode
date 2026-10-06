@@ -294,8 +294,10 @@ setting into another directory.
 ## Stopping and resuming
 
 A single film can take half a day, so stopping one is a normal thing to do.
-Completed chunks, the grain table, the staged copy and the list of finished files are all kept, so
-an interrupted run loses at most the chunk in flight — seconds of video.
+Completed chunks, scene detection (five minutes of film at a time), the grain
+table, the staged copy and the list of finished files are all kept, so an
+interrupted run loses at most the chunk in flight — seconds of video — or the part
+of scene detection it was on.
 
 | | |
 |---|---|

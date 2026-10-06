@@ -325,6 +325,28 @@ starts is given a locale verified to exist, so transcodes are immune.
 
 - **Within a file**: Av1an keeps completed chunks under `work_dir`, so an
   interrupted encode restarts from the chunk it was on.
+- **The scene list** is kept beside the chunks, not inside Av1an's temp directory.
+  Av1an resumes only once it has written its chunk list, which comes after scene
+  detection (and, with `hybrid`, after its keyframe scan and split). Stopped before
+  that, it found no chunk list and detected the scenes again, hours for a 4K film,
+  though its own `scenes.json` was still there. It is now passed `--scenes`, which
+  it reads whenever the file exists. The file is named by a digest of the source's
+  size and duration and the settings scene detection uses (chunk method,
+  `sc_method`, `min_scene_len`, `extra_split_sec`, `sc_downscale_height`), so one of
+  those changing detects the scenes afresh; CRF and the other encoder flags do not.
+- **Scene detection itself** is all or nothing in Av1an: it keeps nothing until the
+  whole film is decoded, which for 4K on an RK3588 can take more than a day. With a
+  VapourSynth chunk method (`lsmash`, `ffms2`, `bestsource`), autotranscode
+  therefore runs it in five-minute parts: Av1an's own detector (`--sc-only`) with
+  the encode's detection settings, on a script that serves one part from the same
+  index the encode uses. Each part is kept as it finishes, so a stop loses the part
+  in flight, and the parts are merged into the scene list once all are done. Every
+  part starts a new scene, which costs one keyframe per five minutes of film. A
+  film shorter than ten minutes, an ffmpeg-based chunk method, or a part that
+  fails leaves detection to Av1an in one go, as before.
+- **The keyframe scan** of the `hybrid` method (`ffprobe -show_frames` over the
+  whole film) is kept the same way, by an `ffprobe` wrapper on Av1an's PATH that
+  saves the scan once it completes and replays it on a rerun.
 - **The grain probe and table** are kept beside the chunks, with a digest of the
   grain settings, the encoder flags SVT's estimate uses, and the source's size and
   duration. A rerun reuses them unless one of those changed.

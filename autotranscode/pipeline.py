@@ -25,12 +25,12 @@ from collections.abc import Iterator, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from . import encode, grain, mux, watch
+from . import encode, grain, mux, scenes, watch
 from .config import Config
 from .probe import MediaInfo, probe
 from .state import Ledger, Record
 from .tools import Toolchain
-from .util import CommandError, human_duration, human_size, log
+from .util import CommandError, digest, human_duration, human_size, log
 
 
 class SkipFile(Exception):
@@ -86,10 +86,6 @@ def _savings(cfg: Config) -> dict[str, object]:
     }
 
 
-def _digest(settings: dict[str, object]) -> str:
-    return hashlib.sha256(json.dumps(settings, sort_keys=True, default=str).encode()).hexdigest()[:16]
-
-
 def _earlier(cfg: Config) -> tuple[tuple[int, int] | None, ...]:
     """Grain sampling to try besides the current digest's: none with a denoise on,
     since its digest still holds the sampling it was made with."""
@@ -101,14 +97,14 @@ def size_key(cfg: Config, chain: Toolchain) -> str:
 
     An estimate stays good while this stays the same.
     """
-    return _digest(_size_settings(cfg, chain))
+    return digest(_size_settings(cfg, chain))
 
 
 def size_keys(cfg: Config, chain: Toolchain) -> set[str]:
     """`size_key`, and the digests an estimate made before the grain sampling
     left it may carry."""
     return {size_key(cfg, chain),
-            *(_digest(_size_settings(cfg, chain, s)) for s in _earlier(cfg))}
+            *(digest(_size_settings(cfg, chain, s)) for s in _earlier(cfg))}
 
 
 def settings_key(cfg: Config, chain: Toolchain) -> str:
@@ -117,13 +113,13 @@ def settings_key(cfg: Config, chain: Toolchain) -> str:
     A file that did not save enough is skipped while this stays the same: trying
     again would spend the same hours to reach the same size.
     """
-    return _digest({**_size_settings(cfg, chain), **_savings(cfg)})
+    return digest({**_size_settings(cfg, chain), **_savings(cfg)})
 
 
 def settings_keys(cfg: Config, chain: Toolchain) -> set[str]:
     """`settings_key`, and its digests from before the grain sampling left it."""
     return {settings_key(cfg, chain),
-            *(_digest({**_size_settings(cfg, chain, s), **_savings(cfg)})
+            *(digest({**_size_settings(cfg, chain, s), **_savings(cfg)})
               for s in _earlier(cfg))}
 
 
@@ -356,8 +352,8 @@ def _work_dir(source: Path, cfg: Config) -> Path:
     Av1an resume across runs, so it must follow the real source and never a
     staged copy. Passing the path explicitly makes that hard to get wrong.
     """
-    digest = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
-    path = cfg.work_dir / digest
+    name = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
+    path = cfg.work_dir / name
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -365,8 +361,8 @@ def _work_dir(source: Path, cfg: Config) -> Path:
 def _staged_path(source: Path, cfg: Config, suffix: str) -> Path:
     """Name staged files by the whole source path, so identically named files in
     different folders cannot collide."""
-    digest = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
-    return cfg.staging_dir / f"{digest}{suffix}"
+    name = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
+    return cfg.staging_dir / f"{name}{suffix}"
 
 
 def staged_output_path(source: Path, cfg: Config) -> Path:
@@ -494,7 +490,7 @@ def _grain_key(read: MediaInfo, chain: Toolchain, cfg: Config) -> str:
         # SVT's estimate is an encode of the samples with the real encode's flags.
         settings["svt"] = [*encode.svt_params(read, cfg, chain),
                            encode.pix_format(read, cfg), chain.svtav1_version]
-    return _digest({"grain": settings, "source": [read.size_bytes, read.duration]})
+    return digest({"grain": settings, "source": [read.size_bytes, read.duration]})
 
 
 def _grain_step(
@@ -544,6 +540,18 @@ def _grain_step(
     return report, table
 
 
+def _keyframes_file(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> Path:
+    """Where the hybrid method's keyframe scan is kept between runs
+    (encode.FFPROBE_SHIM). A scan of the source as it was before is removed."""
+    keyframes = work / f"keyframes-{digest({'source': [read.size_bytes, read.duration]})}.json"
+    for old in work.glob("keyframes-*"):
+        if old != keyframes:
+            old.unlink(missing_ok=True)
+    if keyframes.is_file() and encode.chunk_method(cfg, chain) == "hybrid":
+        log.info("  keyframe scan kept from an earlier run")
+    return keyframes
+
+
 def _transcode(
     source: Path,
     info: MediaInfo,
@@ -571,11 +579,15 @@ def _transcode(
 
     encoded = work / "encoded.mkv"
     encoded.unlink(missing_ok=True)
-    argv = encode.build_command(read, encoded, chain, cfg, work / "av1an", denoise)
-    check = (watch.SavingWatch(read, cfg, chain, work / "av1an")
+    scene_list = scenes.prepare(read, chain, cfg, work)
+    if not dry_run:
+        scenes.detect(read, chain, cfg, work, scene_list)
+    argv = encode.build_command(read, encoded, chain, cfg, work / "av1an", denoise, scene_list)
+    check = (watch.SavingWatch(read, cfg, chain, work / "av1an", scene_list)
              if cfg.output.check_saving_after_percent > 0 and not dry_run else None)
     try:
-        stopped = encode.run_encode(argv, cfg, chain, dry_run=dry_run, check=check)
+        stopped = encode.run_encode(argv, cfg, chain, dry_run=dry_run, check=check,
+                                    keyframes=_keyframes_file(read, chain, cfg, work))
     finally:
         if check is not None:
             check.close()

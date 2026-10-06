@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import itertools
 import json
 import locale
 import os
 import random
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,7 +25,8 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from autotranscode import (
-    config, encode, estimate, grain, mux, pipeline, probe, sample, tools, util, verify, watch,
+    config, encode, estimate, grain, mux, pipeline, probe, sample, scenes, tools, util, verify,
+    watch,
 )
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
@@ -986,6 +989,58 @@ class TestFfmpegShim(unittest.TestCase):
     def test_anything_else_passes_through_untouched(self):
         other = ["-hide_banner", "-i", "a b.mkv", "-map", "0:v", "-c", "copy", "out.mkv"]
         self.assertEqual(self.argv_seen(*other), other)
+
+
+class TestFfprobeShim(unittest.TestCase):
+    """The hybrid method's keyframe scan decodes the whole film; a rerun replays it."""
+
+    SCAN = ("-v", "quiet", "-print_format", "json", "-show_frames", "-select_streams", "v:0",
+            "-show_entries", "frame=key_frame", "film.mkv")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.calls = self.dir / "calls"
+        self.cache = self.dir / "keyframes.json"
+        # A stand-in "real ffprobe": counts its runs, prints its argv, and fails on "bad".
+        self.fake = self.dir / "real ffprobe"
+        self.fake.write_text(f'#!/bin/sh\necho run >> "{self.calls}"\n'
+                             'for a do printf "%s\\n" "$a"; done\n'
+                             'case " $* " in *" bad "*) exit 1 ;; esac\n')
+        self.fake.chmod(0o755)
+        encode.write_ffprobe_shim(self.dir / "bin", str(self.fake))
+
+    def probe(self, *args: str, cache: Path | None = None) -> subprocess.CompletedProcess[str]:
+        env = {**os.environ}
+        env.pop(encode.KEYFRAMES_VARIABLE, None)
+        if cache is not None:
+            env[encode.KEYFRAMES_VARIABLE] = str(cache)
+        return subprocess.run([str(self.dir / "bin" / "ffprobe"), *args], env=env,
+                              capture_output=True, text=True, check=False)
+
+    def runs(self) -> int:
+        return len(self.calls.read_text().splitlines()) if self.calls.exists() else 0
+
+    def test_the_keyframe_scan_is_kept_and_replayed(self):
+        first = self.probe(*self.SCAN, cache=self.cache)
+        again = self.probe(*self.SCAN, cache=self.cache)
+        self.assertEqual(first.stdout.splitlines(), list(self.SCAN))
+        self.assertEqual(again.stdout, first.stdout)
+        self.assertEqual(self.runs(), 1)
+
+    def test_a_failed_scan_is_not_kept(self):
+        failed = self.probe(*self.SCAN, "bad", cache=self.cache)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertFalse(self.cache.exists())
+        self.assertFalse(self.cache.with_name(self.cache.name + ".part").exists())
+
+    def test_anything_else_passes_through_untouched(self):
+        other = ["-v", "error", "-show_entries", "format=duration", "film.mkv"]
+        self.assertEqual(self.probe(*other, cache=self.cache).stdout.splitlines(), other)
+        self.probe(*self.SCAN)   # no file to keep it in
+        self.assertFalse(self.cache.exists())
+        self.assertEqual(self.runs(), 2)
 
 
 class TestCrfCurve(unittest.TestCase):
@@ -2442,3 +2497,201 @@ class TestGrainStepResumes(unittest.TestCase):
             self.assertEqual(self._step(), (None, None))
         self._step()
         self.assertEqual(self.built, 1)
+
+
+class TestScenesResume(unittest.TestCase):
+    """Scene detection takes hours on a 4K film. Av1an only resumes once it has
+    written its chunk list, so the scene list is kept outside its reach."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.temp = self.work / "av1an"
+        self.temp.mkdir()
+        self.cfg = config.Config()
+        self.chain = make_chain()
+        self.info = make_info()
+
+    LIST = json.dumps({"frames": 400, "scenes": [{"start_frame": 0, "end_frame": 400}],
+                       "split_scenes": [{"start_frame": 0, "end_frame": 400}]})
+
+    def _scenes(self) -> Path:
+        return scenes.prepare(self.info, self.chain, self.cfg, self.work)
+
+    def test_av1an_is_told_where_the_list_is(self):
+        scenes = self._scenes()
+        argv = encode.build_command(self.info, Path("/o.mkv"), self.chain, self.cfg,
+                                    self.temp, scenes=scenes)
+        self.assertEqual(argv[argv.index("--scenes") + 1], str(scenes))
+        self.assertNotEqual(scenes.parent, self.temp)
+
+    def test_a_list_from_an_earlier_run_is_kept(self):
+        self._scenes().write_text(self.LIST)
+        self.assertEqual(self._scenes().read_text(), self.LIST)
+
+    def test_a_changed_scene_setting_detects_again(self):
+        self._scenes().write_text(self.LIST)
+        self.cfg.encode.min_scene_len += 1
+        self.assertFalse(self._scenes().exists())
+        self.assertEqual(list(self.work.glob("scenes-*.json")), [])
+
+    def test_a_setting_scene_detection_does_not_use_keeps_it(self):
+        self._scenes().write_text(self.LIST)
+        self.cfg.encode.crf += 1
+        self.cfg.encode.preset += 1
+        self.assertTrue(self._scenes().is_file())
+
+    def test_a_list_cut_short_is_dropped(self):
+        self._scenes().write_text(self.LIST[:30])
+        self.assertFalse(self._scenes().exists())
+
+    def test_av1ans_own_list_from_before_is_kept(self):
+        # A run stopped between scene detection and the chunk list, before this fix.
+        (self.temp / "scenes.json").write_text(self.LIST)
+        self.assertEqual(self._scenes().read_text(), self.LIST)
+        self.assertFalse((self.temp / "scenes.json").exists())
+
+    def test_a_resuming_encode_keeps_the_list_its_chunks_were_cut_by(self):
+        self._scenes().write_text(self.LIST)
+        self.cfg.encode.min_scene_len += 1
+        for name in ("done.json", "chunks.json"):
+            (self.temp / name).write_text("{}")
+        self.assertEqual(self._scenes().read_text(), self.LIST)
+
+    def test_the_watch_reads_the_list_where_av1an_keeps_it(self):
+        scenes = self._scenes()
+        scenes.write_text(self.LIST)
+        (self.temp / "done.json").write_text(json.dumps(
+            {"frames": 400, "done": {"00000": {"frames": 400, "size_bytes": 7}}}))
+        self.assertEqual(watch.finished_chunks(self.temp, scenes),
+                         (400, [watch.Chunk(0, 400, 7)]))
+
+    def test_a_keyframe_scan_of_a_changed_source_is_dropped(self):
+        kept = pipeline._keyframes_file(self.info, self.chain, self.cfg, self.work)
+        kept.write_text("{}")
+        self.assertEqual(pipeline._keyframes_file(self.info, self.chain, self.cfg, self.work),
+                         kept)
+        self.assertTrue(kept.is_file())
+        changed = replace(self.info, size_bytes=self.info.size_bytes + 1)
+        pipeline._keyframes_file(changed, self.chain, self.cfg, self.work)
+        self.assertFalse(kept.exists())
+
+
+class TestScenesInParts(unittest.TestCase):
+    """Scene detection of a 4K film can outlast a day. Done a part at a time, a stop
+    loses the part in flight and no more."""
+
+    FRAMES = 30_000   # what the decoder finds; the probe says 28,800 at 24 fps
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = config.Config()
+        self.cfg.encode.chunk_method = "lsmash"
+        self.chain = make_chain()
+        self.info = make_info(fps=24.0, frames=28_800, duration=1200.0)   # 4 parts of 7,200
+        self.ran: list[tuple[int, int | None]] = []
+        self.fail_at: int | None = None
+        patcher = unittest.mock.patch.object(scenes, "run_watched", self._fake_av1an)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _fake_av1an(self, argv: list[str], _check, **_kwargs) -> None:
+        """Av1an --sc-only: one scene per 1,000 frames of what the script serves."""
+        script = Path(argv[argv.index("-i") + 1]).read_text()
+        bounds = script.rsplit("video[", 1)[1].split("]", 1)[0]
+        start_text, end_text = bounds.split(":")
+        start, end = int(start_text), int(end_text) if end_text else None
+        if self.fail_at == start:
+            raise KeyboardInterrupt
+        self.ran.append((start, end))
+        frames = (end if end is not None else self.FRAMES) - start
+        cuts = [*range(0, frames, 1000), frames]
+        listed = [{"start_frame": a, "end_frame": b, "zone_overrides": None}
+                  for a, b in itertools.pairwise(cuts)]
+        Path(argv[argv.index("--scenes") + 1]).write_text(json.dumps(
+            {"frames": frames, "scenes": listed, "split_scenes": listed}))
+
+    def _detect(self) -> Path:
+        scene_list = scenes.prepare(self.info, self.chain, self.cfg, self.work)
+        scenes.detect(self.info, self.chain, self.cfg, self.work, scene_list)
+        return scene_list
+
+    def test_the_parts_make_one_list_of_the_whole_film(self):
+        merged = json.loads(self._detect().read_text())
+        self.assertEqual(self.ran, [(0, 7200), (7200, 14400), (14400, 21600), (21600, None)])
+        self.assertEqual(merged["frames"], self.FRAMES)
+        ends = [scene["end_frame"] for scene in merged["split_scenes"]]
+        starts = [scene["start_frame"] for scene in merged["split_scenes"]]
+        self.assertEqual(starts, [0, *ends[:-1]], "the scenes must tile the film")
+        self.assertEqual(ends[-1], self.FRAMES)
+        self.assertIn(7200, starts, "each part starts a scene")
+        self.assertEqual(list(self.work.glob("scenes-*.parts")), [], "parts are tidied away")
+
+    def test_a_stop_keeps_the_parts_already_done(self):
+        self.fail_at = 14400
+        with self.assertRaises(KeyboardInterrupt):
+            self._detect()
+        self.fail_at = None
+        self.ran.clear()
+        self._detect()
+        self.assertEqual(self.ran, [(14400, 21600), (21600, None)])
+
+    def test_the_list_once_made_is_not_detected_again(self):
+        self._detect()
+        self.ran.clear()
+        self._detect()
+        self.assertEqual(self.ran, [])
+
+    def test_av1an_detects_by_itself_with_an_ffmpeg_chunk_method(self):
+        self.cfg.encode.chunk_method = "hybrid"
+        self.assertFalse(self._detect().exists())
+        self.assertEqual(self.ran, [])
+
+    def test_a_short_film_is_left_to_av1an(self):
+        self.info = make_info(fps=24.0, frames=10_000, duration=416.0)
+        self.assertFalse(self._detect().exists())
+        self.assertEqual(self.ran, [])
+
+    def test_a_failed_part_leaves_it_to_av1an(self):
+        def failing(argv, _check, **_kwargs):
+            raise util.CommandError(argv, 1, "")
+        with unittest.mock.patch.object(scenes, "run_watched", failing):
+            self.assertFalse(self._detect().exists())
+
+    def test_a_part_of_the_wrong_length_is_not_merged(self):
+        self.FRAMES = 30_000
+        original = self._fake_av1an
+
+        def short(argv, check, **kwargs):
+            original(argv, check, **kwargs)
+            out = Path(argv[argv.index("--scenes") + 1])
+            data = json.loads(out.read_text())
+            data["frames"] -= 1
+            out.write_text(json.dumps(data))
+        with unittest.mock.patch.object(scenes, "run_watched", short):
+            self.assertFalse(self._detect().exists())
+
+    def test_the_script_serves_the_part_from_the_index_the_encode_uses(self):
+        script = scenes.source_script(Path("/lib/a 'b'.mkv"), "lsmash",
+                                      Path("/w/av1an/split/cache.lwi"), 7200, 14400)
+        self.assertIn("core.lsmas.LWLibavSource(\"/lib/a 'b'.mkv\", "
+                      "cachefile='/w/av1an/split/cache.lwi')", script)
+        self.assertTrue(script.endswith("video[7200:14400].set_output()\n"))
+        compile(script, "part.vpy", "exec")
+        last = scenes.source_script(Path("/a.mkv"), "bestsource", Path("/c"), 21600, None)
+        self.assertIn("video[21600:].set_output()", last)
+        compile(last, "part.vpy", "exec")
+
+    def test_the_scene_command_matches_the_encodes_detection_settings(self):
+        argv = encode.scene_command(self.chain, self.cfg, "lsmash", Path("/p/0000.vpy"),
+                                    Path("/p/0000.new.json"), Path("/p/0000.av1an"))
+        encode_argv = encode.build_command(self.info, Path("/o.mkv"), self.chain, self.cfg,
+                                           Path("/t"))
+        for flag in ("--sc-method", "--extra-split-sec", "--min-scene-len",
+                     "--sc-downscale-height"):
+            self.assertEqual(argv[argv.index(flag) + 1],
+                             encode_argv[encode_argv.index(flag) + 1], flag)
+        self.assertIn("--sc-only", argv)

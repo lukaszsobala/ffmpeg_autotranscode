@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
+import json
 import locale
 import logging
 import os
@@ -13,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +50,12 @@ def child_locale() -> str:
     finally:
         with contextlib.suppress(locale.Error):
             locale.setlocale(locale.LC_ALL, previous)
+
+
+def digest(settings: dict[str, object]) -> str:
+    """A short, stable digest of `settings`, for naming what was made with them."""
+    text = json.dumps(settings, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def child_env(extra_path: Sequence[str] = ()) -> dict[str, str]:
@@ -214,10 +222,11 @@ def run_watched(
     *,
     every: float = 60.0,
     extra_path: Sequence[str] = (),
+    extra_env: Mapping[str, str] | None = None,
 ) -> str | None:
     """Run a long command with its output on the terminal, asking `check` every
     `every` seconds whether to stop it. Returns why it was stopped, or None when it
-    ran to the end.
+    ran to the end. `extra_env` is added to its environment.
 
     The command gets a process group of its own, so that stopping it stops its
     children too: Av1an's ffmpeg and encoder processes would otherwise run on to
@@ -225,8 +234,8 @@ def run_watched(
     sees Ctrl-C, so an interrupt arriving here is passed on to it.
     """
     log.debug("exec: %s", shlex.join(argv))
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, env=child_env(extra_path),
-                            process_group=0)
+    env = {**child_env(extra_path), **(extra_env or {})}
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, env=env, process_group=0)
     try:
         while True:
             try:

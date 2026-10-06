@@ -330,7 +330,8 @@ def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> 
                   f"{human_size(int(guess.saved_per_hour))} saved per hour")
         print(f"  output: {out}")
         argv = encode.build_command(info, Path("<encoded.mkv>"), chain, cfg,
-                                    Path("<temp>"), "<denoise-if-grainy>")
+                                    Path("<temp>"), "<denoise-if-grainy>",
+                                    Path("<scenes.json>"))
         # The LC_ALL prefix is not decoration: it is what a real run sets, and
         # without it this command aborts in any shell holding a locale the machine
         # has not generated. Printing it makes the line safe to paste.

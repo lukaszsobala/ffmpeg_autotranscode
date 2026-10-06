@@ -3,7 +3,7 @@
 The size check at the end of the pipeline only learns that a file grew once the
 whole encode is paid for, and for a grainy 4K film that can be days. Av1an keeps
 the answer on disk as it goes: done.json lists every finished chunk with its
-frames and bytes, and scenes.json places each chunk in the film. Set against the
+frames and bytes, and the scene list places each chunk in the film. Set against the
 bytes the source spends on the same frames, the finished chunks give the ratio
 the whole file is heading for, and from that the size of the result.
 
@@ -36,15 +36,17 @@ class Chunk:
     size: int   # encoded bytes
 
 
-def finished_chunks(temp: Path) -> tuple[int, list[Chunk]]:
+def finished_chunks(temp: Path, scenes_file: Path | None = None) -> tuple[int, list[Chunk]]:
     """The film's frame count and Av1an's finished chunks; (0, []) until there are any.
 
-    Chunk i is split_scenes[i] in scenes.json. chunks.json has frame ranges too,
-    but with the hybrid method they count from the start of each split segment.
+    Chunk i is split_scenes[i] in the scene list: `scenes_file`, or else Av1an's
+    own scenes.json in `temp`. chunks.json has frame ranges too, but with the
+    hybrid method they count from the start of each split segment.
     """
+    scenes_file = scenes_file or temp / "scenes.json"
     try:
         done = json.loads((temp / "done.json").read_text(encoding="utf-8"))
-        scenes = json.loads((temp / "scenes.json").read_text(encoding="utf-8"))["split_scenes"]
+        scenes = json.loads(scenes_file.read_text(encoding="utf-8"))["split_scenes"]
         total = int(done.get("frames") or 0)
         entries = dict(done.get("done") or {})
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -189,8 +191,9 @@ class SavingWatch:
 
     LOG_EVERY = 10.0  # percent of the frames between progress lines
 
-    def __init__(self, info: MediaInfo, cfg: Config, chain: Toolchain, temp: Path):
-        self.info, self.cfg, self.temp = info, cfg, temp
+    def __init__(self, info: MediaInfo, cfg: Config, chain: Toolchain, temp: Path,
+                 scenes: Path | None = None):
+        self.info, self.cfg, self.temp, self.scenes = info, cfg, temp, scenes
         self.source = SourceSizes(info.path, chain)
         self._next_log = cfg.output.check_saving_after_percent
         self._broken = False
@@ -208,7 +211,7 @@ class SavingWatch:
         sizes = self.source.sizes
         if self._broken or sizes is None:
             return None
-        frames, chunks = finished_chunks(self.temp)
+        frames, chunks = finished_chunks(self.temp, self.scenes)
         if frames and abs(len(sizes) - frames) > max(10, frames // 50):
             # Not the stream Av1an is encoding: a cover image listed first, say.
             log.warning("  the source has %d video packets for %d frames; "

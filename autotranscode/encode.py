@@ -285,8 +285,13 @@ def build_command(
     cfg: Config,
     temp_dir: Path,
     denoise_filter: str = "",
+    scenes: Path | None = None,
 ) -> list[str]:
     """Assemble the full Av1an invocation for one file.
+
+    `scenes` is where Av1an keeps its scene list: read when it is there, written
+    once scene detection is done. Outside `temp_dir`, so that it survives a stop
+    before Av1an writes its chunk list; see `scenes`.
 
     Tolerates a missing Av1an so that `plan` still shows the command it would run;
     `tools.require` is what actually gates a real encode.
@@ -314,6 +319,8 @@ def build_command(
     ]
 
     argv += ["-w", str(workers(info, cfg, chain))]
+    if scenes is not None:
+        argv += ["--scenes", str(scenes)]
     if method in VAPOURSYNTH_CHUNK_METHODS:
         # The index goes next to the source by default: into the library.
         argv += ["--cache-mode", "temp"]
@@ -330,14 +337,45 @@ def build_command(
     return argv
 
 
+def scene_command(
+    chain: Toolchain, cfg: Config, method: str, script: Path, scenes: Path, temp_dir: Path,
+) -> list[str]:
+    """Av1an's scene detection alone, over the frames `script` serves, into `scenes`.
+
+    The settings that decide the scenes are build_command's, so a film detected in
+    parts is cut as it would have been whole, part boundaries aside.
+    """
+    enc = cfg.encode
+    argv: list[str] = [
+        chain.av1an or "av1an",
+        "-i", str(script),
+        # Never written: --sc-only stops once the scenes are, and deletes the temp.
+        "-o", str(temp_dir.with_name(temp_dir.name + ".mkv")),
+        "-e", "svt-av1",
+        "-m", method,
+        "--sc-method", enc.sc_method,
+        "--extra-split-sec", str(enc.extra_split_sec),
+        "--min-scene-len", str(enc.min_scene_len),
+        "--temp", str(temp_dir),
+        "--scenes", str(scenes),
+        "--sc-only",
+        "-y",
+    ]
+    if enc.sc_downscale_height > 0:
+        argv += ["--sc-downscale-height", str(enc.sc_downscale_height)]
+    return argv
+
+
 def run_encode(
     argv: list[str], cfg: Config, chain: Toolchain, dry_run: bool = False,
-    check: Callable[[], str | None] | None = None,
+    check: Callable[[], str | None] | None = None, keyframes: Path | None = None,
 ) -> str | None:
     """Run Av1an with its output streamed to the terminal rather than captured.
 
     These encodes run for hours; swallowing the progress bar would be unkind.
     `check` is asked every minute whether to stop; the reason it gave is returned.
+    `keyframes` is where the hybrid chunk method's keyframe scan is kept between
+    runs (FFPROBE_SHIM).
     """
     if cfg.machine.nice > 0:
         argv = ["nice", "-n", str(cfg.machine.nice), *argv]
@@ -346,7 +384,10 @@ def run_encode(
         run(argv, dry_run=True)
         return None
     shim_dir = str(write_ffmpeg_shim(cfg.work_dir / "bin", chain.ffmpeg))
-    return run_watched(argv, check or (lambda: None), extra_path=[shim_dir, *chain.bin_dirs])
+    write_ffprobe_shim(cfg.work_dir / "bin", chain.ffprobe)
+    env = {KEYFRAMES_VARIABLE: str(keyframes)} if keyframes is not None else {}
+    return run_watched(argv, check or (lambda: None), extra_path=[shim_dir, *chain.bin_dirs],
+                       extra_env=env)
 
 
 # More than this between the encode's length and the source video's is not
@@ -453,16 +494,60 @@ exec "$real" "$@"
 """
 
 
+# The hybrid chunk method finds the source's keyframes with `ffprobe -show_frames`,
+# which decodes the whole film on one core: about ten hours for a 4K feature on an
+# RK3588. Av1an keeps nothing of it until the chunk list is written, after the
+# scan and the split that follows, so a stop anywhere before that paid for the
+# scan again on every rerun. This keeps its output in the file named by
+# $AUTOTRANSCODE_KEYFRAMES and replays it. Written under another name and renamed
+# only once the scan succeeds, so a scan cut short is never replayed.
+KEYFRAMES_VARIABLE = "AUTOTRANSCODE_KEYFRAMES"
+FFPROBE_SHIM = """\
+#!/bin/sh
+# Written by autotranscode; see FFPROBE_SHIM in autotranscode/encode.py.
+real={real}
+cache="$AUTOTRANSCODE_KEYFRAMES"
+case " $* " in
+  *" -show_frames "*" frame=key_frame "*) ;;
+  *) exec "$real" "$@" ;;
+esac
+[ -n "$cache" ] || exec "$real" "$@"
+if [ ! -s "$cache" ]; then
+  if "$real" "$@" > "$cache.part"; then
+    mv -f "$cache.part" "$cache"
+  else
+    status=$?
+    rm -f "$cache.part"
+    exit "$status"
+  fi
+fi
+exec cat "$cache"
+"""
+
+
 def write_ffmpeg_shim(directory: Path, real_ffmpeg: str) -> Path:
     """Write an `ffmpeg` wrapper into `directory` and return the directory.
 
     Put first on Av1an's PATH, it stands in for ffmpeg in every y4m pipe Av1an
     opens and execs the real binary for everything else.
     """
+    return _write_shim(directory, "ffmpeg", FFMPEG_SHIM, real_ffmpeg)
+
+
+def write_ffprobe_shim(directory: Path, real_ffprobe: str) -> Path:
+    """Write an `ffprobe` wrapper into `directory` and return the directory.
+
+    Put first on Av1an's PATH, it keeps the keyframe scan (FFPROBE_SHIM) and
+    execs the real binary for everything else.
+    """
+    return _write_shim(directory, "ffprobe", FFPROBE_SHIM, real_ffprobe)
+
+
+def _write_shim(directory: Path, name: str, text: str, real: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    shim = directory / "ffmpeg"
-    part = directory / "ffmpeg.part"
-    part.write_text(FFMPEG_SHIM.format(real=shlex.quote(str(Path(real_ffmpeg).resolve()))))
+    shim = directory / name
+    part = directory / f"{name}.part"
+    part.write_text(text.format(real=shlex.quote(str(Path(real).resolve()))))
     part.chmod(0o755)
     os.replace(part, shim)
     return directory
