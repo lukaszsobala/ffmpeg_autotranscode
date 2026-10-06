@@ -13,6 +13,7 @@ import json
 import locale
 import os
 import random
+import shutil
 import signal
 import subprocess
 import sys
@@ -25,8 +26,8 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from autotranscode import (
-    config, encode, estimate, grain, mux, pipeline, probe, sample, scenes, tools, util, verify,
-    watch,
+    clean, config, encode, estimate, grain, mux, pipeline, probe, resume, sample, scenes, tools,
+    util, verify, watch,
 )
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
@@ -733,6 +734,32 @@ class TestStopAndResume(unittest.TestCase):
             pipeline.process_one(self.source, make_chain(), self.cfg)
 
         self.assertTrue(staged.is_file(), "the staged copy must survive an interrupt")
+
+    def test_the_work_directory_names_its_source_and_a_run_marks_it_while_running(self):
+        work = pipeline._work_dir(self.source, self.cfg)
+        seen: list[bool] = []
+
+        def interrupt(*_args, **_kwargs):
+            seen.append((work / pipeline.RUNNING_FILE).is_file())
+            raise KeyboardInterrupt
+
+        self._stub_probe()
+        self._stub_encode(interrupt)
+        with self.assertRaises(KeyboardInterrupt):
+            pipeline.process_one(self.source, make_chain(), self.cfg)
+        self.assertEqual(seen, [True])
+        self.assertFalse((work / pipeline.RUNNING_FILE).exists())
+        self.assertEqual((work / pipeline.SOURCE_FILE).read_text(), str(self.source.resolve()))
+
+    def test_a_file_left_for_later_keeps_its_staged_copy(self):
+        # Its chunks may be reading the copy: Av1an's script names the file.
+        self._stub_probe()
+        staged = present(pipeline.stage_source(self._info(), self.cfg))
+        with unittest.mock.patch.object(pipeline.resume, "check",
+                                        lambda argv, *_a, **_k: (argv, "left for now")), \
+                self.assertRaises(pipeline.Postponed):
+            pipeline.process_one(self.source, make_chain(), self.cfg)
+        self.assertTrue(staged.is_file())
 
     def test_a_finished_file_drops_its_staged_copy(self):
         self._stub_probe()
@@ -2601,6 +2628,9 @@ class TestScenesInParts(unittest.TestCase):
     def _fake_av1an(self, argv: list[str], _check, **_kwargs) -> None:
         """Av1an --sc-only: one scene per 1,000 frames of what the script serves."""
         script = Path(argv[argv.index("-i") + 1]).read_text()
+        if "with open(" in script:   # what the script does as Av1an evaluates it
+            Path(eval(script.split("with open(", 1)[1].split(",", 1)[0])).write_text(
+                str(self.FRAMES))
         bounds = script.rsplit("video[", 1)[1].split("]", 1)[0]
         start_text, end_text = bounds.split(":")
         start, end = int(start_text), int(end_text) if end_text else None
@@ -2639,6 +2669,19 @@ class TestScenesInParts(unittest.TestCase):
         self._detect()
         self.assertEqual(self.ran, [(14400, 21600), (21600, None)])
 
+    def test_parts_named_by_number_are_kept(self):
+        # As the first version named them: 0000.json, 0001.json...
+        scene_list = scenes.prepare(self.info, self.chain, self.cfg, self.work)
+        folder = scenes.parts_dir(scene_list)
+        folder.mkdir()
+        listed = [{"start_frame": 0, "end_frame": 7200, "zone_overrides": None}]
+        for number in range(2):
+            (folder / f"{number:04d}.json").write_text(json.dumps(
+                {"frames": 7200, "scenes": listed, "split_scenes": listed}))
+        scenes.detect(self.info, self.chain, self.cfg, self.work, scene_list)
+        self.assertEqual(self.ran, [(14400, 21600), (21600, None)])
+        self.assertEqual(json.loads(scene_list.read_text())["frames"], self.FRAMES)
+
     def test_the_list_once_made_is_not_detected_again(self):
         self._detect()
         self.ran.clear()
@@ -2660,6 +2703,21 @@ class TestScenesInParts(unittest.TestCase):
             raise util.CommandError(argv, 1, "")
         with unittest.mock.patch.object(scenes, "run_watched", failing):
             self.assertFalse(self._detect().exists())
+
+    def test_the_parts_follow_the_decoders_frame_count_not_the_probes(self):
+        # The probe says 50 minutes; the video holds 16. Planned on the probe, parts
+        # 3 to 6 would start past the end.
+        self.info = make_info(fps=24.0, frames=72_000, duration=3000.0)
+        self.FRAMES = 23_000
+        merged = json.loads(self._detect().read_text())
+        self.assertEqual(self.ran, [(0, 7200), (7200, 14400), (14400, None)])
+        self.assertEqual(merged["frames"], 23_000)
+
+    def test_a_film_shorter_than_its_probe_said_is_left_to_av1an(self):
+        self.info = make_info(fps=24.0, frames=72_000, duration=3000.0)
+        self.FRAMES = 10_000
+        self.assertFalse(self._detect().exists())
+        self.assertEqual(list(self.work.glob("scenes-*.parts")), [])
 
     def test_a_part_of_the_wrong_length_is_not_merged(self):
         self.FRAMES = 30_000
@@ -2695,3 +2753,326 @@ class TestScenesInParts(unittest.TestCase):
             self.assertEqual(argv[argv.index(flag) + 1],
                              encode_argv[encode_argv.index(flag) + 1], flag)
         self.assertIn("--sc-only", argv)
+
+
+class TestResumeFingerprint(unittest.TestCase):
+    """Av1an resumes whatever chunks it finds; they must belong to this encode."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.work = self.root / "work"
+        self.temp = self.work / "av1an"
+        self.source = self.root / "Film.mkv"
+        self.source.write_bytes(b"x")
+        self.cfg = config.Config()
+        self.cfg.encode.chunk_method = "lsmash"
+        self.chain = make_chain(vapoursynth_plugins={"lsmas"})
+        self.info = make_info(path=self.source)
+        self.asked: list[list[str]] = []
+        self.answer = "skip"
+
+    def _argv(self, denoise: str = "") -> list[str]:
+        return encode.build_command(self.info, self.work / "encoded.mkv", self.chain, self.cfg,
+                                    self.temp, denoise)
+
+    def _ask(self, _name, differences, _done, _total) -> str:
+        self.asked.append(differences)
+        return self.answer
+
+    def _check(self, argv: list[str] | None = None, info: MediaInfo | None = None):
+        return resume.check(argv or self._argv(), info or self.info, info or self.info,
+                            self.cfg, self.work, ask=self._ask)
+
+    def _chunks(self, done: int = 2) -> None:
+        """An encode stopped with `done` of 3 chunks finished."""
+        (self.temp / "split").mkdir(parents=True, exist_ok=True)
+        (self.temp / "split" / "cache.lwi").write_text("index")
+        (self.temp / "split" / "loadscript.vpy").write_text("script")
+        (self.temp / "encode").mkdir(exist_ok=True)
+        (self.temp / "chunks.json").write_text(json.dumps([{}, {}, {}]))
+        (self.temp / "done.json").write_text(json.dumps(
+            {"frames": 300, "done": {f"{i:05d}": {} for i in range(done)}}))
+
+    def _started(self, done: int = 2) -> None:
+        self._check()          # the first run: a fingerprint and nothing to compare
+        self._chunks(done)
+
+    def test_an_unchanged_encode_resumes(self):
+        self._started()
+        argv = self._argv()
+        self.assertEqual(self._check(argv), (argv, None))
+        self.assertTrue((self.temp / "chunks.json").is_file())
+        self.assertEqual(self.asked, [])
+
+    def test_a_replaced_source_starts_again(self):
+        self._started()
+        self._check(info=replace(self.info, size_bytes=self.info.size_bytes + 1))
+        self.assertFalse((self.temp / "chunks.json").exists())
+        self.assertFalse((self.temp / "split" / "cache.lwi").exists(), "a stale index goes too")
+        self.assertEqual(self.asked, [])
+
+    def test_changed_settings_are_asked_about(self):
+        self._started()
+        self.cfg.encode.crf += 2
+        self._check()
+        self.assertEqual(len(self.asked), 1)
+        self.assertTrue(any(line.startswith("--crf: ") for line in self.asked[0]))
+
+    def test_restart_keeps_only_the_index(self):
+        self._started()
+        self.cfg.encode.crf += 2
+        self.answer = "restart"
+        self.assertEqual(self._check()[1], None)
+        self.assertFalse((self.temp / "chunks.json").exists())
+        self.assertFalse((self.temp / "split" / "loadscript.vpy").exists())
+        self.assertTrue((self.temp / "split" / "cache.lwi").is_file())
+        self._chunks()
+        self._check()
+        self.assertEqual(len(self.asked), 1, "the new settings are now the encode's own")
+
+    def test_continue_runs_with_the_flags_it_started_with(self):
+        self._started()
+        before = self._argv()
+        self.cfg.encode.crf += 2
+        self.answer = "continue"
+        argv, postponed = self._check(self._argv(denoise="hqdn3d=2"))
+        self.assertIsNone(postponed)
+        self.assertEqual(resume.flags(argv), resume.flags(before))
+        self.assertTrue((self.temp / "chunks.json").is_file())
+        again, _ = self._check(self._argv(denoise="hqdn3d=2"))
+        self.assertEqual(len(self.asked), 1, "a rerun does not ask again")
+        self.assertEqual(resume.flags(again), resume.flags(before))
+
+    def test_skip_keeps_the_chunks_for_later(self):
+        self._started()
+        self.cfg.encode.preset += 1
+        _, postponed = self._check()
+        self.assertTrue(postponed)
+        self.assertTrue((self.temp / "chunks.json").is_file())
+
+    def test_without_a_terminal_it_is_left_for_later(self):
+        self._started()
+        self.cfg.encode.crf += 2
+        with unittest.mock.patch.object(sys.stdin, "isatty", return_value=False):
+            _, postponed = resume.check(self._argv(), self.info, self.info, self.cfg, self.work)
+        self.assertTrue(postponed)
+        self.assertTrue((self.temp / "chunks.json").is_file())
+
+    def test_a_configured_answer_is_not_asked_for(self):
+        self._started()
+        self.cfg.encode.crf += 2
+        self.cfg.library.on_changed_settings = "restart"
+        self._check()
+        self.assertEqual(self.asked, [])
+        self.assertFalse((self.temp / "chunks.json").exists())
+
+    def test_changed_settings_before_any_chunk_finished_just_start_again(self):
+        self._started(done=0)
+        self.cfg.encode.crf += 2
+        self._check()
+        self.assertEqual(self.asked, [])
+        self.assertFalse((self.temp / "chunks.json").exists())
+
+    def test_a_lost_staged_copy_starts_again(self):
+        staged = self.root / "staging" / "copy.mkv"
+        staged.parent.mkdir()
+        staged.write_bytes(b"x")
+        resume.check(self._argv(), self.info, replace(self.info, path=staged), self.cfg,
+                     self.work, ask=self._ask)
+        self._chunks()
+        staged.unlink()
+        self._check()
+        self.assertFalse((self.temp / "chunks.json").exists())
+
+    def test_chunks_from_before_fingerprints_are_taken_as_they_are(self):
+        self._chunks()
+        self.cfg.encode.crf += 2
+        self._check()
+        self.assertTrue((self.temp / "chunks.json").is_file())
+        self.assertEqual(self.asked, [])
+
+    def test_changes_are_listed_flag_by_flag(self):
+        before = {"-v": "--crf 29 --tf-strength -1 --tune 0", "-f": ""}
+        after = {"-v": "--crf 31 --tf-strength 1 --tune 0", "-f": "-vf hqdn3d"}
+        self.assertEqual(resume.changes(before, after),
+                         ["--crf: 29 -> 31", "--tf-strength: -1 -> 1",
+                          "filters: (none) -> -vf hqdn3d"])
+
+    def test_flags_are_put_back_added_and_removed(self):
+        argv = ["av1an", "-v", "--crf 31", "-f", "-vf x", "-w", "1"]
+        self.assertEqual(resume.with_flags(argv, {"-v": "--crf 29", "-m": "lsmash"}),
+                         ["av1an", "-v", "--crf 29", "-w", "1", "-m", "lsmash"])
+
+
+class TestClean(unittest.TestCase):
+    """`clean` removes what no run will use again, and never what one is using."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.library = self.root / "library"
+        self.library.mkdir()
+        self.cfg = config.Config()
+        self.cfg.paths.work_dir = str(self.root / "work")
+        self.cfg.paths.state_file = str(self.root / "work" / "state.json")
+        self.chain = make_chain()
+        self.ledger = Ledger(self.cfg.state_path)
+
+    def _film(self, name: str = "Film.mkv", size: int = 100) -> Path:
+        source = self.library / name
+        source.write_bytes(b"x" * size)
+        return source
+
+    def _work(self, source: Path, *, chunks: int = 1000) -> Path:
+        work = pipeline._work_dir(source, self.cfg)
+        (work / "av1an").mkdir(exist_ok=True)
+        (work / "av1an" / "chunks").write_bytes(b"c" * chunks)
+        return work
+
+    def _plan(self, *sources: Path, **flags) -> dict[Path, clean.Entry]:
+        entries = clean.plan(self.cfg, self.chain, self.ledger, sources,
+                             pipeline.library_roots([self.library]) if sources else [], **flags)
+        return {entry.path: entry for entry in entries}
+
+    def test_resumable_work_is_kept(self):
+        work = self._work(self._film())
+        entry = self._plan()[work]
+        self.assertFalse(entry.remove)
+        self.assertIn("resumable", entry.reason)
+        self.assertTrue(self._plan(everything=True)[work].remove)
+
+    def test_work_whose_source_is_gone_is_removed(self):
+        source = self._film()
+        work = self._work(source)
+        source.unlink()
+        self.assertTrue(self._plan()[work].remove)
+
+    def test_a_missing_folder_is_taken_for_a_disk_not_mounted(self):
+        source = self._film()
+        work = self._work(source)
+        shutil.rmtree(self.library)
+        self.assertFalse(self._plan()[work].remove)
+        self.assertTrue(self._plan(unknown=True)[work].remove)
+
+    def test_finished_work_is_removed_but_a_kept_grain_table_stays(self):
+        source = self._film()
+        work = self._work(source)
+        (work / "grain.tbl").write_text(TABLE)
+        self.ledger.record(source, Record(source=str(source), status="done"))
+        self.cfg.grain.keep_table = True
+        entries = self._plan()
+        self.assertTrue(entries[work].remove)
+        clean.remove(entries.values())
+        self.assertEqual([path.name for path in work.iterdir()], ["grain.tbl"])
+
+    def test_a_running_encode_is_never_touched(self):
+        source = self._film()
+        work = self._work(source)
+        (work / pipeline.RUNNING_FILE).write_text(str(os.getpid()))
+        source.unlink()
+        self.assertFalse(self._plan(everything=True)[work].remove)
+
+    def test_a_dead_runs_mark_does_not_protect(self):
+        source = self._film()
+        work = self._work(source)
+        (work / pipeline.RUNNING_FILE).write_text("999999999")
+        source.unlink()
+        self.assertTrue(self._plan()[work].remove)
+
+    def test_work_from_before_it_named_its_source_is_matched_through_the_library(self):
+        source = self._film()
+        work = self._work(source)
+        (work / pipeline.SOURCE_FILE).unlink()
+        self.assertFalse(self._plan()[work].remove)
+        self.assertIn("source unknown", self._plan()[work].reason)
+        self.assertIn("resumable", self._plan(source)[work].reason)
+        self.assertTrue(self._plan(unknown=True)[work].remove)
+
+    def test_work_for_a_replaced_source_is_removed(self):
+        source = self._film(size=100)
+        work = self._work(source)
+        (work / resume.FINGERPRINT).write_text(json.dumps({"source": [100, 60.0]}))
+        self._film(size=200)
+        self.assertTrue(self._plan()[work].remove)
+
+    def test_work_run_would_skip_is_removed(self):
+        source = self._film()
+        work = self._work(source)
+        self.ledger.record(source, Record(source=str(source), status="skipped", reason="too big",
+                                          settings=pipeline.settings_key(self.cfg, self.chain)))
+        self.assertTrue(self._plan()[work].remove)
+
+    def test_work_whose_output_is_already_there_is_removed(self):
+        source = self._film()
+        work = self._work(source)
+        pipeline.output_for(source, self.cfg).write_bytes(b"o")
+        self.assertTrue(self._plan()[work].remove)
+
+    def test_a_same_named_output_in_a_mirrored_directory_is_not_guessed(self):
+        self.cfg.output.directory = str(self.root / "out")
+        source = self._film()
+        work = self._work(source)
+        (self.root / "out").mkdir()
+        (self.root / "out" / f"Film{self.cfg.output.suffix}.mkv").write_bytes(b"o")
+        self.assertFalse(self._plan()[work].remove, "without the library, the root is unknown")
+        self.assertTrue(self._plan(source)[work].remove)
+
+    def test_partial_outputs_are_removed(self):
+        source = self._film()
+        part = pipeline.output_for(source, self.cfg)
+        part = part.with_name(part.name + ".part")
+        part.write_bytes(b"p")
+        staged_out = pipeline.staged_output_path(source, self.cfg)
+        staged_out.parent.mkdir(parents=True)
+        staged_out.write_bytes(b"s")
+        self.ledger.record(source, Record(source=str(source), status="failed"))
+        entries = self._plan()
+        self.assertTrue(entries[part].remove)
+        self.assertTrue(entries[staged_out].remove)
+
+    def test_a_staged_copy_follows_its_work(self):
+        kept, gone = self._film("Kept.mkv"), self._film("Gone.mkv")
+        self._work(kept), self._work(gone)
+        copies = {}
+        for source in (kept, gone):
+            copies[source] = pipeline._staged_path(source, self.cfg, ".mkv")
+            copies[source].parent.mkdir(parents=True, exist_ok=True)
+            copies[source].write_bytes(b"x" * 100)
+        gone.unlink()
+        orphan = self.cfg.staging_dir / "0123456789abcdef.mkv"
+        orphan.write_bytes(b"x")
+        entries = self._plan()
+        self.assertFalse(entries[copies[kept]].remove)
+        self.assertTrue(entries[copies[gone]].remove)
+        self.assertTrue(entries[orphan].remove)
+
+    def test_old_scratch_goes_and_fresh_scratch_stays(self):
+        old, fresh = self.cfg.work_dir / "estimate", self.cfg.work_dir / "verify"
+        for folder in (old, fresh):
+            folder.mkdir(parents=True)
+            (folder / "log").write_text("x")
+        long_ago = time.time() - 2 * clean.SCRATCH_QUIET_SECONDS
+        for path in (old / "log", old):
+            os.utime(path, (long_ago, long_ago))
+        entries = self._plan()
+        self.assertTrue(entries[old].remove)
+        self.assertFalse(entries[fresh].remove)
+
+    def test_other_things_in_the_work_directory_are_left_alone(self):
+        for name in ("bin", "samples"):
+            (self.cfg.work_dir / name).mkdir(parents=True)
+        self.ledger.save()
+        paths = set(self._plan())
+        self.assertFalse(paths & {self.cfg.work_dir / "bin", self.cfg.work_dir / "samples",
+                                  self.cfg.state_path})
+
+    def test_remove_frees_what_it_reports(self):
+        source = self._film()
+        work = self._work(source, chunks=5000)
+        source.unlink()
+        entries = self._plan()
+        self.assertGreaterEqual(clean.remove(entries.values()), 5000)
+        self.assertFalse(work.exists())

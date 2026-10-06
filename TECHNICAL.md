@@ -343,7 +343,10 @@ starts is given a locale verified to exist, so transcodes are immune.
   in flight, and the parts are merged into the scene list once all are done. Every
   part starts a new scene, which costs one keyframe per five minutes of film. A
   film shorter than ten minutes, an ffmpeg-based chunk method, or a part that
-  fails leaves detection to Av1an in one go, as before.
+  fails leaves detection to Av1an in one go, as before. The probe's frame count
+  plans only the first part: each part's script writes down the frames the decoder
+  finds in the whole film, and the rest are planned on that, so a container that
+  overstates its length cannot plan parts past the end.
 - **The keyframe scan** of the `hybrid` method (`ffprobe -show_frames` over the
   whole film) is kept the same way, by an `ffprobe` wrapper on Av1an's PATH that
   saves the scan once it completes and replays it on a rerun.
@@ -355,11 +358,25 @@ starts is given a locale verified to exist, so transcodes are immune.
 - **Across a library**: a JSON ledger records every finished file. A source that
   changed size is treated as new.
 
-The resume digest follows the source path, and Av1an will reuse chunks encoded at
-a different preset or CRF without saying so; hence the rule that changing settings
-means deleting that file's work directory. Staging does not change the digest, the
-output path or the ledger entry, so switching it on or off never invalidates
-half-finished work.
+The work directory is named by the source path. Av1an resumes whatever chunk list
+it finds there without checking it: each chunk keeps the encoder flags it was
+listed with, while the filters and pixel format come from the new command line.
+So every encode leaves `encode.json` beside the chunks: the source's size and
+duration, the file Av1an reads, and its `-v`, `--pix-format`, `-m` and `-f`. On a
+rerun, before anything else:
+
+- a source with another size or duration discards the chunks and the index;
+- a file Av1an was reading that is gone -- a staged copy deleted while staging is
+  off -- discards them too, since its script names that file;
+- changed flags discard them silently if no chunk had finished, and otherwise
+  follow `library.on_changed_settings`: `ask` on the terminal (without one, leave
+  the file for now), `restart` keeping the index, `continue` with the stored flags
+  put back on the command line (remembered, so a rerun does not ask again), or
+  `skip`. A file left for now keeps its chunks and its staged copy.
+
+Staging does not change the work directory, the output path or the ledger entry,
+so switching it on or off keeps half-finished work for as long as the file it was
+reading is still there.
 
 The output is muxed under a `.part` name and renamed into place only once it is
 complete, so a half-written file can never be read as "already transcoded".

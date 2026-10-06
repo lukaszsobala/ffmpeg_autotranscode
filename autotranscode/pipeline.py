@@ -25,7 +25,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from . import encode, grain, mux, scenes, watch
+from . import encode, grain, mux, resume, scenes, watch
 from .config import Config
 from .probe import MediaInfo, probe
 from .state import Ledger, Record
@@ -40,6 +40,10 @@ class SkipFile(Exception):
 class OutputExists(Exception):
     """A file took the output's name while the encode ran. The encode is kept
     beside it under another name rather than written over it."""
+
+
+class Postponed(SkipFile):
+    """Left for now, with its finished chunks and staged copy kept for later."""
 
 
 class NoSaving(SkipFile):
@@ -226,11 +230,16 @@ def output_path(info: MediaInfo, cfg: Config, roots: Sequence[Path] = ()) -> Pat
     library and on one of its folders puts a film in the same place. A file given
     on its own, or through a .txt list, goes to the top of the output directory.
     """
-    name = f"{info.path.stem}{cfg.output.suffix}.mkv"
+    return output_for(info.path, cfg, roots)
+
+
+def output_for(path: Path, cfg: Config, roots: Sequence[Path] = ()) -> Path:
+    """`output_path` for a source known only by its path."""
+    name = f"{path.stem}{cfg.output.suffix}.mkv"
     if not cfg.output.directory:
-        return info.path.parent / name
+        return path.parent / name
     directory = Path(cfg.output.directory).expanduser()
-    source = info.path.expanduser().absolute()
+    source = path.expanduser().absolute()
     containing = [root for root in roots if source.is_relative_to(root)]
     if containing:
         outermost = min(containing, key=lambda root: len(root.parts))
@@ -345,6 +354,17 @@ def _calibrate_grain(
     return True
 
 
+def source_digest(source: Path) -> str:
+    """The name a source's work directory and staged files go by."""
+    return hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
+
+
+# Written in each work directory: the source it belongs to, so that `clean` can
+# tell what is still wanted; and, while a run works on it, that run's pid.
+SOURCE_FILE = "source.txt"
+RUNNING_FILE = "running"
+
+
 def _work_dir(source: Path, cfg: Config) -> Path:
     """Per-file scratch directory, keyed to the source path.
 
@@ -352,17 +372,18 @@ def _work_dir(source: Path, cfg: Config) -> Path:
     Av1an resume across runs, so it must follow the real source and never a
     staged copy. Passing the path explicitly makes that hard to get wrong.
     """
-    name = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
-    path = cfg.work_dir / name
+    path = cfg.work_dir / source_digest(source)
     path.mkdir(parents=True, exist_ok=True)
+    named = path / SOURCE_FILE
+    if not named.is_file() or named.read_text(encoding="utf-8") != str(source.resolve()):
+        named.write_text(str(source.resolve()), encoding="utf-8")
     return path
 
 
 def _staged_path(source: Path, cfg: Config, suffix: str) -> Path:
     """Name staged files by the whole source path, so identically named files in
     different folders cannot collide."""
-    name = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
-    return cfg.staging_dir / f"{name}{suffix}"
+    return cfg.staging_dir / f"{source_digest(source)}{suffix}"
 
 
 def staged_output_path(source: Path, cfg: Config) -> Path:
@@ -438,7 +459,18 @@ def process_one(
     # directory digest that makes Av1an resumable, and the ledger entry. Only the
     # steps that actually *read* the video move to the staged copy.
     work = _work_dir(source, cfg)
+    running = work / RUNNING_FILE
+    running.write_text(str(os.getpid()), encoding="ascii")
+    try:
+        return _process_in(source, info, final, work, chain, cfg, started, dry_run=dry_run)
+    finally:
+        running.unlink(missing_ok=True)
 
+
+def _process_in(
+    source: Path, info: MediaInfo, final: Path, work: Path, chain: Toolchain, cfg: Config,
+    started: float, *, dry_run: bool,
+) -> Record:
     staged: Path | None = None
     staged_out: Path | None = None
     if cfg.staging.enabled and not dry_run:
@@ -454,6 +486,11 @@ def process_one(
             source, info, read, final, staged_out, work, chain, cfg, started,
             dry_run=dry_run,
         )
+    except Postponed:
+        # Its chunks may be reading the staged copy, so that stays.
+        if staged_out is not None:
+            staged_out.unlink(missing_ok=True)
+        raise
     except (SkipFile, OutputExists):
         # A decided skip is a finished outcome, and so is an encode kept under
         # another name; either way the copy has served its purpose.
@@ -579,10 +616,17 @@ def _transcode(
 
     encoded = work / "encoded.mkv"
     encoded.unlink(missing_ok=True)
-    scene_list = scenes.prepare(read, chain, cfg, work)
+    scene_list = scenes.path(read, chain, cfg, work)
+    argv = encode.build_command(read, encoded, chain, cfg, work / "av1an", denoise, scene_list)
+    if not dry_run:
+        # First: a changed source discards the chunks, and the scene list must not
+        # then be taken over from them.
+        argv, postponed = resume.check(argv, info, read, cfg, work)
+        if postponed:
+            raise Postponed(postponed)
+    scenes.prepare(read, chain, cfg, work)
     if not dry_run:
         scenes.detect(read, chain, cfg, work, scene_list)
-    argv = encode.build_command(read, encoded, chain, cfg, work / "av1an", denoise, scene_list)
     check = (watch.SavingWatch(read, cfg, chain, work / "av1an", scene_list)
              if cfg.output.check_saving_after_percent > 0 and not dry_run else None)
     try:

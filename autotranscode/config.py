@@ -308,6 +308,10 @@ class Library:
     # release ~0.08, and a good 4K AV1 encode ~0.01.
     min_bits_per_pixel: float = 0.03
     recursive: bool = True
+    # A file whose encode was stopped and whose encoder settings have changed since:
+    # "ask" on the terminal (without one, leave it for now), "restart" with the new
+    # settings, "continue" with the ones it started with, or "skip" it for now.
+    on_changed_settings: str = "ask"
 
 
 @dataclass(slots=True)
@@ -481,6 +485,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("encode.variance_boost_curve must be auto, 0, 1 or 2")
     if cfg.library.min_bits_per_pixel < 0:
         raise ConfigError("library.min_bits_per_pixel cannot be negative")
+    if cfg.library.on_changed_settings not in {"ask", "restart", "continue", "skip"}:
+        raise ConfigError("library.on_changed_settings must be ask, restart, continue or skip")
     if cfg.grain.mode not in {"auto", "always", "never"}:
         raise ConfigError("grain.mode must be auto, always or never")
     if cfg.grain.analysis not in {"sampled", "full"}:

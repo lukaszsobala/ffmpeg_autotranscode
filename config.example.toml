@@ -282,3 +282,12 @@ min_duration_sec = 60.0      # ignore clips and samples
 # Set 0 to check nothing. A source whose bitrate cannot be read is never skipped.
 min_bits_per_pixel = 0.03
 recursive = true
+
+# A film stopped partway whose encoder settings (CRF, preset, filters...) have
+# changed since. Its finished chunks were made with the old ones, and Av1an would
+# finish it with them while taking the filters from the new. "ask" puts the choice
+# on the terminal, and without a terminal (Docker, systemd) leaves the file for
+# now; "restart" starts it again with the new settings; "continue" finishes it
+# with the ones it started with; "skip" leaves it for now. A changed source always
+# starts again.
+on_changed_settings = "ask"

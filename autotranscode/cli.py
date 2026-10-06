@@ -8,7 +8,20 @@ import shlex
 import sys
 from pathlib import Path
 
-from . import __version__, config, encode, estimate, grain, pipeline, probe, sample, tools, verify, watch
+from . import (
+    __version__,
+    clean,
+    config,
+    encode,
+    estimate,
+    grain,
+    pipeline,
+    probe,
+    sample,
+    tools,
+    verify,
+    watch,
+)
 from .state import Guess, Ledger
 from .util import (
     CommandError,
@@ -111,6 +124,22 @@ def build_parser() -> argparse.ArgumentParser:
     verify_cmd.add_argument("--no-grain", action="store_true",
                             help="skip the grain retention pass (it decodes both files again)")
 
+    clean_cmd = sub.add_parser(
+        "clean",
+        help="remove work directories, staged copies and partial outputs no run will use "
+             "again; resumable work is kept",
+    )
+    clean_cmd.add_argument("inputs", nargs="*", type=Path,
+                           help="the library, to match work directories that do not name "
+                                "their source and to find outputs in a mirrored "
+                                "output.directory")
+    clean_cmd.add_argument("-n", "--dry-run", action="store_true",
+                           help="list what would be removed and kept, remove nothing")
+    clean_cmd.add_argument("--unknown", action="store_true",
+                           help="also remove work whose source cannot be told")
+    clean_cmd.add_argument("--all", action="store_true", dest="everything",
+                           help="also remove resumable work: every film starts again")
+
     sub.add_parser("doctor", help="check that the required tools are present and capable")
     sub.add_parser("status", help="summarise the state ledger")
 
@@ -161,6 +190,22 @@ def cmd_doctor(cfg: config.Config, chain: tools.Toolchain) -> int:
         print("Usually SSH importing the client's LC_* through AcceptEnv. Either unset")
         print("them in your shell, stop the client sending them, or generate the")
         print("locales with: sudo dpkg-reconfigure locales")
+    return 0
+
+
+def cmd_clean(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolchain) -> int:
+    sources = pipeline.discover(args.inputs, cfg) if args.inputs else []
+    entries = clean.plan(cfg, chain, Ledger(cfg.state_path), sources,
+                         pipeline.library_roots(args.inputs),
+                         unknown=args.unknown, everything=args.everything)
+    if not entries:
+        print("nothing to clean")
+        return 0
+    print(clean.report(entries))
+    if args.dry_run:
+        print("dry run: nothing removed")
+        return 0
+    print(f"removed {human_size(clean.remove(entries))}")
     return 0
 
 
@@ -360,6 +405,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return cmd_doctor(cfg, chain)
+
+    if args.command == "clean":
+        return cmd_clean(args, cfg, chain)
 
     if args.command == "status":
         print(Ledger(cfg.state_path).summary())

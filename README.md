@@ -169,6 +169,7 @@ honoured). `-c` overrides it; with neither, the built-in defaults apply.
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
 | `run` | Transcode (`--dry-run` probes and measures but does not encode) |
 | `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
+| `clean` | Remove work directories, staged copies and half-written outputs no run will use again; keeps what can be resumed (`--dry-run` lists, `--all` removes that too) |
 
 Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
 `-w/--workers`, `-o/--output-dir`, `--grain {auto,always,never}`.
@@ -306,9 +307,32 @@ of scene detection it was on.
 | `kill -STOP -<pgid>` / `kill -CONT -<pgid>` | Freeze and thaw in place, losing nothing at all. Use this for a pause measured in minutes. Av1an runs in a process group of its own, so take the pgid from `ps -o pgid= -C av1an`; under systemd, `systemctl --user kill --signal=STOP <unit>` does it for you. |
 | Power cut | Same as Ctrl-C, minus the chunk in flight. Rarely, it costs that film's progress; see [TECHNICAL.md](TECHNICAL.md#resuming-in-detail). |
 
-To resume, run the **same** command again. Av1an will reuse chunks encoded at a
-different preset or CRF without saying so, so changing settings means deleting
-that file's directory under `work_dir` first.
+To resume, run the same command again. If the source has been replaced since, the
+film starts again. If its encoder settings changed (CRF, preset, filters...), you
+are asked whether to start it again with the new ones, finish it with the ones it
+started with, or leave it for now. Without a terminal to ask on, as under Docker or
+systemd, it is left for now unless `library.on_changed_settings` gives the answer.
+
+### Cleaning up
+
+A film's work directory holds its chunks, tens of gigabytes for 4K. A run removes
+it once the film is finished or rejected, but not when the film is later skipped,
+deleted, replaced, or turns out to be finished already. `clean` removes those,
+with staged copies nothing uses, half-written outputs and the scratch of
+`estimate`, `measure` and `verify`:
+
+```bash
+autotranscode clean --dry-run /media/films   # list what would go and what stays, and why
+autotranscode clean /media/films
+```
+
+It keeps work that can still be resumed, and never touches the film a running
+`run` is working on. Pass the library: work directories made before this
+version do not say which film they belong to, and an `output.directory` that
+mirrors the library needs it to find outputs. Those it still cannot place are
+kept unless you add `--unknown`; a source whose whole folder is missing is
+taken for a disk that is not mounted, and kept too. `--all` removes resumable
+work as well.
 
 ## Staging
 
