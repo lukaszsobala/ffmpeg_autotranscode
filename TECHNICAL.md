@@ -315,6 +315,18 @@ delimeter` line printed alongside is not an error; it is SVT-AV1 reaching the en
 of its input while it is still encoding the frames it has read ahead. This only
 concerns the `hybrid` chunk method; with `lsmash` the frames come from `vspipe`.
 
+### Why Av1an's progress bar is redrawn
+
+Av1an's bar is one line of about 120 columns before the bar itself gets any. On a
+narrower terminal the line wraps, Av1an's redraws stop clearing what they drew,
+and the bar ends up nowhere to be seen. Its layout cannot be changed, so on a
+terminal Av1an runs on a pseudo-terminal 300 columns wide, and autotranscode
+reads its bar back and draws its own to the real terminal's width: one line when
+everything fits, else the bar and time left on one line and the other figures that
+fit on a second. Other lines Av1an prints, and autotranscode's own log, appear
+above it. When the output is not a terminal, Av1an is run as before and draws no
+bar.
+
 ### Locales
 
 A C++ tool, usually mkvmerge, aborts with `_S_create_c_locale name not valid` when

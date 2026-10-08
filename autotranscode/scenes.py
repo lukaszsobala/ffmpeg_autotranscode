@@ -219,7 +219,7 @@ def _detect_part(
     argv = encode.scene_command(chain, cfg, method, script, written, temp)
     if cfg.machine.nice > 0:
         argv = ["nice", "-n", str(cfg.machine.nice), *argv]
-    run_watched(argv, lambda: None, extra_path=chain.bin_dirs)
+    run_watched(argv, lambda: None, extra_path=chain.bin_dirs, redraw=True)
     if not whole_list(written):
         raise ValueError(f"Av1an wrote no scene list for frames {start} on")
     frames = int(json.loads(written.read_text(encoding="utf-8"))["frames"])

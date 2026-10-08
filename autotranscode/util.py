@@ -19,6 +19,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import progress
+
 log = logging.getLogger("autotranscode")
 
 
@@ -223,10 +225,12 @@ def run_watched(
     every: float = 60.0,
     extra_path: Sequence[str] = (),
     extra_env: Mapping[str, str] | None = None,
+    redraw: bool = False,
 ) -> str | None:
     """Run a long command with its output on the terminal, asking `check` every
     `every` seconds whether to stop it. Returns why it was stopped, or None when it
-    ran to the end. `extra_env` is added to its environment.
+    ran to the end. `extra_env` is added to its environment. `redraw` is for Av1an:
+    its progress bar is redrawn to fit the terminal (`progress`).
 
     The command gets a process group of its own, so that stopping it stops its
     children too: Av1an's ffmpeg and encoder processes would otherwise run on to
@@ -235,19 +239,28 @@ def run_watched(
     """
     log.debug("exec: %s", shlex.join(argv))
     env = {**child_env(extra_path), **(extra_env or {})}
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, env=env, process_group=0)
+    relay = progress.Relay() if redraw and progress.usable(sys.stderr) else None
+    output = relay.child_fd if relay else None
     try:
-        while True:
-            try:
-                returncode = proc.wait(timeout=every)
-                break
-            except subprocess.TimeoutExpired:
-                if reason := check():
-                    _stop_group(proc)
-                    return reason
-    except BaseException:
-        _stop_group(proc)
-        raise
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                env=env, process_group=0)
+        if relay:
+            relay.started()
+        try:
+            while True:
+                try:
+                    returncode = proc.wait(timeout=every)
+                    break
+                except subprocess.TimeoutExpired:
+                    if reason := check():
+                        _stop_group(proc)
+                        return reason
+        except BaseException:
+            _stop_group(proc)
+            raise
+    finally:
+        if relay:
+            relay.close()
     if returncode != 0:
         raise CommandError(argv, returncode, "")
     return None

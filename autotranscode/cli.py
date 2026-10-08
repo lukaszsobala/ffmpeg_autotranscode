@@ -132,13 +132,17 @@ def build_parser() -> argparse.ArgumentParser:
     clean_cmd.add_argument("inputs", nargs="*", type=Path,
                            help="the library, to match work directories that do not name "
                                 "their source and to find outputs in a mirrored "
-                                "output.directory")
+                                "output.directory; and `sample --out` directories outside "
+                                "the work directory")
     clean_cmd.add_argument("-n", "--dry-run", action="store_true",
                            help="list what would be removed and kept, remove nothing")
     clean_cmd.add_argument("--unknown", action="store_true",
                            help="also remove work whose source cannot be told")
     clean_cmd.add_argument("--all", action="store_true", dest="everything",
                            help="also remove resumable work: every film starts again")
+    clean_cmd.add_argument("--samples", action="store_true",
+                           help="also remove `sample`'s results: reports, excerpts, encodes "
+                                "and snapshots")
 
     sub.add_parser("doctor", help="check that the required tools are present and capable")
     sub.add_parser("status", help="summarise the state ledger")
@@ -194,10 +198,13 @@ def cmd_doctor(cfg: config.Config, chain: tools.Toolchain) -> int:
 
 
 def cmd_clean(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolchain) -> int:
-    sources = pipeline.discover(args.inputs, cfg) if args.inputs else []
+    sample_sets = [path for path in args.inputs if (path / clean.PICKS).is_file()]
+    library = [path for path in args.inputs if path not in sample_sets]
+    sources = pipeline.discover(library, cfg) if library else []
     entries = clean.plan(cfg, chain, Ledger(cfg.state_path), sources,
-                         pipeline.library_roots(args.inputs),
-                         unknown=args.unknown, everything=args.everything)
+                         pipeline.library_roots(library),
+                         unknown=args.unknown, everything=args.everything,
+                         sample_sets=sample_sets, samples=args.samples)
     if not entries:
         print("nothing to clean")
         return 0

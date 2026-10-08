@@ -387,7 +387,7 @@ def run_encode(
     write_ffprobe_shim(cfg.work_dir / "bin", chain.ffprobe)
     env = {KEYFRAMES_VARIABLE: str(keyframes)} if keyframes is not None else {}
     return run_watched(argv, check or (lambda: None), extra_path=[shim_dir, *chain.bin_dirs],
-                       extra_env=env)
+                       extra_env=env, redraw=True)
 
 
 # More than this between the encode's length and the source video's is not

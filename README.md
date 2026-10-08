@@ -169,7 +169,7 @@ honoured). `-c` overrides it; with neither, the built-in defaults apply.
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
 | `run` | Transcode (`--dry-run` probes and measures but does not encode) |
 | `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
-| `clean` | Remove work directories, staged copies and half-written outputs no run will use again; keeps what can be resumed (`--dry-run` lists, `--all` removes that too) |
+| `clean` | Remove work directories, staged copies and half-written outputs no run will use again; keeps what can be resumed (`--dry-run` lists, `--all` removes that too, `--samples` removes `sample` results) |
 
 Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
 `-w/--workers`, `-o/--output-dir`, `--grain {auto,always,never}`.
@@ -333,6 +333,12 @@ mirrors the library needs it to find outputs. Those it still cannot place are
 kept unless you add `--unknown`; a source whose whole folder is missing is
 taken for a disk that is not mounted, and kept too. `--all` removes resumable
 work as well.
+
+`sample` runs are cleaned too, those in the work directory and any other `--out`
+directory named on the command line. Their reports, excerpts, encodes and
+snapshots are kept; the chunks beside them go once every sample is done (an
+unfinished run keeps them to resume, unless `--all`). `--samples` removes the
+sample directories whole.
 
 ## Staging
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import io
 import itertools
 import json
 import locale
@@ -26,8 +27,8 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from autotranscode import (
-    clean, config, encode, estimate, grain, mux, pipeline, probe, resume, sample, scenes, tools,
-    util, verify, watch,
+    clean, config, encode, estimate, grain, mux, pipeline, probe, progress, resume, sample, scenes,
+    tools, util, verify, watch,
 )
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
@@ -3069,6 +3070,71 @@ class TestClean(unittest.TestCase):
         self.assertFalse(paths & {self.cfg.work_dir / "bin", self.cfg.work_dir / "samples",
                                   self.cfg.state_path})
 
+    def _sample_set(self, *, done: bool, age: float = 2 * clean.SCRATCH_QUIET_SECONDS,
+                    name: str = "20260101-1200") -> Path:
+        folder = self.cfg.work_dir / clean.SAMPLES / name
+        (folder / "1080p-1").mkdir(parents=True)
+        (folder / clean.PICKS).write_text(json.dumps({"picks": [{"id": "1080p-1"}]}))
+        (folder / "report.md").write_text("report")
+        (folder / "1080p-1" / "Film.600s.mkv").write_bytes(b"e" * 300)
+        (folder / "1080p-1" / "result.json").write_text(json.dumps({"ok": done}))
+        (folder / "work" / "0123456789abcdef" / "av1an").mkdir(parents=True)
+        (folder / "work" / "0123456789abcdef" / "av1an" / "chunk").write_bytes(b"c" * 1000)
+        long_ago = time.time() - age
+        for path in [*sorted(folder.rglob("*"), reverse=True), folder]:
+            os.utime(path, (long_ago, long_ago))
+        return folder
+
+    def _sample_entries(self, folder: Path, **flags) -> list[clean.Entry]:
+        return [entry for entry in clean.plan(self.cfg, self.chain, self.ledger, **flags)
+                if entry.path.is_relative_to(folder)]
+
+    def test_a_finished_sample_runs_chunks_go_and_its_results_stay(self):
+        folder = self._sample_set(done=True)
+        clean.remove(self._sample_entries(folder))
+        self.assertFalse((folder / "work").exists())
+        self.assertTrue((folder / "report.md").is_file())
+        self.assertTrue((folder / "1080p-1" / "Film.600s.mkv").is_file())
+
+    def test_an_unfinished_sample_run_keeps_its_chunks_unless_all(self):
+        folder = self._sample_set(done=False)
+        part = folder / "1080p-1" / "Other.900s.mkv.part"
+        part.write_bytes(b"p")
+        long_ago = time.time() - 2 * clean.SCRATCH_QUIET_SECONDS
+        for path in (part, part.parent, folder):
+            os.utime(path, (long_ago, long_ago))
+        entries = self._sample_entries(folder)
+        self.assertFalse(next(e for e in entries if e.path == folder / "work").remove)
+        clean.remove(entries)
+        self.assertTrue((folder / "work").is_dir())
+        self.assertFalse((folder / "1080p-1" / "Other.900s.mkv.part").exists())
+        clean.remove(self._sample_entries(folder, everything=True))
+        self.assertFalse((folder / "work").exists())
+        self.assertTrue((folder / "report.md").is_file())
+
+    def test_samples_go_whole_only_when_asked(self):
+        folder = self._sample_set(done=True)
+        clean.remove(self._sample_entries(folder, everything=True, unknown=True))
+        self.assertTrue((folder / "report.md").is_file())
+        clean.remove(self._sample_entries(folder, samples=True))
+        self.assertFalse(folder.exists())
+
+    def test_a_sample_run_in_progress_is_left_alone(self):
+        folder = self._sample_set(done=True, age=10)
+        entries = self._sample_entries(folder, samples=True)
+        self.assertTrue(entries and not any(entry.remove for entry in entries))
+        folder = self._sample_set(done=True, name="20260102-1200")
+        (folder / "work" / "0123456789abcdef" / pipeline.RUNNING_FILE).write_text(str(os.getpid()))
+        self.assertFalse(any(entry.remove for entry in self._sample_entries(folder, samples=True)))
+
+    def test_sample_sets_elsewhere_are_cleaned_when_named(self):
+        folder = self._sample_set(done=True)
+        elsewhere = self.root / "my-samples"
+        folder.rename(elsewhere)
+        self.assertEqual(self._sample_entries(elsewhere), [])
+        clean.remove(self._sample_entries(elsewhere, sample_sets=[elsewhere]))
+        self.assertFalse((elsewhere / "work").exists())
+
     def test_remove_frees_what_it_reports(self):
         source = self._film()
         work = self._work(source, chunks=5000)
@@ -3076,3 +3142,64 @@ class TestClean(unittest.TestCase):
         entries = self._plan()
         self.assertGreaterEqual(clean.remove(entries.values()), 5000)
         self.assertFalse(work.exists())
+
+
+BAR_LINE = ("\x1b[1m00:12:01\x1b[0m [12/431 Chunks] ▐\x1b[34m████    \x1b[0m▌ \x1b[1m 42%\x1b[0m "
+            "89369/212784 (\x1b[1m1.71 fps\x1b[0m, eta 20h, 4521.3 Kbps, est. 12.3 GiB)")
+
+
+class TestProgressRedraw(unittest.TestCase):
+    """Av1an's progress bar is read back and drawn to fit the terminal."""
+
+    def test_av1an_bar_is_read(self):
+        status, rest = progress.parse(progress.ESCAPE.sub("", BAR_LINE))
+        self.assertEqual(rest, "")
+        self.assertEqual(status, progress.Status(
+            elapsed="00:12:01", pos=89369, rate="1.71 fps", percent=42, length=212784,
+            eta="20h", chunks=(12, 431), kbps=4521.3, size="12.3 GiB"))
+
+    def test_scene_detection_bars_are_read(self):
+        status, _ = progress.parse("00:00:53 ▐ ▌   0% 91/212784 (1.71 fps, eta 35h)")
+        self.assertEqual((status.pos, status.length, status.chunks), (91, 212784, None))
+        status, _ = progress.parse("00:00:53 [       ]  91 frames (0.58 s/fr)")
+        self.assertEqual((status.pos, status.rate, status.percent), (91, "0.58 s/fr", None))
+
+    def test_every_width_fits(self):
+        status, _ = progress.parse(progress.ESCAPE.sub("", BAR_LINE))
+        for width in range(20, 200):
+            lines = progress.render(status, width)
+            self.assertTrue(all(len(line) < width for line in lines), width)
+            self.assertIn("42%", lines[0])
+            self.assertIn("eta 20h", lines[0])
+        self.assertEqual(len(progress.render(status, 160)), 1)
+        self.assertEqual(len(progress.render(status, 80)), 2)
+        self.assertIn("12/431 chunks", progress.render(status, 80)[1])
+
+    def test_other_output_goes_above_the_bar(self):
+        out = io.StringIO()
+        screen = progress.Screen(out, width=80)
+        feed = progress.Feed(screen)
+        for piece in ("\r\x1b[2K" + BAR_LINE, "\r\x1b[2KINFO a chunk ", "finished\n",
+                      BAR_LINE[:30], BAR_LINE[30:] + "\r"):
+            feed.feed(piece.encode())
+        feed.end()
+        screen.finish()
+        text = progress.ESCAPE.sub("", out.getvalue())
+        self.assertIn("INFO a chunk finished\n", text)
+        self.assertNotIn("Kbps", text)
+        self.assertTrue(text.rstrip("\n").endswith("00:12:01"))
+
+    def test_a_child_draws_on_a_terminal_and_is_redrawn(self):
+        out = io.StringIO()
+        relay = progress.Relay(out)
+        script = ("import os, sys; sys.stderr.write(str(os.isatty(2)) + '\\n'); "
+                  f"sys.stderr.write({BAR_LINE!r}); sys.stderr.flush()")
+        child = subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.DEVNULL,
+                                 stdout=relay.child_fd, stderr=relay.child_fd)
+        relay.started()
+        child.wait()
+        relay.close()
+        text = progress.ESCAPE.sub("", out.getvalue())
+        self.assertIn("True\n", text)
+        self.assertIn("12/431 chunks", text)
+        self.assertNotIn("Kbps", text)
