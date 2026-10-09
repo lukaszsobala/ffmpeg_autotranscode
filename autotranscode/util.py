@@ -253,9 +253,13 @@ def run_watched(
                     break
                 except subprocess.TimeoutExpired:
                     if reason := check():
+                        if relay:
+                            relay.stop()
                         _stop_group(proc)
                         return reason
         except BaseException:
+            if relay:
+                relay.stop()
             _stop_group(proc)
             raise
     finally:

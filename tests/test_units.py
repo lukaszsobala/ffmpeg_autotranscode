@@ -3189,6 +3189,22 @@ class TestProgressRedraw(unittest.TestCase):
         self.assertNotIn("Kbps", text)
         self.assertTrue(text.rstrip("\n").endswith("00:12:01"))
 
+    def test_what_a_stopped_command_says_while_dying_is_dropped(self):
+        out = io.StringIO()
+        screen = progress.Screen(out, width=80)
+        feed = progress.Feed(screen)
+        feed.feed(("\r\x1b[2K" + BAR_LINE + "\r").encode())
+        screen.mute()
+        feed.feed(b"Terminated\nError: fwrite() call failed\n\r\x1b[2K" + BAR_LINE.encode())
+        feed.end()
+        screen.finish()
+        screen.write_above("too late\n")
+        text = progress.ESCAPE.sub("", out.getvalue())
+        self.assertIn("12/431 chunks", text)
+        self.assertNotIn("Terminated", text)
+        self.assertNotIn("fwrite", text)
+        self.assertTrue(text.endswith("00:12:01\n"))
+
     def test_a_child_draws_on_a_terminal_and_is_redrawn(self):
         out = io.StringIO()
         relay = progress.Relay(out)
