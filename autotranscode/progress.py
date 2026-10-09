@@ -161,6 +161,9 @@ class Screen:
         self.status: Status | None = None
         self._drawn = 0           # lines of the bar on the screen
         self._last_draw = 0.0
+        # Set once the command is being stopped: what it says then is dropped.
+        self.muted = False
+        self._finished = False    # and nothing at all is written after `finish`
 
     def width(self) -> int:
         if isinstance(self._width, int):
@@ -176,6 +179,8 @@ class Screen:
     def write_above(self, text: str) -> None:
         """Write `text`, whole lines, above the bar."""
         with self.lock:
+            if self._finished:
+                return
             self._clear()
             self.out.write(text)
             self._redraw()
@@ -185,9 +190,16 @@ class Screen:
             self._clear()
             self.out.flush()
 
-    def finish(self) -> None:
-        """Leave the last bar on the screen, the cursor below it."""
+    def mute(self) -> None:
         with self.lock:
+            self.muted = True
+
+    def finish(self) -> None:
+        """Leave the last bar on the screen, the cursor below it, and draw no more."""
+        with self.lock:
+            if self._finished:
+                return
+            self.muted = self._finished = True
             if self.status is not None:
                 self._redraw()
             if self._drawn:
@@ -234,6 +246,8 @@ class Feed:
         self._pending = ""
 
     def _segment(self, raw: str, *, newline: bool) -> None:
+        if self.screen.muted:
+            return
         status, rest = parse(ESCAPE.sub("", raw))
         if status is not None:
             self.screen.update(status)
@@ -257,7 +271,7 @@ class Relay:
     redrawn on `out`. While it runs, log lines written to `out` go above the bar.
 
     Give the child `child_fd` as its stdout and stderr, then call `started()`;
-    `close()` when it has exited.
+    `stop()` before stopping it, and `close()` once it has exited.
     """
 
     def __init__(self, out: TextIO | None = None):
@@ -280,7 +294,14 @@ class Relay:
         self._divert_logging()
         self._thread.start()
 
+    def stop(self) -> None:
+        """The command is being stopped: drop what it and its children say while
+        they die (broken pipes, "Terminated", encoder errors), one line each."""
+        self.screen.mute()
+
     def close(self, wait: float = 5.0) -> None:
+        if self.screen.muted:
+            wait = min(wait, 0.5)   # nothing more of it is shown
         try:
             if self.child_fd >= 0:
                 os.close(self.child_fd)
