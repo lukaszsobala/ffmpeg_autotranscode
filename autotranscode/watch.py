@@ -224,8 +224,8 @@ class SavingWatch:
             return None
         if projection.done_percent >= self._next_log:
             self._next_log = projection.done_percent + self.LOG_EVERY
-            log.info("  %.0f%% of the frames encoded, at %.2fx the source's bytes: "
-                     "heading for %s", projection.done_percent, projection.ratio,
+            log.info("  %.0f%% encoded, bitrate %.2fx vs source: "
+                     "projected: %s", projection.done_percent, projection.ratio,
                      describe_saving(projection.saving_percent))
         reason = shortfall(self.cfg, self.info.size_bytes, projection.output_bytes)
         if reason is None:
