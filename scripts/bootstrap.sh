@@ -24,8 +24,10 @@ set -euo pipefail
 # (Debian 13 has 2.3.0, without the dark bias the 1080p setting depends on), and
 # a release can move quality at the same CRF. The per-resolution settings were
 # judged on 4.0.0; 4.2.0 matched them within 0.2 dB on the 1080p excerpts and
-# encodes 5-10% faster on ARM. Re-check the CRF curve on a few excerpts when moving this.
-SVT_AV1_VERSION="${SVT_AV1_VERSION:-v4.2.0}"
+# encodes 5-10% faster on ARM. 4.3.0 keeps every option and default they use; its
+# release claims 5-8% better efficiency across presets, not yet re-judged on the
+# excerpts. Re-check the CRF curve on a few excerpts when moving this.
+SVT_AV1_VERSION="${SVT_AV1_VERSION:-v4.3.0}"
 ZIMG_VERSION="${ZIMG_VERSION:-release-3.0.6}"
 # Pinned deliberately, not lazily. R73 onward added Vulkan GPU filters whose
 # gpufilter.h does not compile against Debian 13's Vulkan headers
