@@ -21,11 +21,11 @@ import os
 import shutil
 import signal
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from . import encode, grain, mux, resume, scenes, watch
+from . import encode, grain, mux, progress, resume, scenes, watch
 from .config import Config
 from .probe import MediaInfo, probe
 from .state import Ledger, Record
@@ -127,18 +127,40 @@ def settings_keys(cfg: Config, chain: Toolchain) -> set[str]:
               for s in _earlier(cfg))}
 
 
-def by_estimate(sources: list[Path], ledger: Ledger, cfg: Config,
-                chain: Toolchain) -> tuple[list[Path], int]:
-    """Estimated files first, best saving per hour of encoding at the top; then the
-    rest in their usual order. Returns the order and how many had an estimate.
+def by_estimate(sources: list[Path], ledger: Ledger, cfg: Config, chain: Toolchain,
+                under_way: Collection[Path] = ()) -> tuple[list[Path], int]:
+    """`under_way` first, then the estimated files, best saving per hour of encoding
+    at the top; then the rest in their usual order. Returns the order and how many
+    had an estimate.
 
-    A run that is stopped early has then spent its hours where they bought the most.
+    A run that is stopped early has then spent its hours where they bought the most,
+    and a restarted one picks up what it was doing before starting anything new.
     """
     keys = size_keys(cfg, chain)
     rate = {source: guess.saved_per_hour
             for source in sources if (guess := ledger.guess(source, keys))}
-    ordered = sorted(sources, key=lambda source: (source not in rate, -rate.get(source, 0.0)))
+    ordered = sorted(sources, key=lambda source: (
+        source not in under_way, source not in rate, -rate.get(source, 0.0)))
     return ordered, len(rate)
+
+
+def under_way(sources: list[Path], cfg: Config) -> set[Path]:
+    """The sources an earlier run left work for: finished chunks, or scenes found.
+
+    Estimates and the order they give change with the settings, and an encoder
+    upgrade changes them all; without this a restarted run would start on new films
+    and leave a half-done one waiting until its turn came round.
+    """
+    found = set()
+    for source in sources:
+        work = cfg.work_dir / source_digest(source)
+        if not work.is_dir():
+            continue
+        if (resume.progress(work / "av1an")[0]
+                or next(work.glob("scenes-*.json"), None)
+                or next(work.glob("scenes-*.parts/*.json"), None)):
+            found.add(source)
+    return found
 
 
 class StopRequest:
@@ -462,7 +484,8 @@ def process_one(
     running = work / RUNNING_FILE
     running.write_text(str(os.getpid()), encoding="ascii")
     try:
-        return _process_in(source, info, final, work, chain, cfg, started, dry_run=dry_run)
+        with progress.showing(source.stem):
+            return _process_in(source, info, final, work, chain, cfg, started, dry_run=dry_run)
     finally:
         running.unlink(missing_ok=True)
 

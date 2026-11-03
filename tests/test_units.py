@@ -14,6 +14,7 @@ import json
 import locale
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -2440,6 +2441,27 @@ class TestEstimatesSteerTheRun(unittest.TestCase):
         self.assertEqual(ordered, [d, b, a, c])
         self.assertEqual(estimated, 2)
 
+    def test_films_an_earlier_run_started_go_before_everything_else(self):
+        a, b, c, d = self.files
+        self.cfg.paths.work_dir = str(self.root / "work")
+        self._guess(d, 2000, 1000, 1)
+        chunks = self.cfg.work_dir / pipeline.source_digest(c) / "av1an"
+        chunks.mkdir(parents=True)
+        (chunks / "chunks.json").write_text(json.dumps([{}] * 10))
+        (chunks / "done.json").write_text(json.dumps({"frames": 100, "done": {"3": {}}}))
+        parts = self.cfg.work_dir / pipeline.source_digest(b) / "scenes-0123.parts"
+        parts.mkdir(parents=True)
+        (parts / "0000000-0043200.json").write_text("{}")
+        # Work for `a` with nothing in it yet is not a start.
+        (self.cfg.work_dir / pipeline.source_digest(a) / "av1an").mkdir(parents=True)
+
+        started = pipeline.under_way(self.files, self.cfg)
+        self.assertEqual(started, {b, c})
+        ordered, estimated = pipeline.by_estimate(self.files, self.ledger, self.cfg,
+                                                  self.chain, started)
+        self.assertEqual(ordered, [b, c, d, a])
+        self.assertEqual(estimated, 1)
+
     def test_a_file_estimated_to_fall_short_is_skipped_before_encoding(self):
         a, b, c, d = self.files
         self._guess(a, 2000, 1950, 1)     # 2.5% smaller
@@ -3164,6 +3186,29 @@ class TestProgressRedraw(unittest.TestCase):
         status, _ = progress.parse("00:00:53 [       ]  91 frames (0.58 s/fr)")
         self.assertEqual((status.pos, status.rate, status.percent), (91, "0.58 s/fr", None))
 
+    def test_a_bar_ending_in_any_partial_block_is_read(self):
+        for part in "▉▊▋▌▍▎▏ ":
+            line = f"00:01:21 ▐{'█' * 30}{part}{' ' * 9}▌  83% 6102/7333 (76.06 fps, eta 16s)"
+            status, rest = progress.parse(line)
+            self.assertEqual((status.pos, status.percent, rest), (6102, 83, ""), part)
+
+    def test_scene_detection_draws_never_pile_up_above_the_bar(self):
+        out = io.StringIO()
+        screen = progress.Screen(out, width=100)
+        feed = progress.Feed(screen)
+        for pos, part in enumerate("▉▊▋▌▍▎▏ ", start=6100):
+            feed.feed(f"\r\x1b[2K00:01:21 ▐{'█' * 30}{part}{' ' * 9}▌  83% {pos}/7333 "
+                      f"(76.06 fps, eta 16s)".encode())
+        # A layout this does not read is dropped, not passed through.
+        feed.feed("\r\x1b[2K00:01:22 ▐████▌ 84% of something else".encode())
+        feed.feed(b"\r\x1b[2KINFO encode_file: scenecut: found 33 scene(s)\n")
+        feed.end()
+        screen.finish()
+        lines = progress.ESCAPE.sub("", out.getvalue()).replace("\r", "\n").splitlines()
+        self.assertIn("INFO encode_file: scenecut: found 33 scene(s)", lines)
+        self.assertFalse([line for line in lines if "fps, eta" in line or "something" in line])
+        self.assertIn("6,107/7,333 frames", lines[-1])
+
     def test_every_width_fits(self):
         status, _ = progress.parse(progress.ESCAPE.sub("", BAR_LINE))
         for width in range(20, 200):
@@ -3174,6 +3219,29 @@ class TestProgressRedraw(unittest.TestCase):
         self.assertEqual(len(progress.render(status, 160)), 1)
         self.assertEqual(len(progress.render(status, 80)), 2)
         self.assertIn("12/431 chunks", progress.render(status, 80)[1])
+
+    def test_the_film_is_named_on_a_line_above_the_bar(self):
+        title = "The Quiet Danubian Hotel (2014)"
+        for width in (200, 80, 30):
+            out = io.StringIO()
+            screen = progress.Screen(out, width=width, title=title)
+            screen.update(progress.parse(progress.ESCAPE.sub("", BAR_LINE))[0], now=True)
+            screen.write_above("INFO a chunk finished\n")
+            screen.finish()
+            # What the last redraw left, after it cleared the lines before.
+            last = re.split(r"(?:\r?\x1b\[2K|\x1b\[1A\x1b\[2K)+", out.getvalue())[-1]
+            last = progress.ESCAPE.sub("", last).splitlines()
+            bar = progress.render(screen.status, width)
+            self.assertEqual(last, [progress.heading(title, width), *bar], width)
+            self.assertTrue(all(len(line) < width for line in last), width)
+        self.assertEqual(progress.heading(title, 20), "The Quiet Danubian…")
+
+    def test_bars_drawn_while_showing_a_film_are_titled_with_it(self):
+        with progress.showing("Some Film"):
+            relay = progress.Relay(io.StringIO())
+        self.addCleanup(relay.close)
+        self.assertEqual(relay.screen.title, "Some Film")
+        self.assertEqual(progress.Relay(io.StringIO()).screen.title, "")
 
     def test_other_output_goes_above_the_bar(self):
         out = io.StringIO()

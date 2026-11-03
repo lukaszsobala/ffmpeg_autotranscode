@@ -357,7 +357,8 @@ def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> 
         return 1
     roots = pipeline.library_roots(inputs)
     ledger = Ledger(cfg.state_path)
-    sources, _ = pipeline.by_estimate(sources, ledger, cfg, chain)
+    sources, _ = pipeline.by_estimate(sources, ledger, cfg, chain,
+                                      pipeline.under_way(sources, cfg))
     keys = pipeline.size_keys(cfg, chain)
 
     for source in sources:
@@ -479,7 +480,10 @@ def main(argv: list[str] | None = None) -> int:
              len(sources), cfg.machine.profile, cfg.encode.preset, crf, cfg.grain.mode)
 
     ledger = Ledger(cfg.state_path)
-    sources, estimated = pipeline.by_estimate(sources, ledger, cfg, chain)
+    started = pipeline.under_way(sources, cfg)
+    sources, estimated = pipeline.by_estimate(sources, ledger, cfg, chain, started)
+    if started:
+        log.info("%d of them started on an earlier run: those go first", len(started))
     if estimated:
         log.info("%d of them estimated: those go first, most saved per hour of encoding "
                  "at the top", estimated)

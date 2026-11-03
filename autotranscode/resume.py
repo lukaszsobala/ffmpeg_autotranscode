@@ -137,7 +137,7 @@ def check(
         log.info("  finishing with the settings it started with, as chosen before")
         return with_flags(argv, before), None
 
-    done, total = _progress(temp)
+    done, total = progress(temp)
     if not done:
         log.info("  settings changed before any chunk finished; starting with the new ones")
         return _restart(argv, temp, saved, now, keep_index=True)
@@ -207,7 +207,7 @@ def _save(path: Path, fingerprint: dict[str, object]) -> None:
     part.replace(path)
 
 
-def _progress(temp: Path) -> tuple[int, int]:
+def progress(temp: Path) -> tuple[int, int]:
     """How many of the film's chunks are finished, and how many there are."""
     try:
         done = len(json.loads((temp / "done.json").read_text(encoding="utf-8"))["done"])

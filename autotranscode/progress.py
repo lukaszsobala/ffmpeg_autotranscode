@@ -7,8 +7,10 @@ drew, falls out of step with what is on the screen, until the bar is not to be
 seen at all. Its layout is fixed. So Av1an is given a pseudo-terminal wide enough
 for its line, the line is read back, and drawn here to the terminal's width: on
 one line when it fits, on two when it does not, the least needed figures dropped
-first. Anything else Av1an writes is passed through above the bar, as are this
-program's own log lines while it runs.
+first. The film's name goes on a line of its own above it: what Av1an itself says
+names only the staged copy, and the line that named the film has long scrolled
+away by the time anyone looks. Anything else Av1an writes is passed through above
+both, as are this program's own log lines while it runs.
 
 Only when the terminal is one: written to a file, Av1an draws no bar anyway.
 """
@@ -23,6 +25,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TextIO
 
@@ -36,9 +39,11 @@ REDRAW_SECONDS = 0.25
 #                                           4521.3 Kbps, est. 12.3 GiB)
 # and while scene detection does not yet know the length (INDICATIF_SC_SPINNER_TEMPLATE):
 #   00:00:53 [   ]  91 frames (1.71 fps)
+# The bar's cells include the partial blocks "▉▊▋▌▍▎▏", so its own closing "▌" is
+# only the one followed by the percentage.
 BAR = re.compile(
     r"(?P<elapsed>\d+:\d\d:\d\d) +(?:\[(?P<done>\d+)/(?P<chunks>\d+) Chunks\] *)?"
-    r"▐[^▌]*▌ +(?P<percent>\d+)% +(?P<pos>\d+)/(?P<length>\d+) +"
+    r"▐.*?▌ +(?P<percent>\d+)% +(?P<pos>\d+)/(?P<length>\d+) +"
     r"\((?P<rate>[^,()]+), eta (?P<eta>[^,()]+)"
     r"(?:, (?P<kbps>[\d.]+) Kbps, est\. (?P<size>[^,()]+))?\)")
 SPINNER = re.compile(r"(?P<elapsed>\d+:\d\d:\d\d) +\[[^\]]*\] +(?P<pos>\d+) frames "
@@ -47,8 +52,25 @@ SPINNER = re.compile(r"(?P<elapsed>\d+:\d\d:\d\d) +\[[^\]]*\] +(?P<pos>\d+) fram
 # erase. Colour codes do not end one.
 BREAK = re.compile(r"\r\n|\r|\n|\x1b\[[0-9;?]*[@-ln-~]")
 ESCAPE = re.compile(r"\x1b\[[0-9;?]*[@-~]|\x1b[@-_]")
+# A draw of the bar that BAR does not read, in a layout some other Av1an has. Dropped:
+# passed through, every draw of it would pile up above the bar as one long line.
+STRAY = re.compile(r"\d+:\d\d:\d\d +.*▐.*▌")
 
 PARTIAL_BLOCKS = " ▏▎▍▌▋▊▉"
+
+# What the bars drawn now are about; see `showing`.
+_title = ""
+
+
+@contextlib.contextmanager
+def showing(title: str) -> Iterator[None]:
+    """Name `title` above every bar drawn inside the block."""
+    global _title
+    before, _title = _title, title
+    try:
+        yield
+    finally:
+        _title = before
 
 
 @dataclass(slots=True)
@@ -132,6 +154,12 @@ def render(status: Status, width: int) -> list[str]:
     return [f"{head} ▐{bar(fraction, cells)}▌ {tail}"[:width], _fit(figures, width)]
 
 
+def heading(title: str, width: int) -> str:
+    """`title` cut short, if need be, to the width `render` keeps to."""
+    width = max(width - 1, 20)
+    return title if len(title) <= width else title[:width - 1].rstrip() + "…"
+
+
 def _fit(figures: list[str], width: int) -> str:
     """As many of `figures`, from the first, as fit in `width`."""
     line = ""
@@ -151,12 +179,13 @@ def terminal_width(stream: TextIO) -> int:
 
 
 class Screen:
-    """The bar at the bottom of the terminal, with whatever else is written going
-    above it. Safe to call from any thread."""
+    """The bar at the bottom of the terminal, under the title if there is one, with
+    whatever else is written going above them. Safe to call from any thread."""
 
-    def __init__(self, out: TextIO, width: TextIO | int | None = None):
+    def __init__(self, out: TextIO, width: TextIO | int | None = None, title: str = ""):
         self.out = out
         self._width = width
+        self.title = title   # drawn on a line above the bar
         self.lock = threading.RLock()
         self.status: Status | None = None
         self._drawn = 0           # lines of the bar on the screen
@@ -215,7 +244,10 @@ class Screen:
     def _redraw(self) -> None:
         self._clear()
         if self.status is not None:
-            lines = render(self.status, self.width())
+            width = self.width()
+            lines = render(self.status, width)
+            if self.title:
+                lines.insert(0, heading(self.title, width))
             self.out.write("\n".join(lines))
             self._drawn = len(lines)
             self._last_draw = time.monotonic()
@@ -251,6 +283,8 @@ class Feed:
         status, rest = parse(ESCAPE.sub("", raw))
         if status is not None:
             self.screen.update(status)
+        elif STRAY.search(rest):
+            return
         if rest:
             self._text = f"{self._text} {rest}" if self._text else rest
         if newline and self._text:
@@ -281,7 +315,7 @@ class Relay:
         import termios
 
         self.out = out or sys.stderr
-        self.screen = Screen(self.out)
+        self.screen = Screen(self.out, title=_title)
         self.master, self.child_fd = pty.openpty()
         fcntl.ioctl(self.child_fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLUMNS, 0, 0))
         self._thread = threading.Thread(target=self._read, daemon=True)
