@@ -253,7 +253,15 @@ that would set `sw_apply_grain` is commented out, so the flag stays at 0 and eve
 frame comes out without grain. The bug and a one-line fix are in
 [rockchip-linux/mpp#974](https://github.com/rockchip-linux/mpp/issues/974).
 
-Until an MPP release fixes it, **a player that decodes AV1 through MPP on the
+Rockchip merged the fix on 2026-11-03, as commit `9b56348` on MPP's `develop`
+branch ("fix[hal_av1d]: Enable film grain on VDPU output"); no MPP release has it
+yet, the latest being 1.1.0. jellyfin-ffmpeg ships its own `librockchip_mpp`,
+built from the tip of nyanmisaka's `jellyfin-mpp-next` branch, which carries the
+same fix since that day: its packages built after 2026-11-03 (after 8.1.3-1)
+should apply the grain. A player using the system's MPP needs an MPP built from
+`develop` or a release after 1.1.0.
+
+Until then, **a player that decodes AV1 through MPP on the
 RK3588 (ffmpeg's `av1_rkmpp`, and players built on it) shows none of the
 synthesised grain.** That brings back the flat, grain-free look the grain was
 added to hide. The wrong pictures at some frame sizes, above, are a separate
@@ -275,6 +283,13 @@ Distributions lag far behind: Debian 13 ships 2.3.0, which lacks the dark bias t
 On the same 1080p excerpts at the same settings, 4.2.0 came out 2% smaller and
 0.2 dB lower (within what a CRF step moves), and encoded 5-10% faster on the
 RK3588, where 4.1 and 4.2 added NEON kernels.
+
+4.3.0 is the pin now. It changed none of the options these settings pass, nor their
+defaults (temporal filter strength is still 3), and fixed a bitrate inversion at
+fractional CRFs that only showed above 63. Its release notes claim 5-8% better
+efficiency at similar quality and more Neon kernels; the CRF curve has not been
+re-judged on it yet, so compare a few `sample` excerpts against 4.2.0 output
+before trusting it blind.
 
 ### Why grav1synth is patched
 

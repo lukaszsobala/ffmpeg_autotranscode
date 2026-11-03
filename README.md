@@ -16,8 +16,9 @@ settings are what they are, is in [TECHNICAL.md](TECHNICAL.md).
 
 **Watch the results in a software AV1 decoder** (dav1d: mpv, VLC, most desktop
 browsers). The RK3588's hardware decoder currently shows none of the film grain,
-because of [a bug in Rockchip's MPP library](https://github.com/rockchip-linux/mpp/issues/974);
-see [TECHNICAL.md](TECHNICAL.md#film-grain-on-the-rk3588s-av1-decoder).
+because of [a bug in Rockchip's MPP library](https://github.com/rockchip-linux/mpp/issues/974).
+The fix is merged but not yet released; see
+[TECHNICAL.md](TECHNICAL.md#film-grain-on-the-rk3588s-av1-decoder).
 
 ## Install
 
@@ -32,7 +33,7 @@ silicon or Intel):
 | | Debian / Ubuntu | macOS |
 |---|---|---|
 | jellyfin-ffmpeg | Jellyfin's apt repository; its portable build where the repository has no packages | its portable build, into `~/.local/lib/jellyfin-ffmpeg` |
-| SVT-AV1 4.2.0 | built from source into `~/.local` | built from source into `~/.local` |
+| SVT-AV1 4.3.0 | built from source into `~/.local` | built from source into `~/.local` |
 | VapourSynth (Av1an will not link without it) | built from source into `~/.local` | Homebrew |
 | L-SMASH-Works VapourSynth plugin, for the `lsmash` chunk method | built from source into `~/.local/lib/vapoursynth` | built from source into Homebrew's plugin folder |
 | Av1an | `cargo install` | Homebrew |

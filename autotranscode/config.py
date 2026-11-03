@@ -132,7 +132,7 @@ class Encode:
     )
     # 0-8: bias rate-distortion toward keeping high-frequency detail. One number
     # or a width table, as above. Temporal filter strength: SVT-AV1's 0-4, or -1
-    # to leave it at the encoder's own default (3 in SVT-AV1 4.2).
+    # to leave it at the encoder's own default (3 in SVT-AV1 4.2 and 4.3).
     #
     # Both on at 4K and 1080p, together. Variance boost left a grainy 4K film's fog
     # blotched: the grain smeared into patches tens of pixels across, some of them
