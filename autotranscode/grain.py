@@ -36,7 +36,7 @@ from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
 from .util import CommandError, child_env, human_size, log, run
-from .verify import GRAIN_GRAPH, parse_mse_log
+from .verify import first, grain_graph, parse_mse_log
 
 # Fixed reference denoiser used only for *measurement*, so scores are comparable
 # across files. The strength actually used for encoding is chosen from the score.
@@ -150,7 +150,8 @@ def measure(info: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> Grain
             "-i", str(info.path),
             "-an", "-sn", "-dn",
             "-filter_complex",
-            f"[0:v]split=2[ref][pre];[pre]{PROBE_DENOISE}[den];"
+            f"[0:v]{first(encode.deinterlace_filter(info, cfg))}"
+            f"split=2[ref][pre];[pre]{PROBE_DENOISE}[den];"
             f"[den][ref]psnr=stats_file={stats.as_posix()}",
             "-f", "null", "-",
         ]
@@ -216,7 +217,7 @@ def _extract_lossless(
             "-ss", f"{start:.3f}", "-t", str(cfg.grain.sample_seconds),
             "-i", str(info.path),
             "-an", "-sn", "-dn", "-map", "0:v:0",
-            "-vf", ANALYSIS_CROP,
+            "-vf", first(encode.deinterlace_filter(info, cfg)) + ANALYSIS_CROP,
             "-c:v", "ffv1", "-level", "3", "-g", "1",
             str(part),
         ])
@@ -538,7 +539,7 @@ PLANES = ("y", "u", "v")
 
 def window_grain(
     path: Path, chain: Toolchain, times: list[float], seconds: float, work: Path,
-    *, synthesis: bool = True,
+    *, synthesis: bool = True, prefilter: str = "",
 ) -> tuple[float, float, float]:
     """Mean grain energy of `path` over the given windows, per plane (Y, U, V).
 
@@ -555,7 +556,7 @@ def window_grain(
             "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-i", str(path),
             "-an", "-sn", "-dn",
             "-filter_complex",
-            f"{GRAIN_GRAPH}psnr=stats_file={stats.as_posix()}",
+            f"{grain_graph(prefilter)}psnr=stats_file={stats.as_posix()}",
             "-f", "null", "-",
         ])
         text = stats.read_text(encoding="utf-8", errors="replace")
@@ -623,16 +624,19 @@ def needs_probe(cfg: Config) -> bool:
 
 def calibrate_strength(
     source: Path, grainy: Path, chain: Toolchain, cfg: Config, work: Path, duration: float,
+    source_filter: str = "",
 ) -> tuple[float | None, float | None, float | None]:
     """Per-plane factors that make `grainy`'s synthesised grain match `source`'s.
 
     Chroma is calibrated on its own: grav1synth's colour grain was far stronger,
     relative to its luma grain, than the source's, and showed as coloured speckle.
+    `source_filter` is the deinterlacing the encode had: combing is pixel-scale
+    texture too, and would be asked of the grain.
     """
     times = sample_times(duration, cfg.grain.samples, cfg.grain.sample_seconds)
     seconds = float(cfg.grain.sample_seconds)
     try:
-        wanted = window_grain(source, chain, times, seconds, work)
+        wanted = window_grain(source, chain, times, seconds, work, prefilter=source_filter)
         underneath = window_grain(grainy, chain, times, seconds, work, synthesis=False)
         with_grain = window_grain(grainy, chain, times, seconds, work, synthesis=True)
     except CommandError as exc:

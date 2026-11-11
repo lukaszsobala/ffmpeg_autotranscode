@@ -149,12 +149,13 @@ def _encode_sample(
     does per chunk. -fps_mode passthrough for the same reason the Av1an wrapper
     needs it: without it a 23.976 fps source gains duplicated frames.
     """
+    filters = ",".join(f for f in (encode.deinterlace_filter(info, cfg), denoise) if f)
     decode = [
         chain.ffmpeg, "-hide_banner", "-v", "error", "-y",
         "-ss", f"{start:.3f}", "-t", f"{length:.3f}",
         "-i", str(info.path),
         "-an", "-sn", "-dn",
-        *(["-vf", denoise] if denoise else []),
+        *(["-vf", filters] if filters else []),
         "-fps_mode", "passthrough",
         "-pix_fmt", encode.pix_format(info, cfg),
         "-strict", "-1", "-f", "yuv4mpegpipe", "-",

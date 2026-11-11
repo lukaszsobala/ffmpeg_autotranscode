@@ -25,11 +25,26 @@ import unittest
 import unittest.mock
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 from autotranscode import (
-    clean, config, encode, estimate, grain, mux, pipeline, probe, progress, resume, sample, scenes,
-    tools, util, verify, watch,
+    clean,
+    cli,
+    config,
+    encode,
+    estimate,
+    grain,
+    mux,
+    pipeline,
+    probe,
+    progress,
+    resume,
+    sample,
+    scenes,
+    tools,
+    util,
+    verify,
+    watch,
 )
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
 from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, MediaInfo, Stream
@@ -128,6 +143,22 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(cfg.encode.crf, 25)     # overridden by the file
             self.assertEqual(cfg.machine.workers, 1)
 
+    def test_the_profile_flag_takes_the_files_profile_and_leaves_its_settings(self):
+        # Order: defaults, profile, file, flags. --profile used to be applied after
+        # the file, so its preset 4 and crf 28 overwrote the file's 6 and 26.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text('[machine]\nprofile = "generic"\n[encode]\npreset = 6\ncrf = 26\n')
+            args = cli.build_parser().parse_args(
+                ["-c", str(path), "--profile", "workstation", "plan", "x.mkv"])
+            cfg = cli.load_config(args)
+            self.assertEqual((cfg.encode.preset, cfg.encode.crf), (6, 26))
+            self.assertEqual(cfg.machine.profile, "workstation")
+            self.assertEqual(cfg.machine.workers, 0, "the profile's own settings still apply")
+            args = cli.build_parser().parse_args(
+                ["-c", str(path), "--profile", "workstation", "--crf", "24", "plan", "x.mkv"])
+            self.assertEqual(cli.load_config(args).encode.crf, 24, "a flag still beats the file")
+
     def test_auto_profile_follows_the_device_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.toml"
@@ -160,6 +191,49 @@ class TestConfig(unittest.TestCase):
             path.write_text("[nonsense]\nx = 1\n")
             with self.assertRaises(config.ConfigError):
                 config.load(path)
+
+    def _load(self, text: str) -> config.Config:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text(text)
+            return config.load(path)
+
+    def test_a_value_of_the_wrong_type_names_the_option_and_the_type(self):
+        # A string preset ended in a TypeError traceback. A string of extensions
+        # was iterated letter by letter, and the library came up empty in silence.
+        for text, option, wanted in (
+                ('[encode]\npreset = "4"\n', "encode.preset", "a whole number"),
+                ("[encode]\ncrf = 30.5\n", "encode.crf", "a whole number"),
+                ('[library]\nextensions = ".mkv"\n', "library.extensions", "a list of strings"),
+                ('[library]\nskip_codecs = "av1"\n', "library.skip_codecs", "a list of strings"),
+                ("[staging]\nenabled = 1\n", "staging.enabled", "true or false"),
+                ("[machine]\nworkers = true\n", "machine.workers", "a whole number"),
+                ('[encode]\nac_bias = "1"\n', "encode.ac_bias", "a number or a table")):
+            with self.subTest(text=text), \
+                    self.assertRaisesRegex(config.ConfigError, f"{option} must be {wanted}"):
+                self._load(text)
+
+    def test_numbers_and_tables_are_accepted_where_they_belong(self):
+        cfg = self._load('[grain]\nthreshold_db = 44\n[encode]\nac_bias = 1\n'
+                         'tf_strength = {"1700" = 1, "0" = -1}\nvariance_boost_curve = 2\n')
+        self.assertIsInstance(cfg.grain.threshold_db, float)
+        self.assertEqual(cfg.encode.tf_strength, {"1700": 1, "0": -1})
+        self.assertEqual(cfg.encode.variance_boost_curve, 2)
+
+    def test_every_default_has_the_type_its_option_declares(self):
+        cfg = config.Config()
+        for section in dataclasses.fields(cfg):
+            for option in dataclasses.fields(getattr(cfg, section.name)):
+                value = getattr(getattr(cfg, section.name), option.name)
+                config._check_type(value, str(option.type), f"{section.name}.{option.name}")
+
+    def test_counts_and_rates_must_be_positive(self):
+        for text in ("[grain]\nsamples = 0\n", "[grain]\nsample_seconds = -3\n",
+                     "[audio]\nopus_kbps_per_channel = 0\n", "[estimate]\nmin_samples = 0\n",
+                     "[estimate]\nmin_samples = 5\nmax_samples = 4\n",
+                     "[estimate]\nsample_seconds = 0\n", "[machine]\nworkers = -1\n"):
+            with self.subTest(text=text), self.assertRaises(config.ConfigError):
+                self._load(text)
 
     def test_validation_catches_impossible_combinations(self):
         cfg = config.Config()
@@ -405,6 +479,26 @@ class TestLedger(unittest.TestCase):
             source.write_bytes(b"0" * 200)   # replaced with a different file
             self.assertIsNone(Ledger(state).already_done(source))
 
+    def test_two_commands_sharing_the_ledger_keep_each_others_entries(self):
+        # A run going for days and an estimate started beside it each load the
+        # ledger once. Neither save may drop what the other recorded since.
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a.mkv", Path(tmp) / "b.mkv"
+            a.write_bytes(b"a" * 100)
+            b.write_bytes(b"b" * 100)
+            state = Path(tmp) / "state.json"
+            run, est = Ledger(state), Ledger(state)
+
+            est.record_guess(b, Guess(str(b), 2, 1, 60.0, 30.0, "k"))
+            run.record(a, Record(str(a), "done", output="a.av1.mkv"))
+            self.assertIsNotNone(Ledger(state).guess(b, "k"), "run's save dropped the estimate")
+
+            est.record_guess(b, Guess(str(b), 2, 1, 90.0, 30.0, "k"))
+            self.assertIsNotNone(Ledger(state).already_done(a), "the estimate dropped run's done")
+            self.assertEqual(present(Ledger(state).guess(b, "k")).encode_seconds, 90.0)
+            # And each process sees the other's entries without reloading.
+            self.assertIsNotNone(est.already_done(a))
+
 
 class TestGrainReport(unittest.TestCase):
     def test_describe_mentions_the_decision(self):
@@ -628,6 +722,9 @@ class TestStaging(unittest.TestCase):
         original_mux, original_encode = pipeline.mux.mux, pipeline.encode.run_encode
         pipeline.mux.mux = fake_mux
         pipeline.encode.run_encode = fake_encode
+        rehearse = unittest.mock.patch.object(pipeline.mux, "rehearse")
+        rehearse.start()
+        self.addCleanup(rehearse.stop)
         self.addCleanup(setattr, pipeline.mux, "mux", original_mux)
         self.addCleanup(setattr, pipeline.encode, "run_encode", original_encode)
         # Its frame timing is checked with ffprobe, which a fake encode cannot pass.
@@ -685,6 +782,89 @@ class TestStaging(unittest.TestCase):
             config.validate(cfg)
 
 
+class TestOneRunPerWorkDir(unittest.TestCase):
+    """Two runs on one library start on the same film, since films already under
+    way go first, and then share its chunks, its staged copy and its output."""
+
+    HOLD = ("import sys, time\n"
+            "from autotranscode import config, pipeline\n"
+            "cfg = config.Config()\n"
+            "cfg.paths.work_dir = sys.argv[1]\n"
+            "with pipeline.only_run(cfg):\n"
+            "    print('held', flush=True)\n"
+            "    time.sleep(60)\n")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = config.Config()
+        self.cfg.paths.work_dir = str(self.root / "work")
+
+    def test_a_second_run_on_the_same_work_dir_is_refused_and_named_by_pid(self):
+        with pipeline.only_run(self.cfg), \
+                self.assertRaises(pipeline.AlreadyRunning) as caught, \
+                pipeline.only_run(self.cfg):
+            self.fail("two runs held the work directory at once")
+        self.assertIn(f"pid {os.getpid()}", str(caught.exception))
+
+    def test_the_work_dir_is_free_once_the_run_holding_it_is_killed(self):
+        # A pid left in a file outlives kill -9 and may later name another process.
+        holder = subprocess.Popen(
+            [sys.executable, "-c", self.HOLD, self.cfg.paths.work_dir],
+            stdout=subprocess.PIPE, text=True,
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])})
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        assert holder.stdout is not None
+        self.addCleanup(holder.stdout.close)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        with self.assertRaises(pipeline.AlreadyRunning) as caught, pipeline.only_run(self.cfg):
+            pass
+        self.assertIn(f"pid {holder.pid}", str(caught.exception))
+        holder.kill()
+        holder.wait()
+        with pipeline.only_run(self.cfg):
+            pass
+
+    def _run_cli(self, *flags: str, during: Any = None) -> tuple[int, unittest.mock.Mock]:
+        settings = self.root / "config.toml"
+        settings.write_text(f'[paths]\nwork_dir = "{self.cfg.paths.work_dir}"\n'
+                            f'state_file = "{self.root / "state.json"}"\n', encoding="utf-8")
+        source = self.root / "Film (1975).mkv"
+        with unittest.mock.patch.object(cli.tools, "detect", return_value=make_chain()), \
+                unittest.mock.patch.object(cli.tools, "require"), \
+                unittest.mock.patch.object(cli.pipeline, "discover", return_value=[source]), \
+                unittest.mock.patch.object(cli.pipeline, "process_all", return_value=0,
+                                           side_effect=during) as process_all:
+            code = cli.main(["-c", str(settings), "run", *flags, str(source)])
+        return code, process_all
+
+    def test_run_stops_before_any_film_when_another_run_holds_the_work_dir(self):
+        with pipeline.only_run(self.cfg), self.assertLogs(util.log, "ERROR") as logged:
+            code, process_all = self._run_cli()
+        self.assertEqual(code, 1)
+        process_all.assert_not_called()
+        self.assertIn(f"pid {os.getpid()}", "\n".join(logged.output))
+
+    def test_a_dry_run_goes_ahead_while_another_run_holds_the_work_dir(self):
+        with pipeline.only_run(self.cfg):
+            code, process_all = self._run_cli("--dry-run")
+        self.assertEqual(code, 0)
+        process_all.assert_called_once()
+
+    def test_a_run_holds_the_work_dir_while_it_works_and_frees_it_after(self):
+        def busy(*_args: Any, **_kwargs: Any) -> int:
+            with self.assertRaises(pipeline.AlreadyRunning), pipeline.only_run(self.cfg):
+                pass
+            return 0
+        code, process_all = self._run_cli(during=busy)
+        self.assertEqual(code, 0)
+        process_all.assert_called_once()
+        with pipeline.only_run(self.cfg):
+            pass
+
+
 class TestStopAndResume(unittest.TestCase):
     """An encode runs for hours, so stopping it must never cost more than the
     chunk in flight, and must never be mistaken for a finished or failed file."""
@@ -704,6 +884,10 @@ class TestStopAndResume(unittest.TestCase):
         self.cfg.output.min_saving_mib = 0.0   # the test files are a few KiB
         self.cfg.staging.enabled = True
         self.cfg.staging.directory = str(self.root / "staging")
+        # The mux rehearsal shells out too; TestMuxRehearsal covers it.
+        rehearse = unittest.mock.patch.object(pipeline.mux, "rehearse")
+        rehearse.start()
+        self.addCleanup(rehearse.stop)
 
     def _info(self) -> MediaInfo:
         return make_info(path=self.source, size_bytes=self.source.stat().st_size)
@@ -783,6 +967,46 @@ class TestStopAndResume(unittest.TestCase):
         record = pipeline.process_one(self.source, make_chain(), self.cfg)
         self.assertEqual(record.status, "done")
         self.assertFalse(staged.exists(), "a finished file has no use for its copy")
+
+    def test_a_stop_while_the_staged_output_is_copied_leaves_nothing_at_the_final_name(self):
+        # Staging is normally on another filesystem, so the move is a copy. A short
+        # file at the final name would read as "output already exists" next run.
+        self.cfg.output.min_saving_percent = -1e9   # the output is bigger than the 4 KiB source
+        self.cfg.output.min_saving_mib = -1e9
+        self._stub_probe()
+        present(pipeline.stage_source(self._info(), self.cfg))   # before sendfile is patched
+        work = pipeline._work_dir(self.source, self.cfg)
+        final = pipeline.output_path(self._info(), self.cfg)
+        copied: list[int] = []
+
+        def encoded(*_args, **_kwargs):
+            (work / "encoded.mkv").write_bytes(b"e" * 4096)
+
+        def fake_mux(video, info, out, chain, cfg, dry_run=False):
+            Path(out).write_bytes(b"o" * 1_000_000)
+            return out
+
+        rename = os.rename
+
+        def across_filesystems(src, dst, *args, **kwargs):
+            if str(src).endswith(".out.mkv"):
+                raise OSError(18, "Invalid cross-device link")   # EXDEV
+            return rename(src, dst, *args, **kwargs)
+
+        def half_then_stop(out_fd, in_fd, offset, count):
+            copied.append(os.write(out_fd, os.read(in_fd, 500_000)))
+            raise KeyboardInterrupt
+
+        self._stub_encode(encoded)
+        with unittest.mock.patch.object(pipeline.mux, "mux", fake_mux), \
+                unittest.mock.patch("os.rename", across_filesystems), \
+                unittest.mock.patch("os.sendfile", half_then_stop), \
+                self.assertRaises(KeyboardInterrupt):
+            pipeline.process_one(self.source, make_chain(), self.cfg)
+
+        self.assertEqual(copied, [500_000], "the stop must come partway through the output's copy")
+        self.assertFalse(final.exists(), "a truncated film must not sit at the final name")
+        self.assertEqual(list(final.parent.glob(final.name + "*")), [])
 
     def test_an_unstaged_mux_is_renamed_into_place_not_written_there(self):
         # Without staging the mux writes beside the destination and renames, so an
@@ -914,6 +1138,26 @@ class TestStopAndResume(unittest.TestCase):
             pipeline._process_all([self.source], make_chain(), self.cfg, ledger, stop)
         self.assertEqual(ledger.records, {}, "an interrupted file must stay unrecorded")
 
+    def test_a_dry_run_leaves_the_ledger_as_it_was(self):
+        # It recorded "skipped: dry run" over an earlier "failed", and status
+        # counted every file it looked at as skipped.
+        ledger = Ledger(self.root / "state.json")
+        ledger.record(self.source, Record(source=str(self.source), status="failed", reason="x"))
+        other = self.root / "library" / "Other (1980).mkv"
+        other.write_bytes(b"y" * 4096)
+        before = (self.root / "state.json").read_text()
+
+        def look(source, *_args, **_kwargs):
+            if source == other:
+                raise pipeline.SkipFile("already AV1")
+            return Record(source=str(source), status="skipped", reason="dry run")
+
+        with unittest.mock.patch.object(pipeline, "process_one", look):
+            pipeline._process_all([self.source, other], make_chain(), self.cfg, ledger,
+                                  pipeline.StopRequest(), dry_run=True)
+        self.assertEqual((self.root / "state.json").read_text(), before)
+        self.assertEqual(present(ledger.get(self.source)).status, "failed")
+
     def test_the_same_failure_without_a_signal_is_still_a_failure(self):
         self.cfg.staging.enabled = False
         ledger = Ledger(self.root / "state.json")
@@ -940,6 +1184,43 @@ class TestStopAndResume(unittest.TestCase):
             self.assertTrue(stop.seen)
         self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    def test_a_hangup_stops_the_run_the_same_way_ctrl_c_does(self):
+        # A closed SSH session or a killed screen window sends SIGHUP. Av1an has a
+        # process group of its own, so unless Python stops it, it runs on orphaned.
+        previous = signal.getsignal(signal.SIGHUP)
+        with pipeline.stop_signals() as stop:
+            # Checked first: the default action would kill the test runner.
+            self.assertNotIn(signal.getsignal(signal.SIGHUP), (signal.SIG_DFL, previous))
+            with self.assertRaises(KeyboardInterrupt):
+                os.kill(os.getpid(), signal.SIGHUP)
+            self.assertTrue(stop.seen)
+        self.assertEqual(signal.getsignal(signal.SIGHUP), previous)
+
+    def test_sample_encodes_stop_on_sigterm_and_hangup_as_run_does(self):
+        pick_ = sample.Pick(id="1080p-1", band="1080p", source=str(self.source), start=60.0,
+                            length=120.0, width=1920, height=1080, codec="h264", hdr=False,
+                            duration=7200.0)
+        out = self.root / "samples"
+        out.mkdir()
+        picks = {"seed": 1, "picks": [dataclasses.asdict(pick_)]}
+        (out / "picks.json").write_text(json.dumps(picks))
+        caught: list[bool] = []
+
+        def encode_pick(*_args, **_kwargs):
+            handled = [signal.getsignal(sig) not in (signal.SIG_DFL, signal.SIG_IGN, None)
+                       for sig in (signal.SIGTERM, signal.SIGHUP)]
+            caught.extend(handled)
+            if all(handled):   # never send one that would kill the test runner
+                os.kill(os.getpid(), signal.SIGHUP)
+            return sample.Result(pick_.id)
+
+        with unittest.mock.patch.object(sample, "encode_pick", encode_pick), \
+                self.assertRaises(KeyboardInterrupt):
+            sample.run_samples([], make_chain(), self.cfg, out, per_band=1, bands=["1080p"],
+                               minutes=2, skip_start=0, skip_end=0, seed=None, score=False,
+                               pick_only=False)
+        self.assertEqual(caught, [True, True])
 
 
 class TestConfigDiscovery(unittest.TestCase):
@@ -1308,13 +1589,356 @@ class TestMuxOutput(unittest.TestCase):
         self.assertIn("1:t?", self._mux("ass"))
 
 
+class TestMuxRehearsal(unittest.TestCase):
+    """A track the mux cannot take (mov_text, 5.1(side) on mainline ffmpeg) failed
+    the file only after the whole encode. The mux is tried on a few seconds first."""
+
+    def _rehearse(self, fail_mux: bool = False) -> tuple[list[list[str]], Path]:
+        seen: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            seen.append(argv)
+            Path(argv[-1]).write_bytes(b"x")
+            return util.Completed(argv, 0, "", "", 0.0)
+
+        def fake_until(argv, seconds):
+            seen.append(argv)
+            self.assertEqual(seconds, mux.REHEARSAL_SECONDS)
+            Path(argv[-1]).write_bytes(b"x")
+            if fail_mux:
+                raise CommandError(argv, 1, "Subtitle codec 94213 is not supported")
+
+        dts = probe.Stream(index=1, codec="dts", codec_type="audio", channels=6)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        work = Path(tmp.name)
+        with unittest.mock.patch.object(mux, "run", side_effect=fake_run), \
+                unittest.mock.patch.object(mux, "mux_until", side_effect=fake_until):
+            try:
+                mux.rehearse(make_info(audio=[dts]), make_chain(), config.Config(), work)
+            finally:
+                self.assertEqual(list(work.iterdir()), [], "nothing is left behind")
+        return seen, work
+
+    def test_the_real_mux_runs_with_a_stand_in_for_the_encode(self):
+        stand_in, rehearsal = self._rehearse()[0]
+        self.assertIn("lavfi", stand_in)
+        self.assertEqual(rehearsal[rehearsal.index("-i") + 1], stand_in[-1])
+        self.assertIn("/library/Film (1975).mkv", rehearsal, "the source's own tracks")
+        self.assertIn("libopus", rehearsal, "the audio is converted as in the real mux")
+        self.assertEqual(rehearsal[1:3], ["-progress", "pipe:1"], "for mux_until to stop it by")
+
+    def test_a_failed_rehearsal_says_so_and_leaves_nothing_behind(self):
+        with self.assertRaisesRegex(CommandError, "not supported"):
+            self._rehearse(fail_mux=True)
+
+    def _ffmpeg(self, script: str) -> list[str]:
+        """A stand-in for ffmpeg: Python printing progress lines as ffmpeg does."""
+        return [sys.executable, "-c", f"import sys, time\n{script}"]
+
+    def test_the_rehearsal_is_stopped_once_its_output_is_long_enough(self):
+        # ffmpeg reads on through a whole film for a subtitle track with nothing
+        # early: 197 s for one with 13 PGS tracks.
+        started = time.monotonic()
+        mux.mux_until(self._ffmpeg(
+            "print('out_time_us=N/A', flush=True)\n"
+            "print('out_time_us=5200000', flush=True)\n"
+            "time.sleep(60)"), 5)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_rehearsal_whose_output_time_does_not_move_stops_after_writing_a_while(self):
+        # 21 PGS tracks to interleave: out_time stayed N/A while 74 MB were written.
+        started = time.monotonic()
+        mux.mux_until(self._ffmpeg(
+            "print('total_size=0', 'out_time_us=N/A', sep='\\n', flush=True)\n"
+            "while True:\n"
+            "    print('total_size=37748736', 'out_time_us=N/A', sep='\\n', flush=True)\n"
+            "    time.sleep(0.1)"), 1)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_mux_that_fails_before_then_raises_with_what_ffmpeg_said(self):
+        with self.assertRaisesRegex(CommandError, "mov_text"):
+            mux.mux_until(self._ffmpeg(
+                "print('out_time_us=1000000', flush=True)\n"
+                "sys.stderr.write('Subtitle codec mov_text (94213) is not supported.')\n"
+                "sys.exit(1)"), 5)
+
+    def test_a_source_shorter_than_the_rehearsal_passes_when_it_ends_well(self):
+        mux.mux_until(self._ffmpeg("print('out_time_us=2000000', flush=True)"), 5)
+
+    def test_a_file_that_cannot_be_muxed_fails_before_anything_is_encoded(self):
+        steps: list[str] = []
+
+        def refuse(*_args, **_kwargs):
+            steps.append("rehearse")
+            raise CommandError(["ffmpeg"], 1, "Subtitle codec mov_text is not supported")
+
+        cfg = config.Config()
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(pipeline.mux, "rehearse", side_effect=refuse), \
+                unittest.mock.patch.object(pipeline, "_grain_step",
+                                           side_effect=lambda *a, **k: steps.append("grain")), \
+                unittest.mock.patch.object(pipeline.encode, "run_encode",
+                                           side_effect=lambda *a, **k: steps.append("encode")), \
+                self.assertRaises(CommandError):
+            pipeline._transcode(Path("/library/F.mkv"), make_info(), make_info(),
+                                Path(tmp) / "F.av1.mkv", None, Path(tmp), make_chain(), cfg,
+                                0.0, dry_run=False)
+        self.assertEqual(steps, ["rehearse"])
+
+
+class TestVideoStartOffset(unittest.TestCase):
+    """A source whose video starts after its audio must keep the gap. The encode
+    always starts at 0, and ffmpeg shifts every input to start at 0 anyway, so a
+    test file with video at 0.500 s and audio at 0 came out with both at 0: the
+    sound half a second late."""
+
+    def _probe(self, video_start: str | None, format_start: str | None) -> MediaInfo:
+        video: dict[str, Any] = {"codec_type": "video", "codec_name": "h264", "width": 320,
+                                 "height": 240, "avg_frame_rate": "25/1"}
+        fmt: dict[str, Any] = {"duration": "6.5", "size": "1000", "format_name": "matroska"}
+        if video_start is not None:
+            video["start_time"] = video_start
+        if format_start is not None:
+            fmt["start_time"] = format_start
+        audio = {"codec_type": "audio", "codec_name": "pcm_s16le", "start_time": "0.000000"}
+        out = json.dumps({"format": fmt, "streams": [video, audio]})
+        done = subprocess.CompletedProcess([], 0, stdout=out, stderr="")
+        with unittest.mock.patch.object(probe, "run", return_value=done):
+            return probe.probe(Path("/library/Film.mkv"), make_chain())
+
+    def test_probe_records_how_far_the_video_starts_after_the_file(self):
+        self.assertAlmostEqual(self._probe("0.500000", "0.000000").video_start, 0.5)
+        # Measured on the library: video at 0.083, audio and the file at 0.050.
+        self.assertAlmostEqual(self._probe("0.083000", "0.050000").video_start, 0.033)
+        # Five Dolby Vision files gave no video start time at all.
+        self.assertEqual(self._probe(None, "0.000000").video_start, 0.0)
+
+    def test_the_mux_puts_the_gap_back_before_the_encode(self):
+        argv = mux.build_command(Path("/w/encoded.mkv"), make_info(video_start=0.5),
+                                 Path("/out/F.av1.mkv.part"), make_chain(), config.Config())
+        encode_input = argv.index("/w/encoded.mkv")
+        self.assertEqual(argv[encode_input - 3:encode_input], ["-itsoffset", "0.500000", "-i"])
+        self.assertEqual(argv.count("-itsoffset"), 1, "the source's own timing stays as it is")
+
+    def test_a_video_that_starts_with_the_file_needs_no_offset(self):
+        argv = mux.build_command(Path("/w/encoded.mkv"), make_info(),
+                                 Path("/out/F.av1.mkv.part"), make_chain(), config.Config())
+        self.assertNotIn("-itsoffset", argv)
+
+
+class TestStatisticsTags(unittest.TestCase):
+    """mkvmerge's statistics tags describe the track they were written for. ffmpeg
+    copies them onto an Opus track made from it: Battlefield Earth's Opus track
+    claimed BPS-eng=3933034 and 3.5 GB, the DTS-HD MA track's figures."""
+
+    # As ffprobe showed that DTS track.
+    TAGS: ClassVar[dict[str, str]] = {
+            "language": "eng", "BPS-eng": "3933034", "DURATION-eng": "01:57:58.870000000",
+            "NUMBER_OF_FRAMES-eng": "663644", "NUMBER_OF_BYTES-eng": "3480180216",
+            "SOURCE_ID-eng": "001100",
+            "_STATISTICS_WRITING_APP-eng": "mkvmerge v51.0.0 ('I Wish') 64-bit",
+            "_STATISTICS_WRITING_DATE_UTC-eng": "2020-10-08 22:06:40",
+            "_STATISTICS_TAGS-eng": "BPS DURATION NUMBER_OF_FRAMES NUMBER_OF_BYTES SOURCE_ID"}
+    STALE = ("BPS-eng", "DURATION-eng", "NUMBER_OF_FRAMES-eng", "NUMBER_OF_BYTES-eng",
+             "_STATISTICS_WRITING_APP-eng", "_STATISTICS_WRITING_DATE_UTC-eng",
+             "_STATISTICS_TAGS-eng")
+
+    def test_probe_keeps_the_names_of_a_tracks_statistics_tags(self):
+        stream = probe._stream({"index": 1, "codec_name": "dts", "codec_type": "audio",
+                                "tags": {**self.TAGS, "DURATION": "01:57:58.870000000"}})
+        self.assertEqual(sorted(stream.statistics_tags), sorted(self.STALE))
+        self.assertEqual(stream.bitrate, 3_933_034, "the source's own tag is still read")
+
+    def _argv(self, codec: str) -> list[str]:
+        stream = probe.Stream(index=1, codec=codec, codec_type="audio", channels=2,
+                              statistics_tags=self.STALE)
+        return mux.build_command(Path("/w/encoded.mkv"), make_info(audio=[stream]),
+                                 Path("/out/F.av1.mkv.part"), make_chain(), config.Config())
+
+    def test_a_track_made_into_opus_drops_the_source_tracks_statistics(self):
+        argv = self._argv("dts")
+        blanked = [argv[i + 1] for i, a in enumerate(argv) if a == "-metadata:s:a:0"]
+        self.assertEqual(blanked, [f"{name}=" for name in self.STALE])
+        self.assertNotIn("-map_metadata:s:a:0", argv, "that would drop the language and title")
+
+    def test_a_copied_track_keeps_its_statistics(self):
+        # The same bytes, so the figures still hold.
+        self.assertNotIn("-metadata:s:a:0", self._argv("ac3"))
+
+
+class TestDeinterlace(unittest.TestCase):
+    """An interlaced source encoded as it is keeps its combing, and no player
+    deinterlaces AV1. capture.avi has interlaced picture and is flagged progressive
+    (idet: 39,019 frames bottom field first, 25,128 top, 33,600 progressive), so
+    the order can be forced."""
+
+    BWDIF_BFF = "bwdif=mode=send_frame:parity=bff:deint=all"
+
+    def _cfg(self, mode: str) -> config.Config:
+        cfg = config.Config()
+        cfg.encode.deinterlace = mode
+        return cfg
+
+    def _probe(self, field_order: str | None) -> MediaInfo:
+        video: dict[str, Any] = {"codec_type": "video", "codec_name": "mpeg2video",
+                                 "width": 720, "height": 576, "avg_frame_rate": "25/1"}
+        if field_order is not None:
+            video["field_order"] = field_order
+        fmt = {"duration": "60", "size": "1000", "format_name": "matroska"}
+        done = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({"format": fmt, "streams": [video]}), stderr="")
+        with unittest.mock.patch.object(probe, "run", return_value=done):
+            return probe.probe(Path("/library/Film.mkv"), make_chain())
+
+    def test_probe_records_the_field_order_and_whether_it_is_interlaced(self):
+        self.assertEqual(self._probe("tt").field_order, "tt")
+        self.assertTrue(self._probe("bb").interlaced)
+        for order in ("progressive", "unknown", None):
+            self.assertFalse(self._probe(order).interlaced, order)
+
+    def test_nothing_is_deinterlaced_unless_asked(self):
+        info = make_info(field_order="tt")
+        self.assertEqual(encode.deinterlace_filter(info, config.Config()), "")
+        argv = encode.build_command(info, Path("/o.mkv"), make_chain(), config.Config(),
+                                    Path("/w"))
+        self.assertNotIn("-f", argv)
+
+    def test_auto_deinterlaces_a_flagged_source_by_the_field_shown_first(self):
+        cfg = self._cfg("auto")
+        shown_first = {"tt": "tff", "bt": "tff", "bb": "bff", "tb": "bff"}
+        for order, parity in shown_first.items():
+            self.assertIn(f"parity={parity}",
+                          encode.deinterlace_filter(make_info(field_order=order), cfg), order)
+        for order in ("progressive", "unknown", ""):
+            self.assertEqual(encode.deinterlace_filter(make_info(field_order=order), cfg), "")
+
+    def test_a_forced_field_order_deinterlaces_a_source_flagged_progressive(self):
+        info = make_info(field_order="progressive")
+        self.assertEqual(encode.deinterlace_filter(info, self._cfg("bff")), self.BWDIF_BFF)
+
+    def test_deinterlacing_keeps_one_frame_per_frame(self):
+        # Chunks, keyframes and verify all pair frames by number.
+        made = encode.deinterlace_filter(make_info(), self._cfg("tff"))
+        self.assertIn("mode=send_frame", made)
+        self.assertIn("deint=all", made, "frame flags do not survive Av1an's pipe")
+
+    def test_the_encode_deinterlaces_before_it_denoises(self):
+        argv = encode.build_command(make_info(), Path("/o.mkv"), make_chain(), self._cfg("bff"),
+                                    Path("/w"), denoise_filter="hqdn3d=2:2:3:3")
+        self.assertEqual(argv[argv.index("-f") + 1], f"-vf {self.BWDIF_BFF},hqdn3d=2:2:3:3")
+
+    def test_size_estimates_encode_their_samples_deinterlaced(self):
+        seen: list[list[str]] = []
+
+        def popen(argv, **_kwargs):
+            seen.append(argv)
+            raise RuntimeError("stop here")
+
+        with unittest.mock.patch.object(estimate.subprocess, "Popen", side_effect=popen), \
+                self.assertRaises(RuntimeError):
+            estimate._encode_sample(make_info(), make_chain(), self._cfg("bff"), 10.0, 5.0,
+                                    30, "", Path("/w/s.ivf"))
+        self.assertEqual(seen[0][seen[0].index("-vf") + 1], self.BWDIF_BFF)
+
+    def _grain_argvs(self, call) -> list[list[str]]:
+        seen: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            seen.append(argv)
+            joined = " ".join(argv)
+            if (stats := re.search(r"stats_file=(\S+?)(?:[;\s]|$)", joined)):
+                Path(stats.group(1)).write_text("n:1 mse_y:2.0 mse_u:1.0 mse_v:1.0 psnr_y:40\n",
+                                                encoding="utf-8")
+            elif argv[-1].endswith(".mkv"):
+                Path(argv[-1]).write_bytes(b"x")
+            return util.Completed(argv, 0, "", "", 0.0)
+
+        with unittest.mock.patch.object(grain, "run", side_effect=fake_run), \
+                tempfile.TemporaryDirectory() as tmp:
+            call(Path(tmp))
+        return seen
+
+    def test_grain_analysis_clips_are_deinterlaced_before_they_are_cropped(self):
+        seen = self._grain_argvs(lambda work: grain._extract_lossless(
+            make_info(), make_chain(), self._cfg("bff"), [10.0], work))
+        self.assertEqual(seen[0][seen[0].index("-vf") + 1],
+                         f"{self.BWDIF_BFF},{grain.ANALYSIS_CROP}")
+
+    def test_the_grain_probe_measures_the_deinterlaced_picture(self):
+        seen = self._grain_argvs(lambda work: grain.measure(
+            make_info(), make_chain(), self._cfg("bff"), work))
+        graph = seen[0][seen[0].index("-filter_complex") + 1]
+        self.assertTrue(graph.startswith(f"[0:v]{self.BWDIF_BFF},split=2"), graph)
+
+    def test_calibration_deinterlaces_the_source_and_not_the_encode(self):
+        seen = self._grain_argvs(lambda work: grain.calibrate_strength(
+            Path("/library/Film.mkv"), work / "grainy.mkv", make_chain(), self._cfg("bff"),
+            work, 7200.0, source_filter=self.BWDIF_BFF))
+        graphs = {argv[argv.index("-i") + 1]: argv[argv.index("-filter_complex") + 1]
+                  for argv in seen}
+        self.assertTrue(graphs["/library/Film.mkv"].startswith(f"[0:v]{self.BWDIF_BFF},"))
+        encode_graphs = [g for path, g in graphs.items() if path != "/library/Film.mkv"]
+        self.assertTrue(encode_graphs)
+        self.assertTrue(all(g.startswith(verify.GRAIN_GRAPH) for g in encode_graphs))
+
+    def test_verify_deinterlaces_the_source_and_not_the_encode(self):
+        seen: list[list[str]] = []
+
+        def fake_progress(argv, *_args, **_kwargs):
+            seen.append(argv)
+            stats = re.search(r"stats_file=(\S+?)(?:[;\s]|$)", " ".join(argv))
+            Path(present(stats).group(1)).write_text(
+                "n:1 XPSNR y: 40.0 mse_y:2.0 psnr_y:40.0\n", encoding="utf-8")
+
+        with unittest.mock.patch.object(verify, "run_progress", side_effect=fake_progress), \
+                tempfile.TemporaryDirectory() as tmp:
+            verify.compare(make_chain(), Path("/src.mkv"), Path("/enc.mkv"), Path(tmp),
+                           reference_filter=self.BWDIF_BFF)
+        self.assertEqual(len(seen), 4)
+        for argv in seen[:2]:   # XPSNR and low-pass PSNR: both inputs in one graph
+            graph = argv[argv.index("-lavfi") + 1]
+            self.assertIn(f"[0:v]{self.BWDIF_BFF},", graph)
+            self.assertNotIn(f"[1:v]{self.BWDIF_BFF}", graph)
+        source_grain, encode_grain = (argv[argv.index("-filter_complex") + 1] for argv in seen[2:])
+        self.assertTrue(source_grain.startswith(f"[0:v]{self.BWDIF_BFF},"))
+        self.assertEqual(encode_grain.split("psnr=")[0], verify.GRAIN_GRAPH)
+
+    def test_leaving_it_off_keeps_every_estimate_and_turning_it_on_does_not(self):
+        chain = make_chain()
+        encoding = pipeline._size_settings(config.Config(), chain)["encode"]
+        assert isinstance(encoding, dict)
+        self.assertNotIn("deinterlace", encoding)
+        self.assertNotEqual(pipeline.size_key(self._cfg("auto"), chain),
+                            pipeline.size_key(config.Config(), chain))
+
+    def test_an_interlaced_source_left_as_it_is_says_so(self):
+        with self.assertLogs(util.log, "WARNING") as logged:
+            pipeline.note_interlacing(make_info(field_order="tt"), config.Config())
+        self.assertIn("encode.deinterlace", logged.output[0])
+
+    def test_the_setting_takes_only_its_four_values(self):
+        with self.assertRaisesRegex(config.ConfigError, "encode.deinterlace"):
+            config.validate(self._cfg("always"))
+
+    def test_the_flag_sets_it_for_one_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "c.toml"
+            empty.write_text("", encoding="utf-8")
+            args = cli.build_parser().parse_args(
+                ["-c", str(empty), "--deinterlace", "bff", "run", "capture.avi"])
+            self.assertEqual(cli.load_config(args).encode.deinterlace, "bff")
+
+
 class TestPixelAspect(unittest.TestCase):
     """AV1 carries no pixel shape, so a DVD's must be put back at the mux."""
 
     def aspect(self, **info: Any) -> list[str]:
         argv = mux.build_command(Path("/w/encoded.mkv"), make_info(**info),
                                  Path("/out/Film.av1.mkv.part"), make_chain(), config.Config())
-        return argv[argv.index("-aspect") + 1:argv.index("-aspect") + 2] if "-aspect" in argv else []
+        if "-aspect" not in argv:
+            return []
+        return argv[argv.index("-aspect") + 1:argv.index("-aspect") + 2]
 
     def test_pal_dvds_keep_their_shape(self):
         self.assertEqual(self.aspect(width=720, height=576, sample_aspect="16:15"), ["4:3"])
@@ -1385,7 +2009,7 @@ class TestGrainRetention(unittest.TestCase):
         self.assertEqual(verify.ffmpeg_argv(make_chain()), ["ffmpeg"])
 
     def test_av1_stays_on_the_cpu(self):
-        # av1_rkmpp drops film grain and decoded a 1202-wide encode wrongly.
+        # av1_rkmpp decoded a 1202-wide encode wrongly (jellyfin-ffmpeg 8.1.3-2).
         self.assertEqual(self.decoder("av1", grain=True), [])
         self.assertEqual(self.decoder("av1", grain=False), [])
 
@@ -1553,7 +2177,7 @@ class TestVarianceBoost(unittest.TestCase):
 class TestDarkBias(unittest.TestCase):
     """1080p keeps its dark scenes from blocking with a lower QP on dark frames."""
 
-    OPTIONS = {"--luminance-qp-bias"}
+    OPTIONS: ClassVar[set[str]] = {"--luminance-qp-bias"}
 
     def bias_at(self, width: int, cfg: config.Config | None = None,
                 options: set[str] = OPTIONS) -> str | None:
@@ -1592,14 +2216,15 @@ class TestFogSettings(unittest.TestCase):
     """4K keeps its grain in flat fog, and 1080p its rain, with ac-bias and a weak
     temporal filter."""
 
-    OPTIONS = {"--ac-bias", "--tf-strength"}
+    OPTIONS: ClassVar[set[str]] = {"--ac-bias", "--tf-strength"}
 
     def flags_at(self, width: int, cfg: config.Config | None = None,
                  options: set[str] = OPTIONS) -> tuple[str | None, str | None]:
         argv = encode.svt_params(make_info(width=width, height=width * 9 // 16),
                                  cfg or config.Config(), make_chain(svt_options=options))
-        return tuple(argv[argv.index(flag) + 1] if flag in argv else None
-                     for flag in ("--ac-bias", "--tf-strength"))
+        def value(flag: str) -> str | None:
+            return argv[argv.index(flag) + 1] if flag in argv else None
+        return value("--ac-bias"), value("--tf-strength")
 
     def test_4k_and_1080p_get_them_by_default(self):
         self.assertEqual([self.flags_at(w) for w in (3836, 1920, 1280, 720)],
@@ -1637,7 +2262,8 @@ class TestFogSettings(unittest.TestCase):
 class TestEncoderCapabilities(unittest.TestCase):
     """An old SvtAv1EncApp would quietly give the encodes the ladder was set against."""
 
-    FULL = {"--luminance-qp-bias", "--enable-variance-boost", "--ac-bias", "--tf-strength"}
+    FULL: ClassVar[set[str]] = {"--luminance-qp-bias", "--enable-variance-boost", "--ac-bias",
+                                "--tf-strength"}
 
     def problems(self, options: set[str], cfg: config.Config | None = None) -> str:
         chain = make_chain(svt_options=options, svtav1_version="2.3.0")
@@ -1964,6 +2590,82 @@ class TestEarlySavingCheck(unittest.TestCase):
             config.validate(cfg)
 
 
+class TestProgressLog(unittest.TestCase):
+    """With no terminal (Docker, systemd) Av1an draws no bar, and the log said
+    nothing between "encoding" and "done": for a 4K film, days."""
+
+    SCENES: ClassVar[list[tuple[int, int]]] = [(i * 1000, i * 1000 + 1000)
+                                               for i in range(10)]   # 10,000 frames
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.now = 0.0
+
+    _av1an_temp = TestEarlySavingCheck._av1an_temp
+
+    def _log(self, done: dict[int, int], saving: Any = None) -> watch.ProgressLog:
+        temp = self._av1an_temp(self.SCENES, done)
+        return watch.ProgressLog(temp, saving=saving, clock=lambda: self.now)
+
+    def _finish(self, *chunks: int) -> None:
+        self._av1an_temp(self.SCENES, dict.fromkeys(chunks, 1))
+
+    def test_nothing_is_said_within_the_hour(self):
+        progress = self._log({})
+        self._finish(0, 1)
+        self.now = 3599.0
+        with self.assertNoLogs(util.log, "INFO"):
+            self.assertIsNone(progress())
+
+    def test_each_hour_says_how_far_how_fast_and_how_long_to_go(self):
+        progress = self._log({0: 1})   # finished by an earlier run: not this run's speed
+        self._finish(0, 1, 2, 3)
+        self.now = 3600.0
+        with self.assertLogs(util.log, "INFO") as logged:
+            self.assertIsNone(progress(), "it never stops the encode")
+        line = logged.output[0]
+        self.assertIn("40% encoded (4,000 of 10,000 frames)", line)
+        self.assertIn("0.83 fps", line)          # 3,000 frames in 3,600 s
+        self.assertIn("2h00m00s left", line)     # 6,000 frames to go at that rate
+        self.now = 3700.0
+        with self.assertNoLogs(util.log, "INFO"):
+            progress()
+
+    def test_an_hour_without_a_finished_chunk_says_so(self):
+        progress = self._log({})
+        self.now = 3600.0
+        with self.assertLogs(util.log, "INFO") as logged:
+            progress()
+        self.assertIn("no chunk finished yet", logged.output[0])
+
+    def test_the_projected_size_comes_from_the_saving_check(self):
+        projection = watch.Projection(frames_done=4000, frames=10_000, ratio=0.2,
+                                      output_bytes=3 * 2**30, saving_percent=85.3)
+        progress = self._log({}, saving=unittest.mock.Mock(**{"projection.return_value":
+                                                             projection}))
+        self._finish(0)
+        self.now = 3600.0
+        with self.assertLogs(util.log, "INFO") as logged:
+            progress()
+        self.assertIn("projected 3.0 GiB, 85.3% smaller", logged.output[0])
+
+    def test_it_runs_beside_the_saving_check_and_never_stops_the_encode(self):
+        asked: list[str] = []
+        check = present(watch.checks(lambda: asked.append("progress"),
+                                     lambda: asked.append("saving") or "too big"))
+        self.assertEqual(check(), "too big")
+        self.assertEqual(asked, ["progress", "saving"])
+        self.assertIsNone(watch.checks(None, None))
+
+    def test_it_is_wanted_only_where_there_is_no_progress_bar(self):
+        tty = unittest.mock.Mock(**{"isatty.return_value": True})
+        pipe = unittest.mock.Mock(**{"isatty.return_value": False})
+        self.assertFalse(watch.ProgressLog.wanted(tty))
+        self.assertTrue(watch.ProgressLog.wanted(pipe))
+
+
 class TestWatchedCommand(unittest.TestCase):
     """Stopping a command must take its children with it."""
 
@@ -2000,7 +2702,8 @@ class TestMeasurementProgress(unittest.TestCase):
         self.assertEqual(util._progress(250, 1000, 60),
                          "250 of 1,000 frames (25%), 1m00s so far, about 3m00s left")
         self.assertEqual(util._progress(0, 1000, 5), "0 of 1,000 frames (0%), 5s so far")
-        self.assertEqual(util._progress(1200, 1000, 90), "1,200 of 1,000 frames (100%), 1m30s so far")
+        self.assertEqual(util._progress(1200, 1000, 90),
+                         "1,200 of 1,000 frames (100%), 1m30s so far")
         self.assertEqual(util._progress(1200, 0, 90), "1,200 frames, 1m30s so far")
         self.assertEqual(util._progress(3, None, 90), "still running, 1m30s so far")
 
@@ -2190,7 +2893,7 @@ class TestWorkers(unittest.TestCase):
     memory holds."""
 
     GB = 1_000_000_000
-    UHD = dict(width=3840, height=2160)   # 8.3 megapixels
+    UHD: ClassVar[dict[str, int]] = dict(width=3840, height=2160)   # 8.3 megapixels
 
     def test_a_configured_count_wins(self):
         cfg = config.Config()
@@ -2382,7 +3085,8 @@ class TestEstimatesSteerTheRun(unittest.TestCase):
         self.assertIsNone(self.ledger.guess(self.files[0], self.key))
 
     def test_the_thresholds_do_not_invalidate_an_estimate(self):
-        before = pipeline.size_key(self.cfg, self.chain), pipeline.settings_key(self.cfg, self.chain)
+        before = (pipeline.size_key(self.cfg, self.chain),
+                  pipeline.settings_key(self.cfg, self.chain))
         self.cfg.output.min_saving_mib = 500.0
         self.assertEqual(before[0], pipeline.size_key(self.cfg, self.chain))
         self.assertNotEqual(before[1], pipeline.settings_key(self.cfg, self.chain))
@@ -2390,7 +3094,8 @@ class TestEstimatesSteerTheRun(unittest.TestCase):
         self.assertNotEqual(before[0], pipeline.size_key(self.cfg, self.chain))
 
     def test_grain_sampling_does_not_invalidate_an_estimate(self):
-        before = pipeline.size_key(self.cfg, self.chain), pipeline.settings_key(self.cfg, self.chain)
+        before = (pipeline.size_key(self.cfg, self.chain),
+                  pipeline.settings_key(self.cfg, self.chain))
         self.cfg.grain.samples, self.cfg.grain.sample_seconds = 20, 5
         self.assertEqual(before, (pipeline.size_key(self.cfg, self.chain),
                                   pipeline.settings_key(self.cfg, self.chain)))
@@ -2407,7 +3112,9 @@ class TestEstimatesSteerTheRun(unittest.TestCase):
         # Exactly what size_key and settings_key wrote until then.
         grain = dataclasses.asdict(self.cfg.grain)
         grain.update(samples=samples, sample_seconds=seconds)
-        settings = {"encode": dataclasses.asdict(self.cfg.encode), "grain": grain,
+        encoding = dataclasses.asdict(self.cfg.encode)
+        del encoding["deinterlace"]   # came later, and stays out of the digest while off
+        settings = {"encode": encoding, "grain": grain,
                     "audio": dataclasses.asdict(self.cfg.audio),
                     "svt_av1": self.chain.svtav1_version}
         if savings:
@@ -3058,7 +3765,8 @@ class TestClean(unittest.TestCase):
 
     def test_a_staged_copy_follows_its_work(self):
         kept, gone = self._film("Kept.mkv"), self._film("Gone.mkv")
-        self._work(kept), self._work(gone)
+        self._work(kept)
+        self._work(gone)
         copies = {}
         for source in (kept, gone):
             copies[source] = pipeline._staged_path(source, self.cfg, ".mkv")
@@ -3182,14 +3890,17 @@ class TestProgressRedraw(unittest.TestCase):
 
     def test_scene_detection_bars_are_read(self):
         status, _ = progress.parse("00:00:53 ▐ ▌   0% 91/212784 (1.71 fps, eta 35h)")
+        assert status is not None
         self.assertEqual((status.pos, status.length, status.chunks), (91, 212784, None))
         status, _ = progress.parse("00:00:53 [       ]  91 frames (0.58 s/fr)")
+        assert status is not None
         self.assertEqual((status.pos, status.rate, status.percent), (91, "0.58 s/fr", None))
 
     def test_a_bar_ending_in_any_partial_block_is_read(self):
         for part in "▉▊▋▌▍▎▏ ":
             line = f"00:01:21 ▐{'█' * 30}{part}{' ' * 9}▌  83% 6102/7333 (76.06 fps, eta 16s)"
             status, rest = progress.parse(line)
+            assert status is not None, part
             self.assertEqual((status.pos, status.percent, rest), (6102, 83, ""), part)
 
     def test_scene_detection_draws_never_pile_up_above_the_bar(self):
@@ -3211,6 +3922,7 @@ class TestProgressRedraw(unittest.TestCase):
 
     def test_every_width_fits(self):
         status, _ = progress.parse(progress.ESCAPE.sub("", BAR_LINE))
+        assert status is not None
         for width in range(20, 200):
             lines = progress.render(status, width)
             self.assertTrue(all(len(line) < width for line in lines), width)
@@ -3225,12 +3937,15 @@ class TestProgressRedraw(unittest.TestCase):
         for width in (200, 80, 30):
             out = io.StringIO()
             screen = progress.Screen(out, width=width, title=title)
-            screen.update(progress.parse(progress.ESCAPE.sub("", BAR_LINE))[0], now=True)
+            status, _ = progress.parse(progress.ESCAPE.sub("", BAR_LINE))
+            assert status is not None
+            screen.update(status, now=True)
             screen.write_above("INFO a chunk finished\n")
             screen.finish()
             # What the last redraw left, after it cleared the lines before.
             last = re.split(r"(?:\r?\x1b\[2K|\x1b\[1A\x1b\[2K)+", out.getvalue())[-1]
             last = progress.ESCAPE.sub("", last).splitlines()
+            assert screen.status is not None
             bar = progress.render(screen.status, width)
             self.assertEqual(last, [progress.heading(title, width), *bar], width)
             self.assertTrue(all(len(line) < width for line in last), width)

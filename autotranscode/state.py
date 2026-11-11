@@ -1,15 +1,19 @@
 """A small JSON ledger so a library crawl can be stopped and resumed.
 
-Deliberately not a database. The unit of work is one file taking hours; contention
-is not a concern, and a file you can read and hand-edit is worth more here.
+Deliberately not a database. The unit of work is one file taking hours, and a
+file you can read and hand-edit is worth more here. Contention is rare but real: a
+`run` going for days and an `estimate` started beside it share the file, so each
+change is made under a lock against what is on disk at that moment.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import tempfile
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -79,23 +83,46 @@ class Ledger:
         self._load()
 
     def _load(self) -> None:
+        """Replace what this process holds with what is on disk. A file that cannot
+        be read leaves it as it was, so a bad edit by hand costs nothing more."""
         if not self.path.is_file():
+            self.records, self.guesses = {}, {}
             return
         try:
             raw: dict[str, Any] = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            log.warning("could not read state file %s (%s); starting fresh", self.path, exc)
+            log.warning("could not read state file %s (%s); not using it", self.path, exc)
             return
+        records: dict[str, Record] = {}
+        guesses: dict[str, Guess] = {}
         for key, value in raw.get("records", {}).items():
             try:
-                self.records[key] = Record(**value)
+                records[key] = Record(**value)
             except TypeError:
                 log.debug("dropping incompatible state entry %s", key)
         for key, value in raw.get("estimates", {}).items():
             try:
-                self.guesses[key] = Guess(**value)
+                guesses[key] = Guess(**value)
             except TypeError:
                 log.debug("dropping incompatible estimate %s", key)
+        self.records, self.guesses = records, guesses
+
+    @contextlib.contextmanager
+    def _changing(self) -> Iterator[None]:
+        """Hold the lock, re-read the file, let the caller make one change, save.
+
+        Each process loads the ledger once, and used to write its whole copy back
+        on every save: a run's "done" could erase an estimate made since, and the
+        estimate's next save erase the "done" -- a finished film then encoded
+        again if its output was moved.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock = self.path.with_name(self.path.name + ".lock")
+        with lock.open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)   # released when the file closes
+            self._load()
+            yield
+            self.save()
 
     def save(self) -> None:
         """Write atomically: a crash mid-write must not destroy hours of bookkeeping."""
@@ -131,8 +158,8 @@ class Ledger:
         return record if record and record.status == "skipped" and record.settings else None
 
     def record(self, source: Path, record: Record) -> None:
-        self.records[_key(source)] = record
-        self.save()
+        with self._changing():
+            self.records[_key(source)] = record
 
     def guess(self, source: Path, settings: str | Collection[str]) -> Guess | None:
         """The estimate for `source` made with these settings, if there is one.
@@ -142,8 +169,8 @@ class Ledger:
         return guess if guess and guess.settings in accepted else None
 
     def record_guess(self, source: Path, guess: Guess) -> None:
-        self.guesses[_key(source)] = guess
-        self.save()
+        with self._changing():
+            self.guesses[_key(source)] = guess
 
     def summary(self) -> str:
         done = [r for r in self.records.values() if r.status == "done"]

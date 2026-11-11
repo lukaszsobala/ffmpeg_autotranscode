@@ -261,7 +261,8 @@ def encode_pick(
 
         if score:
             _score(result, chain, excerpt, encoded, directory, root / "work",
-                   pq=info.color_transfer == "smpte2084")
+                   pq=info.color_transfer == "smpte2084",
+                   deinterlaced=encode.deinterlace_filter(info, local))
     except pipeline.SkipFile as exc:
         result.ok, result.error = False, f"skipped: {exc}"
     except pipeline.OutputExists as exc:
@@ -276,17 +277,18 @@ def _reason(exc: Exception) -> str:
     """One line for the report: what the tool said, not the command that failed."""
     if isinstance(exc, CommandError):
         said = [line for line in exc.stderr.strip().splitlines() if line.strip()]
-        return f"{Path(exc.argv[0]).name} exit {exc.returncode}: {said[0] if said else 'no message'}"[:300]
+        first = said[0] if said else "no message"
+        return f"{Path(exc.argv[0]).name} exit {exc.returncode}: {first}"[:300]
     return str(exc).splitlines()[0][:300] if str(exc) else repr(exc)
 
 
 def _score(result: Result, chain: Toolchain, excerpt: Path, encoded: Path, directory: Path,
-           work: Path, *, pq: bool) -> None:
+           work: Path, *, pq: bool, deinterlaced: str = "") -> None:
     """Scores and snapshots. A failure here leaves the encode standing: it is noted,
     and a rerun measures again without encoding again."""
     try:
         comparison = verify.compare(chain, excerpt, encoded, work / f"verify-{result.id}",
-                                    frames=result.frames)
+                                    frames=result.frames, reference_filter=deinterlaced)
         if comparison.lowpass:
             result.lowpass_mean = comparison.lowpass_mean
             result.lowpass_p5 = comparison.lowpass_p5
@@ -294,7 +296,8 @@ def _score(result: Result, chain: Toolchain, excerpt: Path, encoded: Path, direc
         result.grain_retention = comparison.grain_retention
         result.worst = comparison.worst
         snaps = directory / "snapshots"
-        verify.snapshots(chain, excerpt, result.worst, snaps, "source", pq=pq)
+        verify.snapshots(chain, excerpt, result.worst, snaps, "source", pq=pq,
+                         prefilter=deinterlaced)
         verify.snapshots(chain, encoded, result.worst, snaps, "encode", pq=pq)
     except (CommandError, OSError, ValueError) as exc:
         result.error = f"not scored: {_reason(exc)}"
@@ -338,7 +341,8 @@ def write_report(root: Path, header: list[str], picks: list[Pick],
         lines.append(
             f"| {p.id} | {film} | {what} | {human_duration(p.start)} "
             f"| {r.kbps(r.source_bytes):,.0f} | {r.kbps(r.encoded_bytes):,.0f} "
-            f"| {r.saving:.0f}% | {encode.crf_text(r.crf)} | {_db(r.lowpass_mean)} | {_db(r.lowpass_p5)} "
+            f"| {r.saving:.0f}% | {encode.crf_text(r.crf)} "
+            f"| {_db(r.lowpass_mean)} | {_db(r.lowpass_p5)} "
             f"| {_db(r.lowpass_min)} | {grain} | {human_duration(r.encode_seconds)} |")
 
     by_band: dict[str, list[Result]] = defaultdict(list)
@@ -415,17 +419,22 @@ def run_samples(
         print(f"{len(picks)} pick(s) in {picks_file}; run again without --pick-only to encode")
         return 0
 
-    for number, p in enumerate(picks, start=1):
-        log.info("[%d/%d] %s: %s from %s", number, len(picks), p.id, Path(p.source).name,
-                 human_duration(p.start))
-        write_report(root, header, picks, results, f"sample {number}/{len(picks)} ({p.id})")
-        results[p.id] = encode_pick(p, chain, cfg, root, score=score)
-        r = results[p.id]
-        if r.ok:
-            log.info("  %s -> %s (%.0f%% smaller)", human_size(r.source_bytes),
-                     human_size(r.encoded_bytes), r.saving)
-        else:
-            log.warning("  failed: %s", r.error)
+    # The same stop handling as `run`: without it a SIGTERM or a hangup ends Python
+    # and leaves Av1an, in a process group of its own, encoding on orphaned.
+    with pipeline.stop_signals() as stop:
+        for number, p in enumerate(picks, start=1):
+            log.info("[%d/%d] %s: %s from %s", number, len(picks), p.id, Path(p.source).name,
+                     human_duration(p.start))
+            write_report(root, header, picks, results, f"sample {number}/{len(picks)} ({p.id})")
+            results[p.id] = encode_pick(p, chain, cfg, root, score=score)
+            if stop.seen:   # a tool killed by our own stop reads as a failed sample
+                raise KeyboardInterrupt
+            r = results[p.id]
+            if r.ok:
+                log.info("  %s -> %s (%.0f%% smaller)", human_size(r.source_bytes),
+                         human_size(r.encoded_bytes), r.saving)
+            else:
+                log.warning("  failed: %s", r.error)
 
     failed = sum(not r.ok for r in results.values())
     status = f"finished {dt.datetime.now():%Y-%m-%d %H:%M}" + (

@@ -19,14 +19,17 @@ import itertools
 import json
 import subprocess
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
-from . import mux
+from . import mux, progress
 from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
-from .util import MIB, child_env, human_size, log
+from .util import MIB, child_env, human_duration, human_size, log
 
 
 @dataclass(slots=True)
@@ -201,13 +204,14 @@ class SavingWatch:
     def __call__(self) -> str | None:
         try:
             return self._check()
-        except Exception:  # noqa: BLE001 - never let a bookkeeping bug end a long encode
+        except Exception:  # never let a bookkeeping bug end a long encode
             if not self._broken:
                 log.warning("  early saving check failed; the encode carries on", exc_info=True)
                 self._broken = True
             return None
 
-    def _check(self) -> str | None:
+    def projection(self) -> Projection | None:
+        """Where the finished chunks say the file is heading; None until they can."""
         sizes = self.source.sizes
         if self._broken or sizes is None:
             return None
@@ -218,7 +222,10 @@ class SavingWatch:
                         "not checking the saving early", len(sizes), frames)
             self._broken = True
             return None
-        projection = project(self.info, self.cfg, frames, chunks, sizes)
+        return project(self.info, self.cfg, frames, chunks, sizes)
+
+    def _check(self) -> str | None:
+        projection = self.projection()
         after = self.cfg.output.check_saving_after_percent
         if projection is None or projection.done_percent < after:
             return None
@@ -234,3 +241,73 @@ class SavingWatch:
 
     def close(self) -> None:
         self.source.close()
+
+
+class ProgressLog:
+    """A line an hour on how the encode is going, for a run with no terminal.
+
+    Under Docker or systemd Av1an draws no bar, and the log said nothing between
+    "encoding" and "done": for a 4K film, days. Asked every minute alongside
+    SavingWatch, it never stops the encode. The speed is this run's own: chunks
+    finished before a restart are counted as done, not as frames it encoded.
+    """
+
+    EVERY = 3600.0
+
+    def __init__(self, temp: Path, scenes: Path | None = None,
+                 saving: SavingWatch | None = None,
+                 clock: Callable[[], float] = time.monotonic):
+        self.temp, self.scenes, self.saving, self.clock = temp, scenes, saving, clock
+        self._started = clock()
+        self._next = self._started + self.EVERY
+        self._done_before = self._frames_done()[0]
+
+    @staticmethod
+    def wanted(stream: TextIO) -> bool:
+        """Only where Av1an draws no bar: with a terminal the bar says all this."""
+        return not progress.usable(stream)
+
+    def _frames_done(self) -> tuple[int, int]:
+        frames, chunks = finished_chunks(self.temp, self.scenes)
+        return sum(chunk.end - chunk.start for chunk in chunks), frames
+
+    def __call__(self) -> None:
+        now = self.clock()
+        if now < self._next:
+            return
+        self._next = now + self.EVERY
+        try:
+            line = self.line(now)
+        except Exception:  # a progress line is never worth an encode
+            log.debug("progress line failed", exc_info=True)
+            return
+        log.info("%s", line)
+
+    def line(self, now: float) -> str:
+        done, frames = self._frames_done()
+        encoded = done - self._done_before
+        if not frames or encoded <= 0:
+            return (f"  {human_duration(now - self._started)} into the encode, "
+                    "no chunk finished yet this run")
+        rate = encoded / (now - self._started)
+        parts = [f"  {100 * done / frames:.0f}% encoded ({done:,} of {frames:,} frames)",
+                 f"{rate:.2f} fps", f"{human_duration((frames - done) / rate)} left"]
+        projection = self.saving.projection() if self.saving is not None else None
+        if projection is not None:
+            parts.append(f"projected {human_size(projection.output_bytes)}, "
+                         f"{describe_saving(projection.saving_percent)}")
+        return ", ".join(parts)
+
+
+def checks(*each: Callable[[], str | None] | None) -> Callable[[], str | None] | None:
+    """One check for run_watched that asks each given one, every time, in order,
+    and passes on the first reason to stop. None when none is given."""
+    present = [check for check in each if check is not None]
+    if not present:
+        return None
+
+    def ask() -> str | None:
+        reasons = [check() for check in present]
+        return next((reason for reason in reasons if reason), None)
+
+    return ask

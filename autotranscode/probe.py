@@ -28,6 +28,8 @@ DOVI_PROFILES = {5, 7, 8, 10}
 
 # Codec tags that signal Dolby Vision even when the configuration record is absent.
 DOVI_CODEC_TAGS = {"dovi", "dvh1", "dvhe", "dav1"}
+# Field orders of interlaced video, by the field coded first, then shown first.
+INTERLACED_ORDERS = {"tt", "bb", "tb", "bt"}
 
 # dv_bl_signal_compatibility_id -> what the base layer is on its own, per profile.
 # Profile 8 is defined as always having a cross-compatible base layer, so an id of 0
@@ -137,6 +139,23 @@ class Stream:
     bitrate: int = 0
     default: bool = False
     forced: bool = False
+    # The names, as spelled here, of mkvmerge's statistics tags on this track
+    # (BPS-eng, NUMBER_OF_BYTES-eng...): the mux blanks them on a track it
+    # re-encodes, since they describe the source's track.
+    statistics_tags: tuple[str, ...] = ()
+
+
+# mkvmerge's statistics tags, without the language suffix it often adds. A plain
+# "DURATION" is left out: ffmpeg's Matroska muxer writes its own, measured on
+# the output, and never copies the input's.
+STATISTICS_TAGS = {"BPS", "DURATION", "NUMBER_OF_FRAMES", "NUMBER_OF_BYTES",
+                   "_STATISTICS_WRITING_APP", "_STATISTICS_WRITING_DATE_UTC",
+                   "_STATISTICS_TAGS"}
+
+
+def _statistics_tags(tags: dict) -> tuple[str, ...]:
+    return tuple(key for key in tags
+                 if key.upper() != "DURATION" and key.upper().split("-")[0] in STATISTICS_TAGS)
 
 
 @dataclass(slots=True)
@@ -158,9 +177,17 @@ class MediaInfo:
     # The video track's own length, which can differ from `duration` (the
     # longest track's). 0 when the container does not say.
     video_duration: float = 0.0
+    # How far the video starts after the file does, in seconds. The encode starts
+    # at 0, so the mux puts this back (`mux.build_command`). 30 of 397 files in
+    # the library had one: 22 under 50 ms, the longest 120 ms.
+    video_start: float = 0.0
     # Pixel shape, "16:15" for 4:3 PAL, "64:45" for a 16:9 DVD. Empty when the
     # pixels are square. The encode carries none of it, so the mux restores it.
     sample_aspect: str = ""
+    # ffprobe's field order: "tt", "bb", "tb" or "bt" for interlaced video, else
+    # "progressive", "unknown" or nothing. Taken from the codec's own flags, which
+    # can be wrong: see encode.deinterlace_filter.
+    field_order: str = ""
 
     color_primaries: str = ""
     color_transfer: str = ""
@@ -172,6 +199,10 @@ class MediaInfo:
 
     audio: list[Stream] = field(default_factory=list)
     subtitles: list[Stream] = field(default_factory=list)
+
+    @property
+    def interlaced(self) -> bool:
+        return self.field_order in INTERLACED_ORDERS
 
     @property
     def is_hdr(self) -> bool:
@@ -271,10 +302,20 @@ def _stream_duration(stream: dict) -> float:
     except ValueError:
         pass
     for key, value in (stream.get("tags") or {}).items():
-        if key.upper() == "DURATION" or key.upper().startswith("DURATION-"):
-            if match := re.fullmatch(r"(\d+):(\d+):(\d+(?:\.\d+)?)", str(value).strip()):
-                return int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3])
+        named = key.upper() == "DURATION" or key.upper().startswith("DURATION-")
+        if named and (match := re.fullmatch(r"(\d+):(\d+):(\d+(?:\.\d+)?)",
+                                            str(value).strip())):
+            return int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3])
     return 0.0
+
+
+def _start_offset(stream: dict, fmt: dict) -> float:
+    """How far `stream` starts after the file. 0.0 when either time is missing:
+    five Dolby Vision files in the library gave no video start time at all."""
+    try:
+        return max(0.0, float(stream["start_time"]) - float(fmt["start_time"]))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
 
 
 def _bit_depth(pix_fmt: str, stream: dict) -> int:
@@ -301,6 +342,7 @@ def _stream(raw: dict) -> Stream:
         bitrate=_int(raw.get("bit_rate")) or _tag_int(raw, "BPS"),
         default=bool(disposition.get("default")),
         forced=bool(disposition.get("forced")),
+        statistics_tags=_statistics_tags(tags),
     )
 
 
@@ -466,6 +508,7 @@ def probe(path: Path, chain: Toolchain) -> MediaInfo:
         path=path,
         video_bytes=video_bytes,
         video_duration=_stream_duration(video),
+        video_start=_start_offset(video, fmt),
         size_bytes=_int(fmt.get("size")) or path.stat().st_size,
         duration=duration,
         container=fmt.get("format_name", ""),
@@ -478,6 +521,7 @@ def probe(path: Path, chain: Toolchain) -> MediaInfo:
         frames=frames,
         video_bitrate=video_bitrate,
         sample_aspect=_sample_aspect(video.get("sample_aspect_ratio", "")),
+        field_order=str(video.get("field_order", "")),
         color_primaries=video.get("color_primaries", ""),
         color_transfer=video.get("color_transfer", ""),
         color_space=video.get("color_space", ""),

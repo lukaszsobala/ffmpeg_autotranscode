@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -240,8 +241,8 @@ def _missing_svt_options(chain: Toolchain, cfg: Config) -> list[str]:
     distribution packages lag well behind -- would give exactly those encodes,
     with nothing to say so.
     """
-    def used(value: float | dict[str, float], off: float = 0) -> bool:
-        return any(v > off for v in (value.values() if isinstance(value, dict) else [value]))
+    def used(value: float | Mapping[str, float], off: float = 0) -> bool:
+        return any(v > off for v in (value.values() if isinstance(value, Mapping) else [value]))
 
     problems: list[str] = []
     upgrade = (f"SvtAv1EncApp {chain.svtav1_version or '(unknown version)'} lacks it; "
@@ -326,7 +327,8 @@ def require(chain: Toolchain, cfg: Config) -> None:
             "filter (jellyfin-ffmpeg has it); set it back to 'skip' otherwise"
         )
     method = cfg.encode.chunk_method
-    if (plugin := VAPOURSYNTH_CHUNK_METHODS.get(method)) and plugin not in chain.vapoursynth_plugins:
+    plugin = VAPOURSYNTH_CHUNK_METHODS.get(method)
+    if plugin and plugin not in chain.vapoursynth_plugins:
         where = "VapourSynth" if chain.has_vapoursynth else "VapourSynth (vspipe not found)"
         problems.append(
             f"encode.chunk_method='{method}' needs {where} with the '{plugin}' plugin"

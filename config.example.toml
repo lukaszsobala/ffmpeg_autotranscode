@@ -78,6 +78,13 @@ min_scene_len = 24
 # Anything extra handed straight to SvtAv1EncApp, e.g. ["--enable-overlays", "1"].
 extra_svt_params = []
 
+# Interlaced sources. "off" encodes the picture as it is, combing and all, and
+# warns about a file flagged interlaced. "auto" deinterlaces (bwdif, one frame
+# per frame) what ffprobe flags interlaced, in its field order. "tff" / "bff"
+# deinterlace every file, top or bottom field first: for a run on files whose
+# flags say progressive, usually with --deinterlace on the command line.
+deinterlace = "off"
+
 # CRF is a quality target per coded pixel, and it is not resolution-neutral: a
 # pixel at 576p is magnified far more on the same screen than one at 2160p, so a
 # single CRF across a mixed library makes the small files look the worst. So the

@@ -67,6 +67,22 @@ GRAIN_FILTER = "median=radius=1"
 # already "had" all the grain, shipped every 8-bit film without any.
 GRAIN_GRAPH = f"[0:v]format=yuv420p10le,split=2[ref][pre];[pre]{GRAIN_FILTER}[den];[den][ref]"
 
+
+
+def first(prefilter: str) -> str:
+    """`prefilter` ready to go in front of a filter chain: "" or "filter,".
+
+    A source that the encode deinterlaced is deinterlaced the same way before it
+    is measured, or every combed frame counts as damage the encoder did.
+    """
+    return f"{prefilter}," if prefilter else ""
+
+
+def grain_graph(prefilter: str = "") -> str:
+    """GRAIN_GRAPH with `prefilter` run on the input first."""
+    return GRAIN_GRAPH.replace("[0:v]", f"[0:v]{first(prefilter)}", 1)
+
+
 # Treat 'inf' (a frame identical to its reference) as this, so means stay finite.
 IDENTICAL_DB = 100.0
 
@@ -238,10 +254,14 @@ def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
     """Input options that decode `path` on the Rockchip video engine when that is exact.
 
     Only for codecs checked frame by frame against software. H.264 was
-    bit-identical on every frame of two films. AV1 is not trusted: av1_rkmpp
-    never applies film grain, and on a 1202-wide encode 14,487 of 14,584
-    frames came out different (20-28 dB), though a 1920-wide one matched.
-    `grain` is kept for the day another codec qualifies that carries grain.
+    bit-identical on every frame of two films. AV1 is not trusted: on
+    jellyfin-ffmpeg 8.1.3-2 av1_rkmpp applies grain exactly, and matched dav1d
+    on encodes 1920, 1918 and 954 wide, but on a 1202-wide one 151,522 of
+    152,518 frames came out different (luma median 16.9 dB): MPP sizes its
+    reference buffers from the unpadded width, which overflows at about one
+    10-bit width in five (TECHNICAL.md has the formula). `grain` is kept
+    for the day AV1 qualifies: av1_rkmpp cannot leave grain off, so only the
+    grain=True decode could move.
     Deinterlacing is on by default in these decoders and would alter the
     frames, so it is turned off.
     """
@@ -255,7 +275,7 @@ def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
 
 
 def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path,
-          frames: int = 0) -> list[float]:
+          frames: int = 0, reference_filter: str = "") -> list[float]:
     """Per-frame luma XPSNR of `distorted` against `reference`.
 
     Synthesised film grain is not applied to `distorted` (see module docstring):
@@ -276,7 +296,7 @@ def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path,
         *decode_args(chain, distorted, grain=False),
         "-export_side_data", "film_grain", "-i", str(distorted),
         "-lavfi",
-        f"[0:v]{ALIGN},format={XPSNR_FORMAT}[ref];"
+        f"[0:v]{first(reference_filter)}{ALIGN},format={XPSNR_FORMAT}[ref];"
         f"[1:v]{ALIGN},format={XPSNR_FORMAT}[dist];"
         f"[ref][dist]xpsnr=stats_file={stats.as_posix()}",
         "-f", "null", "-",
@@ -286,7 +306,7 @@ def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path,
 
 
 def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path,
-                 frames: int = 0) -> list[float]:
+                 frames: int = 0, reference_filter: str = "") -> list[float]:
     """Per-frame luma PSNR of both files after a slight blur, at 10-bit.
 
     Separates the two ways a grainy film gets damaged. An encoder that strips
@@ -309,7 +329,7 @@ def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path
         *decode_args(chain, distorted, grain=False),
         "-export_side_data", "film_grain", "-i", str(distorted),
         "-lavfi",
-        f"[0:v]{ALIGN},format=yuv420p10le,{LOWPASS}[ref];"
+        f"[0:v]{first(reference_filter)}{ALIGN},format=yuv420p10le,{LOWPASS}[ref];"
         f"[1:v]{ALIGN},format=yuv420p10le,{LOWPASS}[dist];"
         f"[ref][dist]psnr=stats_file={stats.as_posix()}",
         "-f", "null", "-",
@@ -319,14 +339,14 @@ def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path
 
 
 def noise_mse(chain: Toolchain, path: Path, stats: Path, label: str = "measuring grain",
-              frames: int = 0) -> list[float]:
+              frames: int = 0, prefilter: str = "") -> list[float]:
     """Per-frame luma MSE between `path` and its median-filtered self: its grain."""
     argv = [
         *measure_argv(chain),
         *decode_args(chain, path, grain=True), "-i", str(path),
         "-an", "-sn", "-dn",
         "-filter_complex",
-        f"{GRAIN_GRAPH}psnr=stats_file={stats.as_posix()}",
+        f"{grain_graph(prefilter)}psnr=stats_file={stats.as_posix()}",
         "-f", "null", "-",
     ]
     run_progress(argv, label, frames=frames)
@@ -351,6 +371,7 @@ def retention_by_frame(source: list[float], encoded: list[float]) -> list[float]
 
 def grain_retention(
     chain: Toolchain, reference: Path, distorted: Path, work: Path, frames: int = 0,
+    reference_filter: str = "",
 ) -> tuple[float, list[float]]:
     """Grain amplitude kept by `distorted`, overall and per frame.
 
@@ -358,7 +379,7 @@ def grain_retention(
     the eye sees as well.
     """
     source = noise_mse(chain, reference, work / "noise_reference.log",
-                       "measuring grain in the source", frames)
+                       "measuring grain in the source", frames, reference_filter)
     encoded = noise_mse(chain, distorted, work / "noise_distorted.log",
                         "measuring grain in the encode", frames)
     return retention(source, encoded), retention_by_frame(source, encoded)
@@ -366,7 +387,7 @@ def grain_retention(
 
 def snapshots(
     chain: Toolchain, path: Path, frames: list[int], out_dir: Path, label: str,
-    *, pq: bool,
+    *, pq: bool, prefilter: str = "",
 ) -> list[Path]:
     """Write `frames` of `path` as PNGs named <label>_f<frame>.png.
 
@@ -383,7 +404,7 @@ def snapshots(
     run_progress([
         *measure_argv(chain),
         "-i", str(path),
-        "-vf", f"select='{chosen}',{view}",
+        "-vf", f"{first(prefilter)}select='{chosen}',{view}",
         "-fps_mode", "passthrough",
         str(pattern),
     ], f"writing snapshots of the {label}")
@@ -399,18 +420,20 @@ def snapshots(
 
 def compare(
     chain: Toolchain, reference: Path, distorted: Path, work: Path,
-    *, grain: bool = True, worst: int = 3, frames: int = 0,
+    *, grain: bool = True, worst: int = 3, frames: int = 0, reference_filter: str = "",
 ) -> Comparison:
     """Everything above, for one pair of files. `frames`, the expected count, only
-    lets the first pass report a share done; later ones know it from the first."""
+    lets the first pass report a share done; later ones know it from the first.
+    `reference_filter` is applied to the reference alone: the deinterlacing the
+    encode had, if any."""
     work.mkdir(parents=True, exist_ok=True)
-    scores = xpsnr(chain, reference, distorted, work / "xpsnr.log", frames)
+    scores = xpsnr(chain, reference, distorted, work / "xpsnr.log", frames, reference_filter)
     if not scores:
         raise CommandError(["xpsnr"], 1, "XPSNR produced no scores")
     result = Comparison(frames=len(scores), xpsnr=scores)
     try:
         result.lowpass = lowpass_psnr(chain, reference, distorted, work / "lowpass.log",
-                                      result.frames)
+                                      result.frames, reference_filter)
     except CommandError as exc:
         log.warning("low-pass PSNR not measured: %s", exc.stderr.strip()[:200])
     # Worst frames by the structural measure when there is one: XPSNR is blind to
@@ -420,7 +443,7 @@ def compare(
     if grain:
         try:
             result.grain_retention, result.grain_by_frame = grain_retention(
-                chain, reference, distorted, work, result.frames)
+                chain, reference, distorted, work, result.frames, reference_filter)
         except CommandError as exc:
             log.warning("grain retention not measured: %s", exc.stderr.strip()[:200])
     return result

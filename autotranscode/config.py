@@ -117,7 +117,7 @@ class Encode:
     )
     # Which variance boost curve: 0 default, 1 low-medium contrast, 2 tuned for
     # PQ. "auto" takes 2 for PQ (HDR10) output and 0 otherwise.
-    variance_boost_curve: str = "auto"
+    variance_boost_curve: str | int = "auto"   # auto, or 0, 1 or 2 written either way
     # 0-100: lower the QP of dark frames, in proportion to how dark they are.
     # One number or a width table, as above. It works per frame, not per block,
     # so a dim film pays for it on most of its frames.
@@ -166,6 +166,11 @@ class Encode:
     extra_split_sec: int = 10
     min_scene_len: int = 24
     extra_svt_params: list[str] = field(default_factory=list)
+    # off: encode the picture as it is. auto: deinterlace what ffprobe flags as
+    # interlaced, in its field order. tff / bff: deinterlace every file, top or
+    # bottom field first, for a run on files whose flags are wrong; see
+    # encode.deinterlace_filter.
+    deinterlace: str = "off"
 
 
 @dataclass(slots=True)
@@ -346,6 +351,41 @@ class ConfigError(ValueError):
     pass
 
 
+# What each annotation accepts. The module defers annotations, so a field's type
+# is its source text: "int", "list[str]", "int | dict[str, int]".
+_KINDS: dict[str, tuple[type, ...]] = {
+    "str": (str,), "int": (int,), "float": (int, float), "bool": (bool,),
+}
+_WANTED = {
+    "str": "a string", "int": "a whole number", "float": "a number", "bool": "true or false",
+    "list[str]": "a list of strings", "str | int": "a string or a whole number",
+    "int | dict[str, int]": "a whole number or a table of them by width",
+    "float | dict[str, float]": "a number or a table of them by width",
+}
+
+
+def _is_kind(value: Any, kind: str) -> bool:
+    if kind.startswith("list[") and kind.endswith("]"):
+        return isinstance(value, list) and all(_is_kind(item, kind[5:-1]) for item in value)
+    if kind.startswith("dict["):
+        return isinstance(value, dict)   # its entries are _check_by_width's to judge
+    if kind != "bool" and isinstance(value, bool):
+        return False   # TOML's true is not the number 1
+    return isinstance(value, _KINDS[kind])
+
+
+def _check_type(value: Any, annotation: str, name: str) -> None:
+    """Refuse a value its option cannot use, naming both.
+
+    Unchecked, a string preset ended in a TypeError traceback, and a string of
+    extensions (".mkv") was iterated letter by letter: the library came up empty
+    with only "no media files found".
+    """
+    if not any(_is_kind(value, kind.strip()) for kind in annotation.split("|")):
+        wanted = _WANTED.get(annotation, annotation)
+        raise ConfigError(f"{name} must be {wanted}; got {value!r}")
+
+
 def _apply_section(obj: Any, values: dict[str, Any], where: str) -> None:
     known = {f.name: f for f in fields(obj)}
     for key, value in values.items():
@@ -353,9 +393,9 @@ def _apply_section(obj: Any, values: dict[str, Any], where: str) -> None:
             raise ConfigError(f"unknown option '{key}' in [{where}]")
         # tomllib gives ints for whole numbers; widen to float where the field wants
         # one. The annotation is a string here, not the type: this module defers them.
-        expected = known[key].type
-        if expected in (float, "float") and isinstance(value, int) \
-                and not isinstance(value, bool):
+        expected = str(known[key].type)
+        _check_type(value, expected, f"{where}.{key}")
+        if expected == "float" and isinstance(value, int):
             value = float(value)
         setattr(obj, key, value)
 
@@ -409,8 +449,12 @@ def default_path() -> Path | None:
     return path if path.is_file() else None
 
 
-def load(path: Path | None) -> Config:
-    """Load config. Profile defaults are applied first, then the file overrides them."""
+def load(path: Path | None, profile: str | None = None) -> Config:
+    """Load config. Profile defaults are applied first, then the file overrides them.
+
+    `profile` (the --profile flag) takes the place of the file's profile, not of
+    its settings: applied after the file, it overwrote the file's preset and crf.
+    """
     raw: dict[str, Any] = {}
     if path is not None:
         if not path.is_file():
@@ -419,7 +463,8 @@ def load(path: Path | None) -> Config:
 
     cfg = Config()
 
-    profile = resolve_profile(raw.get("machine", {}).get("profile", cfg.machine.profile))
+    profile = resolve_profile(
+        profile or raw.get("machine", {}).get("profile", cfg.machine.profile))
     _merge_profile(cfg, profile)
     cfg.machine.profile = profile
 
@@ -477,6 +522,8 @@ def validate(cfg: Config) -> None:
     _check_by_width(cfg.encode.ac_bias, "encode.ac_bias", 0, 8, "0 (off) to 8", decimal=True)
     _check_by_width(cfg.encode.tf_strength, "encode.tf_strength",
                     -1, 4, "-1 (encoder default) or 0 to 4")
+    if cfg.encode.deinterlace not in {"off", "auto", "tff", "bff"}:
+        raise ConfigError("encode.deinterlace must be off, auto, tff or bff")
     if cfg.grain.estimator not in {"svt", "grav1synth"}:
         raise ConfigError("grain.estimator must be svt or grav1synth")
     if not 1 <= cfg.grain.svt_level <= 50:
@@ -505,5 +552,19 @@ def validate(cfg: Config) -> None:
         raise ConfigError(f"encode.chunk_method must be one of {', '.join(sorted(CHUNK_METHODS))}")
     if cfg.encode.sc_downscale_height < 0:
         raise ConfigError("encode.sc_downscale_height cannot be negative (0 turns it off)")
+    for name, value, least in (
+            ("machine.workers", cfg.machine.workers, 0),
+            ("estimate.samples", cfg.estimate.samples, 0),
+            ("estimate.min_samples", cfg.estimate.min_samples, 1),
+            ("estimate.sample_seconds", cfg.estimate.sample_seconds, 1),
+            ("grain.samples", cfg.grain.samples, 1),
+            ("grain.sample_seconds", cfg.grain.sample_seconds, 1),
+            ("audio.max_channels", cfg.audio.max_channels, 0),
+            # 0 does not fail the mux, but the size projection counts the track as free.
+            ("audio.opus_kbps_per_channel", cfg.audio.opus_kbps_per_channel, 1)):
+        if value < least:
+            raise ConfigError(f"{name} must be at least {least}; got {value}")
+    if cfg.estimate.max_samples < cfg.estimate.min_samples:
+        raise ConfigError("estimate.max_samples cannot be below estimate.min_samples")
     if not 0 <= cfg.output.check_saving_after_percent <= 100:
         raise ConfigError("output.check_saving_after_percent must be between 0 and 100")

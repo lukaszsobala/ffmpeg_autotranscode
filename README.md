@@ -15,9 +15,14 @@ which audio to keep, and what to do when a step fails. How it works, and why the
 settings are what they are, is in [TECHNICAL.md](TECHNICAL.md).
 
 **Watch the results in a software AV1 decoder** (dav1d: mpv, VLC, most desktop
-browsers). The RK3588's hardware decoder currently shows none of the film grain,
-because of [a bug in Rockchip's MPP library](https://github.com/rockchip-linux/mpp/issues/974).
-The fix is merged but not yet released; see
+browsers). The RK3588's hardware decoder shows the film grain with
+jellyfin-ffmpeg 8.1.3-2 or later, which has the fix for
+[a bug in Rockchip's MPP library](https://github.com/rockchip-linux/mpp/issues/974),
+and then matched dav1d exactly on encodes 1920, 1918 and 954 pixels wide. A
+second MPP bug still decodes about one 10-bit width in five wrongly (a multiple
+of 8 is always safe): on a 1202-wide encode only the frames at keyframes came out
+right, and within about a second the picture was replaced by flat colour and
+large blocks until the next keyframe. See
 [TECHNICAL.md](TECHNICAL.md#film-grain-on-the-rk3588s-av1-decoder).
 
 ## Install
@@ -125,6 +130,8 @@ docker stop transcode          # SIGTERM: a checkpoint, as Ctrl-C is natively
 ```
 
 `docker stop` gives the run two minutes to wind down, and a rerun resumes it.
+Av1an draws no progress bar without a terminal, so the log gets a line an hour
+instead: how much is encoded, how fast, the time left and the projected size.
 
 **On a Mac**, install Docker Desktop, OrbStack or Colima, and set the VM's CPUs
 and memory in its settings: a 4K encode runs several SVT-AV1 workers at once, each
@@ -168,12 +175,15 @@ honoured). `-c` overrides it; with neither, the built-in defaults apply.
 | `verify` | Score an encode against its source where the eye looks: low-pass PSNR, grain retained, worst-frame snapshots |
 | `sample` | Encode a few random minutes of a few random files per resolution band, to check the settings on the rest of a library |
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
-| `run` | Transcode (`--dry-run` probes and measures but does not encode) |
+| `run` | Transcode (`--dry-run` probes and measures but does not encode, and records nothing) |
 | `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
 | `clean` | Remove work directories, staged copies and half-written outputs no run will use again; keeps what can be resumed (`--dry-run` lists, `--all` removes that too, `--samples` removes `sample` results) |
 
 Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
-`-w/--workers`, `-o/--output-dir`, `--grain {auto,always,never}`.
+`-w/--workers`, `-o/--output-dir`, `--grain {auto,always,never}`,
+`--deinterlace {off,auto,tff,bff}`. `--profile`
+stands in for the file's `machine.profile`, so settings the file gives still win
+over the profile's; the other flags win over the file.
 
 ### Film grain
 
@@ -303,7 +313,7 @@ of scene detection it was on.
 
 | | |
 |---|---|
-| `Ctrl-C`, or `kill <pid>` | Stop and checkpoint. Exit code 130; a rerun picks the file up again. |
+| `Ctrl-C`, `kill <pid>`, or a hangup | Stop and checkpoint. Exit code 130; a rerun picks the file up again. A hangup is a closed SSH session or a killed `screen` window; the encoder stops with the run rather than going on alone. `sample` stops the same way. |
 | `Ctrl-C` twice | Give up on a tool that is slow to wind down. Chunks already finished are still kept. |
 | `kill -STOP -<pgid>` / `kill -CONT -<pgid>` | Freeze and thaw in place, losing nothing at all. Use this for a pause measured in minutes. Av1an runs in a process group of its own, so take the pgid from `ps -o pgid= -C av1an`; under systemd, `systemctl --user kill --signal=STOP <unit>` does it for you. |
 | Power cut | Same as Ctrl-C, minus the chunk in flight. Rarely, it costs that film's progress; see [TECHNICAL.md](TECHNICAL.md#resuming-in-detail). |
@@ -378,12 +388,38 @@ Profile 5 has no usable base layer. `dolby_vision.profile5 = "tonemap-sdr"`
 converts it to SDR with `tonemapx` instead of skipping it. Set
 `dolby_vision.mode = "skip"` to leave every DV title alone.
 
+## Interlaced sources
+
+Off by default: the picture is encoded as it is, and a file flagged interlaced is
+warned about, because no player deinterlaces AV1 and the combing would stay.
+`encode.deinterlace = "auto"` deinterlaces the files ffprobe flags (`tt`, `bb`,
+`tb`, `bt`), with bwdif at one frame per frame, so 25i comes out 25p.
+
+The flags are not always right. An old capture in an AVI can be interlaced and
+flagged progressive: `auto` misses it, so name the field order and run it alone:
+
+```bash
+autotranscode --deinterlace bff run "/library/capture.avi"
+```
+
+To find the order, count with idet; the larger of TFF and BFF is the one:
+
+```bash
+ffmpeg -i film.avi -map 0:v:0 -vf idet -an -f null - 2>&1 | grep 'Multi frame'
+```
+
+DVDs as `VIDEO_TS` folders are not picked up (`.VOB` is not in
+`library.extensions`); remux them to MKV first, and `auto` will find them.
+
 ## What it refuses to do
 
 - **Dolby Vision profile 5**, unless you opt into SDR conversion (above).
 - Files already in AV1, clips shorter than `library.min_duration_sec`, and any result
   that saves less than `output.min_saving_percent` or `output.min_saving_mib`
   (100 MiB by default; the output is deleted and the file is marked skipped).
+- **Files the mux cannot take.** Before anything is encoded, the mux runs on the
+  first 5 seconds, so a track it would refuse fails the file in seconds rather
+  than after the encode.
 - **Encodes heading for too little saving.** Once `output.check_saving_after_percent`
   of the frames are encoded (10 by default), the encode stops as soon as the
   projected result misses either minimum. Progress lines in the log show where
@@ -403,6 +439,9 @@ converts it to SDR with `tonemapx` instead of skipping it. Set
   failed, for you to keep one. With `output.directory` set, the output mirrors the
   folders below the directory given to `run`, so films that share a file name in
   different folders do not collide; files named one by one go to its top.
+- **A second `run` on the same work directory.** It stops at once, naming the pid
+  of the run already going there. `--dry-run` writes nothing and still works, and
+  a run with its own `paths.work_dir` is unaffected.
 
 ## Testing
 

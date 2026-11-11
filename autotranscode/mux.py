@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import math
+import shlex
+import subprocess
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .config import Config
 from .probe import MediaInfo, Stream
 from .tools import Toolchain
-from .util import log, run
+from .util import CommandError, child_env, log, run
 
 # Subtitle codecs that are plain text; the rest are bitmap (PGS, VobSub).
 TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
@@ -27,6 +32,11 @@ WASTEFUL_AUDIO = {"truehd", "dts", "pcm_s16le", "pcm_s24le", "pcm_bluray", "mlp"
 # jellyfin-ffmpeg patches the encoder to accept it; mainline ffmpeg fails the mux,
 # after the whole video encode has been paid for.
 OPUS_LAYOUTS = {"5.1(side)": "5.1", "5.0(side)": "5.0", "quad(side)": "quad"}
+
+# How much of the source `rehearse` muxes before the encode.
+REHEARSAL_SECONDS = 5
+# Progress on stdout, twice a second, for mux_until to stop the rehearsal by.
+REHEARSAL_PROGRESS = ("-progress", "pipe:1", "-stats_period", "0.5")
 
 
 def _opus_bitrate(stream: Stream, cfg: Config) -> int:
@@ -69,6 +79,12 @@ def _audio_args(info: MediaInfo, cfg: Config) -> list[str]:
         else:
             bitrate = _opus_bitrate(stream, cfg)
             args += [f"-c:a:{position}", "libopus", f"-b:a:{position}", f"{bitrate}k"]
+            # ffmpeg copies the track's tags, mkvmerge's statistics with them: an
+            # Opus track made from DTS-HD MA kept BPS-eng=3933034, and Jellyfin
+            # shows it. An empty value deletes the tag; -map_metadata would take
+            # the language and title too.
+            for name in stream.statistics_tags:
+                args += [f"-metadata:s:a:{position}", f"{name}="]
             channels = stream.channels or 2
             if cfg.audio.max_channels and channels > cfg.audio.max_channels:
                 channels = cfg.audio.max_channels
@@ -119,8 +135,15 @@ def build_command(
 ) -> list[str]:
     """Mux the encoded video (input 0) with everything else from the source (input 1)."""
     sub_maps, sub_codec = _subtitle_args(info, cfg)
-    argv = [
-        chain.ffmpeg, "-hide_banner", "-v", "warning", "-y",
+    argv = [chain.ffmpeg, "-hide_banner", "-v", "warning", "-y"]
+    if info.video_start:
+        # ffmpeg shifts each input to start at 0, so a source whose video starts
+        # after its audio lost the gap: a test file with video at 0.500 s came out
+        # at 0, the sound half a second late. -itsoffset applies after that shift,
+        # so it is right whether or not keep_source_timing gave the encode the
+        # source's own frame times, which already include the gap.
+        argv += ["-itsoffset", f"{info.video_start:.6f}"]
+    argv += [
         "-i", str(video),
         "-i", str(info.path),
         "-map", "0:v:0",
@@ -150,6 +173,80 @@ def build_command(
         str(output),
     ]
     return argv
+
+
+def rehearse(info: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> None:
+    """Run the real mux over the source's first seconds, before anything is encoded.
+
+    A track the mux cannot take -- the mov_text and 5.1(side) failures above --
+    otherwise fails the file after the whole encode. A small black FFV1 clip
+    stands in for the encode: the video is copied whatever it is, so what is on
+    trial is the source's own audio, subtitles, fonts and chapters. Raises
+    CommandError as the real mux would.
+    """
+    stand_in = work / "rehearsal_video.mkv"
+    output = work / "rehearsal.mkv"
+    try:
+        run([chain.ffmpeg, "-hide_banner", "-v", "error", "-y",
+             "-f", "lavfi", "-i", f"color=c=black:s=64x64:r=25:d={REHEARSAL_SECONDS}",
+             "-c:v", "ffv1", str(stand_in)])
+        argv = build_command(stand_in, info, output, chain, cfg)
+        mux_until(argv[:1] + list(REHEARSAL_PROGRESS) + argv[1:], REHEARSAL_SECONDS)
+    finally:
+        stand_in.unlink(missing_ok=True)
+        output.unlink(missing_ok=True)
+
+
+def mux_until(argv: list[str], seconds: float,
+              clock: Callable[[], float] = time.monotonic) -> None:
+    """Run an ffmpeg that reports progress on stdout and stop it once it has muxed
+    `seconds` of output, or written for `seconds`. Raises CommandError if it fails
+    before then.
+
+    ffmpeg's own limits do not stop it in time. -t, on the input or the output,
+    ends a stream only once that stream passes the mark, so a subtitle track with
+    nothing in its first seconds sends the demuxer through the whole file for one:
+    197 s over 42 GB for a film with 13 PGS tracks, with -shortest added as well.
+    A "q" on a pipe is ignored. Nor does the output time always move: with 21 PGS
+    tracks to interleave it stayed N/A for 20 s while 74 MB were written. But
+    ffmpeg writes the header only once every encoder has started and the muxer has
+    taken every track, which is where these failures happen; so once there is
+    output, a few seconds of muxing is all there is to learn.
+    """
+    log.debug("exec: %s", shlex.join(argv))
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, errors="replace",
+                            env=child_env())
+    assert proc.stdout is not None and proc.stderr is not None
+    stderr: list[str] = []
+    err = proc.stderr   # the assert does not narrow inside a lambda
+    drain = threading.Thread(target=lambda: stderr.append(err.read()), daemon=True)
+    drain.start()
+    reached = False
+    writing_since: float | None = None
+    try:
+        for line in proc.stdout:
+            key, _, value = line.strip().partition("=")
+            if not value.isdigit():
+                continue
+            if key == "total_size" and int(value) > 0 and writing_since is None:
+                writing_since = clock()
+            long_enough = key == "out_time_us" and int(value) >= seconds * 1e6
+            if long_enough or (writing_since is not None
+                               and clock() - writing_since >= seconds):
+                reached = True
+                proc.kill()
+                break
+    except BaseException:
+        proc.kill()
+        raise
+    finally:
+        returncode = proc.wait()
+        proc.stdout.close()
+        drain.join()
+        proc.stderr.close()
+    if not reached and returncode != 0:
+        raise CommandError(argv, returncode, "".join(stderr))
 
 
 def mux(

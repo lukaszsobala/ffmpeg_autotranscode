@@ -74,6 +74,8 @@ source.mkv
    │
    ├── ffprobe ......................... resolution, depth, HDR, streams
    │
+   ├── mux rehearsal ................... the real mux on the first 5 s
+   │
    ├── grain probe ..................... is there grain worth putting back?
    │
    ├── grain table (if grainy)
@@ -92,6 +94,37 @@ source.mkv
 ```
 
 Only the short analysis excerpts ever touch the disk as lossless files.
+
+The mux comes last, so a track it cannot take -- MP4's mov_text text, or 5.1(side)
+audio on a mainline ffmpeg -- used to fail the file after the whole encode. Before
+anything else, the mux command runs on the first 5 seconds of the source, with a
+small black FFV1 clip in place of the encode: the video is copied whatever it is,
+so what is on trial is the source's audio, subtitles, fonts and chapters.
+With the mov_text conversion switched off, a test MP4 failed it in 0.14 s with
+ffmpeg's own message. All 397 files `run` would pick up in the library passed:
+median 0.65 s, slowest 6.1 s.
+
+ffmpeg's own limits did not end it in time. `-t`, on the input or the output,
+ends a stream only once that stream passes the mark, so a PGS subtitle track with
+nothing early sent the demuxer through the whole file for one: 197 s on a 42 GB
+remux with 13 such tracks, `-shortest` or not. So `mux_until` stops ffmpeg
+itself, once 5 s of output is muxed or, as the output time can stay N/A while
+the muxer waits to interleave sparse tracks, 5 s after writing begins. The
+header is only written once every encoder has started and the muxer has taken
+every track, which is where these failures happen.
+
+The encode always starts at 0, and ffmpeg shifts each input of the mux to start
+at 0 as well. A source whose video starts after its audio would lose the gap, so
+the mux puts it back with `-itsoffset`: a test file with video at 0.500 s came out
+at 0 without it. 30 of 397 files in the library have such a gap, 22 under 50 ms
+and the longest 120 ms.
+
+ffmpeg copies each track's tags, mkvmerge's statistics (`BPS`, `NUMBER_OF_BYTES`,
+`NUMBER_OF_FRAMES`, `DURATION`, often with a language suffix) among them. On a
+track converted to Opus they describe the track it replaced: Battlefield Earth's
+Opus track claimed 3.9 Mb/s and 3.5 GB, the DTS-HD MA figures, and Jellyfin shows
+the bitrate. The mux deletes them on every track it re-encodes. Copied tracks keep
+theirs, which still hold.
 
 ## Quality scales with resolution
 
@@ -231,11 +264,48 @@ anything, and its removal changed no behaviour.
 
 **`verify` is the exception.** It decodes a whole film and its encode several
 times over, so it decodes H.264 sources with `h264_rkmpp`, which matched
-software on every frame of two films. AV1 stays on the CPU, for two reasons.
-`av1_rkmpp` outputs no film grain with the current Rockchip MPP library (see
-below), and `verify`'s grain measure needs it. And it decoded a 1202-wide encode
-wrongly: 14,487 of 14,584 frames differed from dav1d's, at 20-28 dB. A
-1920-wide encode matched exactly.
+software on every frame of two films. AV1 stays on the CPU, because
+`av1_rkmpp` gets some frame sizes wrong. On jellyfin-ffmpeg 8.1.3-2, compared
+with dav1d frame by frame (framemd5) over whole films, all with grain on every
+frame:
+
+| encode | frames | differing |
+|---|---|---|
+| 1920x1080 | 42,509 | 0 |
+| 1918x802 | 138,448 | 0 |
+| 954x720 | 105,668 | 0 |
+| 1202x720 | 152,518 | 151,522 |
+
+On the 1202-wide one, keyframes match exactly; from the next frame the chroma is
+wrong, and on most inter frames the luma too, so the error is in the decoded
+picture, not the grain. Over its first 2,000 frames, luma PSNR against dav1d had
+a median of 16.9 dB and a minimum of 4.9 dB. To the eye, the first frame after a
+keyframe has a green band along the top and blocky smears over its lower half;
+24 frames on, the title card at 35 s is solid green, and 42 frames after a
+keyframe the opening logo is a flat purple gradient. Nothing of the picture
+comes back until the next keyframe. The three that match show the
+grain is now applied exactly (see below), so only the frame width keeps AV1 off
+the video engine.
+
+The cause is in MPP's `hal_av1d_vdpu.c`. The decoder stores each reference frame
+as rows of 4x4 tiles over the width padded to a multiple of 8 pixels, but
+`vdpu_av1d_setup_tile_bufs` sizes the planes from the unpadded width, rounded up
+to a multiple of 128 bits. At 1202 wide and 10 bits a tile row needs
+1208 x 4 x 10 / 8 = 6,040 bytes and gets 6,016, so luma runs about 4 KB into
+chroma, and chroma about 2 KB into the motion vectors. The frame on screen comes
+out right, because the post-processor writes it as it is decoded; only the copy
+later frames predict from is damaged, which is why keyframes match and the next
+frame does not. With w the width and ALIGN(x, n) rounding x up to a multiple of
+n, it breaks whenever ALIGN(w, 8) x 5 > ALIGN(10w, 128) / 2. For even widths
+that is w mod 64 in {10, 12, 34, 36, 38, 50}, about one in five. 8-bit video,
+and any width that is a multiple of 8, are never affected. The formula picked
+out the broken widths exactly: 9 of 26 test clips from 626 to 1912 wide, and of
+31 library encodes (first 2,000 frames each) only Film F. Padding the width
+to 8 before sizing the planes, a one-line change, made MPP's own `mpi_dec_test`
+match dav1d on every frame of five broken test clips and of the 1202-wide film,
+grain included. Until a jellyfin-ffmpeg carries that fix, AV1 stays on dav1d
+here. The XPSNR and low-pass passes would stay on dav1d regardless: they need
+the grain off, and `av1_rkmpp` has no way to leave it off.
 
 Decoding was never the bottleneck anyway. The blur and PSNR filters are, and the
 kernel keeps their threads on the A55 cores. Pinned to the A76s with a thread
@@ -245,28 +315,48 @@ capacity are left out, though: an A55 has about 0.4 of an A76, but an Intel
 Core Ultra 7 258V's E-cores have two-thirds of its P-cores, and there `verify`
 runs on all eight.
 
+**Why `verify` decodes each file three times.** Its four passes (XPSNR,
+low-pass PSNR, grain in the source, grain in the encode) each decode what they
+measure, so the source and the encode are decoded three times each. One graph
+that splits the source three ways and the encode two ways, with the encode's
+grain left to a second pass, decodes the source once and the encode twice. It
+gave the same scores on every frame of three pairs, and saved little, because
+the filters, not decoding, set the pace:
+
+| pair | four passes | two passes | peak memory |
+|---|---|---|---|
+| 1080p H.264 on `h264_rkmpp`, 1,645 frames | 297 s | 281 s | 216 → 294 MiB |
+| 1080p HEVC HDR, 533 frames | 133 s | 114 s | 320 → 412 MiB |
+| 4K HEVC HDR, 409 frames | 281 s | 251 s | 802 → 1,115 MiB |
+
+Folding the fourth pass in too, so that one ffmpeg decoded the encode twice,
+hung on jellyfin-ffmpeg 8.1.3-2: with the source on `h264_rkmpp`, every
+measurement stopped near frame 200 and ffmpeg sat for two hours on 77 s of CPU.
+The same graph with the source decoded in software finished. A 5-14% saving
+was not worth a hang nobody could explain, nor a quarter to two-fifths more
+memory, so the passes stay separate.
+
 ### Film grain on the RK3588's AV1 decoder
 
-The RK3588's AV1 decoder can apply film grain itself; the hardware is not the
-problem. Rockchip's MPP library never tells it to: in `hal_av1d_vdpu.c` the line
-that would set `sw_apply_grain` is commented out, so the flag stays at 0 and every
-frame comes out without grain. The bug and a one-line fix are in
+The RK3588's AV1 decoder can apply film grain itself; the hardware was never the
+problem. Rockchip's MPP library did not tell it to: in `hal_av1d_vdpu.c` the line
+that would set `sw_apply_grain` was commented out, so the flag stayed at 0 and
+every frame came out without grain. The bug and a one-line fix are in
 [rockchip-linux/mpp#974](https://github.com/rockchip-linux/mpp/issues/974).
 
 Rockchip merged the fix on 2026-11-03, as commit `9b56348` on MPP's `develop`
-branch ("fix[hal_av1d]: Enable film grain on VDPU output"); no MPP release has it
-yet, the latest being 1.1.0. jellyfin-ffmpeg ships its own `librockchip_mpp`,
-built from the tip of nyanmisaka's `jellyfin-mpp-next` branch, which carries the
-same fix since that day: its packages built after 2026-11-03 (after 8.1.3-1)
-should apply the grain. A player using the system's MPP needs an MPP built from
-`develop` or a release after 1.1.0.
+branch ("fix[hal_av1d]: Enable film grain on VDPU output"). jellyfin-ffmpeg links
+its own MPP statically, built from nyanmisaka's `jellyfin-mpp-next` branch, and
+shipped the fix in 8.1.3-2 (tagged 2026-11-04; MPP commit `3bcf8c98`). With it,
+`av1_rkmpp`'s grain matched dav1d's bit for bit on three whole films (the table
+above). A player on the system's MPP still needs an MPP release after 1.1.0, or
+one built from `develop`; on an older MPP it shows none of the synthesised grain,
+which brings back the flat look the grain was added to hide.
 
-Until then, **a player that decodes AV1 through MPP on the
-RK3588 (ffmpeg's `av1_rkmpp`, and players built on it) shows none of the
-synthesised grain.** That brings back the flat, grain-free look the grain was
-added to hide. The wrong pictures at some frame sizes, above, are a separate
-problem. Judge these encodes in a player that decodes AV1 in software (dav1d:
-mpv, VLC, most desktop browsers), or with an MPP that has the fix.
+The fix does not cure the wrong pictures at some 10-bit frame sizes, above, which
+is a separate MPP bug in buffer sizing. Judge these encodes in a player that
+decodes AV1 in software (dav1d: mpv, VLC, most desktop browsers), or check the
+width first: a multiple of 8 is always safe.
 
 ### Why jellyfin-ffmpeg
 
@@ -342,6 +432,14 @@ fit on a second. Other lines Av1an prints, and autotranscode's own log, appear
 above it. When the output is not a terminal, Av1an is run as before and draws no
 bar.
 
+Without the bar, under Docker or systemd, the log said nothing between
+"encoding" and "done", which for a 4K film is days. So with no terminal a line
+goes to the log once an hour: frames done, the speed, the time left, and the
+projected size when the early saving check has one. It reads Av1an's
+`done.json`, as that check does, so it moves a chunk at a time. The speed counts
+only this run's chunks; those finished before a restart would make it look
+faster than it is.
+
 ### Locales
 
 A C++ tool, usually mkvmerge, aborts with `_S_create_c_locale name not valid` when
@@ -383,7 +481,17 @@ starts is given a locale verified to exist, so transcodes are immune.
 - **The staged copy** is kept when a run does not finish; the next run checks the
   size still matches and reuses it.
 - **Across a library**: a JSON ledger records every finished file. A source that
-  changed size is treated as new.
+  changed size is treated as new. Commands can share it: each entry is written
+  under a lock (`state.json.lock` beside it) against the file as it is on disk
+  then, so an `estimate` started beside a long `run` loses nothing of either's.
+- **One `run` per work directory.** A second `run` would start on the film the
+  first is encoding, since films already under way go first, then resume from the
+  same chunks, share one staged copy and one output, and delete the staged source
+  under the other when it finished. So `run` holds an `flock` on `run.lock` in the
+  work directory and stops at once if another holds it, naming that run's pid.
+  The kernel drops the lock with the process, however it ends; a pid in a file
+  outlives `kill -9` and may later name another process. `--dry-run` takes no
+  lock, since it writes nothing.
 
 The work directory is named by the source path. Av1an resumes whatever chunk list
 it finds there without checking it: each chunk keeps the encoder flags it was
@@ -406,7 +514,11 @@ so switching it on or off keeps half-finished work for as long as the file it wa
 reading is still there.
 
 The output is muxed under a `.part` name and renamed into place only once it is
-complete, so a half-written file can never be read as "already transcoded".
+complete, so a half-written file can never be read as "already transcoded". With
+staging on, the mux is written to the staging directory, usually another
+filesystem, so moving it is a copy: that copy also goes to `.part` beside the
+destination and is renamed once whole. A stop partway through removes the
+`.part`; a power cut leaves it for `clean`.
 
 The one weak spot is a power cut, not a signal. Av1an rewrites `done.json` in place
 after each chunk (`File::create` then `write_all`, with no rename), so losing power
@@ -414,6 +526,41 @@ inside that write leaves a file it later refuses to parse, and the film restarts
 from zero. The window is a fraction of a millisecond per chunk against hours of
 encoding, and the cost is one film, so this is worth knowing rather than worth
 engineering around. A UPS closes it entirely.
+
+### Interlaced sources
+
+Combing encoded into AV1 stays: players deinterlace MPEG-2 and H.264 flagged
+interlaced, but an AV1 stream from this pipeline is progressive. So
+`encode.deinterlace` puts bwdif first in the filter chain, ahead of the tonemap
+and any denoise, since it needs the fields as they were shot.
+
+`mode=send_frame`, one frame per frame, because chunks, the keyframe list, the
+grain windows and verify all count frames. Field doubling (`send_field`) would
+keep 50i's motion but break each of them.
+
+The field order is set rather than read from frame flags, and every frame is
+deinterlaced (`deint=all`). The flags lie: of the 37 files `run` would pick up whose
+field order ffprobe could not give, capture.avi was the one with interlaced
+picture. It is flagged progressive, and idet
+counted 39,019 frames bottom field first, 25,128 top field first and 33,600
+progressive. Told nothing, bwdif takes such a frame as top field first, wrong for
+most of that film. Frame flags may also not survive Av1an's VapourSynth pipe. So
+`auto` takes the order from ffprobe's `field_order` (`tt` and `bt` show the top
+field first, `bb` and `tb` the bottom), and `tff` / `bff` force it. On 3,000
+frames of capture.avi, idet found 2,229 combed before bwdif and fewer than 60 after,
+with either order, and the frame count unchanged; idet cannot say which order
+is right, only motion seen by eye can. bwdif ran at 110 fps on that 720x480 film,
+far above what the encoder manages.
+
+Everything that compares the encode with its source deinterlaces the source the
+same way: the size estimate's samples, the grain probe, the lossless grain
+excerpts, calibration (combing is pixel-scale texture and would be asked of the
+grain) and `verify` and `sample`, where every combed frame would otherwise count
+as damage the encoder did. The setting stays out of the settings digest while it
+is off, so its arrival kept every estimate.
+
+Of 523 video files in the library, the 86 flagged interlaced are all DVD `.VOB`s,
+which `library.extensions` leaves out.
 
 ## Dolby Vision
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import shlex
 import sys
@@ -58,6 +59,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output-dir", type=Path, help="write outputs here")
     parser.add_argument("--grain", choices=["auto", "always", "never"],
                         help="film grain handling mode")
+    parser.add_argument("--deinterlace", choices=["off", "auto", "tff", "bff"],
+                        help="deinterlace: auto for files flagged interlaced, tff or bff "
+                             "to force it with that field order")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -150,11 +154,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def load_config(args: argparse.Namespace) -> config.Config:
+    """The config file, with the flags on top: defaults, profile, file, flags."""
+    cfg = config.load(args.config or config.default_path(), profile=args.profile)
+    apply_overrides(cfg, args)
+    return cfg
+
+
 def apply_overrides(cfg: config.Config, args: argparse.Namespace) -> None:
-    if args.profile:
-        profile = config.resolve_profile(args.profile)
-        config._merge_profile(cfg, profile)
-        cfg.machine.profile = profile
+    """The flags other than --profile, which `config.load` applies before the file."""
     if args.preset is not None:
         cfg.encode.preset = args.preset
     if args.crf is not None:
@@ -165,6 +173,8 @@ def apply_overrides(cfg: config.Config, args: argparse.Namespace) -> None:
         cfg.output.directory = str(args.output_dir)
     if args.grain is not None:
         cfg.grain.mode = args.grain
+    if args.deinterlace is not None:
+        cfg.encode.deinterlace = args.deinterlace
     config.validate(cfg)
 
 
@@ -252,8 +262,11 @@ def cmd_verify(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolch
     try:
         info = probe.probe(args.reference, chain)
         work = cfg.work_dir / "verify"
+        # The deinterlacing a run with these settings gives the encode.
+        deinterlaced = encode.deinterlace_filter(info, cfg)
         result = verify.compare(chain, args.reference, args.encoded, work,
-                                grain=not args.no_grain, frames=info.frames)
+                                grain=not args.no_grain, frames=info.frames,
+                                reference_filter=deinterlaced)
     except (CommandError, OSError, ValueError) as exc:
         log.error("cannot verify: %s", str(exc)[:300])
         return 1
@@ -261,7 +274,8 @@ def cmd_verify(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolch
     print(f"worst frames: {', '.join(map(str, result.worst))}")
     if args.snapshots:
         pq = info.color_transfer == "smpte2084"
-        verify.snapshots(chain, args.reference, result.worst, args.snapshots, "source", pq=pq)
+        verify.snapshots(chain, args.reference, result.worst, args.snapshots, "source", pq=pq,
+                         prefilter=deinterlaced)
         verify.snapshots(chain, args.encoded, result.worst, args.snapshots, "encode", pq=pq)
         print(f"snapshots in {args.snapshots}")
     return 0
@@ -398,8 +412,7 @@ def main(argv: list[str] | None = None) -> int:
 
     chosen = args.config or config.default_path()
     try:
-        cfg = config.load(chosen)
-        apply_overrides(cfg, args)
+        cfg = load_config(args)
     except config.ConfigError as exc:
         log.error("config error: %s", exc)
         return 2
@@ -469,6 +482,16 @@ def main(argv: list[str] | None = None) -> int:
         log.error("run 'autotranscode doctor' for details")
         return 2
 
+    # A dry run writes nothing, so it may look ahead while a run is going.
+    try:
+        with contextlib.nullcontext() if args.dry_run else pipeline.only_run(cfg):
+            return _run(args, cfg, chain)
+    except pipeline.AlreadyRunning as exc:
+        log.error("%s; not starting a second one", exc)
+        return 1
+
+
+def _run(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolchain) -> int:
     sources = pipeline.discover(args.inputs, cfg)
     if not sources:
         log.error("no media files found")

@@ -294,7 +294,8 @@ def run_progress(
                             env=child_env(extra_path))
     assert proc.stdout is not None and proc.stderr is not None
     stderr: list[str] = []
-    drain = threading.Thread(target=lambda: stderr.append(proc.stderr.read()), daemon=True)
+    err = proc.stderr   # the assert does not narrow inside a lambda
+    drain = threading.Thread(target=lambda: stderr.append(err.read()), daemon=True)
     drain.start()
     started = last = time.monotonic()
     done = 0

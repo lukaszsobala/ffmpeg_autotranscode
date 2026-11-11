@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import itertools
 import json
 import os
 import shutil
 import signal
+import sys
 import time
 from collections.abc import Collection, Iterator, Sequence
 from dataclasses import asdict, replace
@@ -70,13 +72,17 @@ def _size_settings(cfg: Config, chain: Toolchain,
     """What decides size. `sampling` puts the grain sampling back in, as digests
     made before it left had it."""
     grain = asdict(cfg.grain)
+    encoding = asdict(cfg.encode)
+    if cfg.encode.deinterlace == "off":
+        # Left out while off, so that the setting's arrival kept every estimate.
+        del encoding["deinterlace"]
     if not cfg.grain.denoise_before_encode:
         for name in GRAIN_SAMPLING:
             del grain[name]
         if sampling is not None:
             grain.update(zip(GRAIN_SAMPLING, sampling, strict=True))
     return {
-        "encode": asdict(cfg.encode),
+        "encode": encoding,
         "grain": grain,
         "audio": asdict(cfg.audio),
         "svt_av1": chain.svtav1_version,
@@ -174,15 +180,17 @@ class StopRequest:
 
 @contextlib.contextmanager
 def stop_signals() -> Iterator[StopRequest]:
-    """Make stopping a run deterministic, for both Ctrl-C and `kill`.
+    """Make stopping a run deterministic, for Ctrl-C, `kill` and a hangup.
 
-    Two problems this solves. Av1an traps SIGINT itself and exits non-zero, which
+    Three problems this solves. Av1an traps SIGINT itself and exits non-zero, which
     races Python's own KeyboardInterrupt: the same Ctrl-C was sometimes recorded as
-    a *failed* file rather than an interrupted one. And SIGTERM -- what `systemctl
+    a *failed* file rather than an interrupted one. SIGTERM -- what `systemctl
     stop` and a plain `kill` send -- killed the run outright, skipping the cleanup
-    that decides what to keep.
+    that decides what to keep. And SIGHUP -- a closed SSH session or a killed
+    `screen` window -- did the same, and left Av1an encoding on orphaned: it has a
+    process group of its own (`run_watched`), so only Python stops it.
 
-    Both now set a flag and raise KeyboardInterrupt, so there is exactly one stop
+    All three now set a flag and raise KeyboardInterrupt, so there is exactly one stop
     path. A second signal restores the default handler first, so an operator who
     really wants out is never trapped by a tool that is slow to wind down.
     """
@@ -193,7 +201,8 @@ def stop_signals() -> Iterator[StopRequest]:
         signal.signal(signum, signal.SIG_DFL)
         raise KeyboardInterrupt
 
-    previous = {sig: signal.signal(sig, handle) for sig in (signal.SIGINT, signal.SIGTERM)}
+    stops = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    previous = {sig: signal.signal(sig, handle) for sig in stops}
     try:
         yield state
     finally:
@@ -357,7 +366,8 @@ def _calibrate_grain(
     grain.decide_strength). The table is applied after encoding, so all of this
     rewrites stream headers; nothing is re-encoded.
     """
-    measured = grain.calibrate_strength(read.path, grainy, chain, cfg, work, read.duration)
+    measured = grain.calibrate_strength(read.path, grainy, chain, cfg, work, read.duration,
+                                        source_filter=encode.deinterlace_filter(read, cfg))
     if measured[0] is None:
         log.warning("  grain strength not calibrated: measurements inconclusive")
         return True
@@ -385,6 +395,39 @@ def source_digest(source: Path) -> str:
 # tell what is still wanted; and, while a run works on it, that run's pid.
 SOURCE_FILE = "source.txt"
 RUNNING_FILE = "running"
+# In the work directory itself: held by the one `run` working there.
+RUN_LOCK = "run.lock"
+
+
+class AlreadyRunning(Exception):
+    """Another `run` holds the work directory."""
+
+
+@contextlib.contextmanager
+def only_run(cfg: Config) -> Iterator[None]:
+    """Hold the work directory for this run, or raise AlreadyRunning.
+
+    A second run on the same library starts on the film the first is encoding,
+    since films already under way go first. The two then resume from the same
+    chunks, share one staged copy and one output, and whichever finishes first
+    deletes the staged source under the other. The lock is the kernel's, so it
+    goes with the process however that ends; a pid in a file outlives kill -9
+    and may later name another process. The file stays: removing it would let
+    a run that opened it just before lock a file nobody else can see.
+    """
+    cfg.work_dir.mkdir(parents=True, exist_ok=True)
+    with (cfg.work_dir / RUN_LOCK).open("a+", encoding="ascii") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.seek(0)
+            holder = handle.read().strip() or "unknown"
+            raise AlreadyRunning(
+                f"another run is working in {cfg.work_dir} (pid {holder})") from None
+        handle.truncate(0)
+        handle.write(str(os.getpid()))
+        handle.flush()
+        yield   # the lock goes when the file closes
 
 
 def _work_dir(source: Path, cfg: Config) -> Path:
@@ -463,6 +506,15 @@ def stage_source(info: MediaInfo, cfg: Config) -> Path | None:
     return staged
 
 
+def note_interlacing(info: MediaInfo, cfg: Config) -> None:
+    """Say when a file is deinterlaced, and when one flagged interlaced is not."""
+    if bwdif := encode.deinterlace_filter(info, cfg):
+        log.info("  deinterlacing (%s)", bwdif)
+    elif info.interlaced:
+        log.warning("  flagged interlaced (%s) and encode.deinterlace is off: the combing "
+                    "will be encoded", info.field_order)
+
+
 def process_one(
     source: Path, chain: Toolchain, cfg: Config, *, dry_run: bool = False,
     roots: Sequence[Path] = (),
@@ -473,6 +525,7 @@ def process_one(
     log.info("  %s, %s", info.describe(), human_size(info.size_bytes))
     log.info("  %.3f bits/pixel, encoding at crf %s",
              info.bits_per_pixel, encode.crf_text(encode.effective_crf(info, cfg)))
+    note_interlacing(info, cfg)
 
     final = output_path(info, cfg, roots)
     check_skip(info, final, cfg)
@@ -630,6 +683,12 @@ def _transcode(
     `info` describes the source, `read` says where to read it, and `staged_out` --
     when set -- says where to write the result before moving it to `final`.
     """
+    if not dry_run:
+        try:
+            mux.rehearse(read, chain, cfg, work)
+        except CommandError:
+            log.error("  the mux fails on this file's tracks, so it is not encoded")
+            raise
     report, table = _grain_step(read, chain, cfg, work, dry_run=dry_run)
 
     # Only ever denoise when there is a table to put the grain back with, and by
@@ -650,14 +709,17 @@ def _transcode(
     scenes.prepare(read, chain, cfg, work)
     if not dry_run:
         scenes.detect(read, chain, cfg, work, scene_list)
-    check = (watch.SavingWatch(read, cfg, chain, work / "av1an", scene_list)
-             if cfg.output.check_saving_after_percent > 0 and not dry_run else None)
+    saving = (watch.SavingWatch(read, cfg, chain, work / "av1an", scene_list)
+              if cfg.output.check_saving_after_percent > 0 and not dry_run else None)
+    hourly = (watch.ProgressLog(work / "av1an", scene_list, saving)
+              if not dry_run and watch.ProgressLog.wanted(sys.stderr) else None)
     try:
-        stopped = encode.run_encode(argv, cfg, chain, dry_run=dry_run, check=check,
+        stopped = encode.run_encode(argv, cfg, chain, dry_run=dry_run,
+                                    check=watch.checks(hourly, saving),
                                     keyframes=_keyframes_file(read, chain, cfg, work))
     finally:
-        if check is not None:
-            check.close()
+        if saving is not None:
+            saving.close()
     if stopped:
         _cleanup(work, cfg, table)
         raise NoSaving(stopped, settings_key(cfg, chain))
@@ -725,13 +787,17 @@ def _transcode(
         _make_folders(final.parent)
         log.info("  writing %s to %s", human_size(output_bytes), final.parent)
         # shutil.move, not os.replace: staging is normally on a different
-        # filesystem from the library, so this is a copy-and-delete.
+        # filesystem from the library, so this is a copy-and-delete. The copy
+        # goes to "<name>.part" and is renamed into place, as in the unstaged
+        # branch: a stop or a power cut partway through would otherwise leave a
+        # short file at the final name, which check_skip reads as "already done"
+        # and `clean` as licence to remove the chunks.
+        part = final.with_name(final.name + ".part")
         try:
-            shutil.move(str(muxed), str(final))
-        except OSError:
-            # Never leave a half-written file at the destination: check_skip would
-            # read it as "already done" and the title would be silently abandoned.
-            final.unlink(missing_ok=True)
+            shutil.move(str(muxed), str(part))
+            os.replace(part, final)
+        except BaseException:
+            part.unlink(missing_ok=True)
             raise
     else:
         # Same directory, so this is an atomic rename: the destination name either
@@ -822,6 +888,12 @@ def _process_all(
     settings = settings_keys(cfg, chain)
     sizes = size_keys(cfg, chain)
 
+    def remember(source: Path, record: Record) -> None:
+        # A dry run decides nothing: recording it put "skipped: dry run" over an
+        # earlier "failed", and `status` counted every file it looked at.
+        if not dry_run:
+            ledger.record(source, record)
+
     for index, source in enumerate(sources, start=1):
         log.info("[%d/%d] %s", index, total, source)
 
@@ -841,17 +913,17 @@ def _process_all(
             record = process_one(source, chain, cfg, dry_run=dry_run, roots=roots)
         except NoSaving as exc:
             log.info("  skipped: %s", exc)
-            ledger.record(source, Record(source=str(source), status="skipped",
-                                         reason=str(exc), settings=exc.settings))
+            remember(source, Record(source=str(source), status="skipped",
+                                    reason=str(exc), settings=exc.settings))
             continue
         except SkipFile as exc:
             log.info("  skipped: %s", exc)
-            ledger.record(source, Record(source=str(source), status="skipped", reason=str(exc)))
+            remember(source, Record(source=str(source), status="skipped", reason=str(exc)))
             continue
         except OutputExists as exc:
             failures += 1
             log.error("  %s", exc)
-            ledger.record(source, Record(source=str(source), status="failed", reason=str(exc)))
+            remember(source, Record(source=str(source), status="failed", reason=str(exc)))
             continue
         except (CommandError, OSError, ValueError) as exc:
             # A tool killed by our own stop signal exits non-zero before Python
@@ -863,7 +935,7 @@ def _process_all(
             failures += 1
             log.error("  failed: %s", str(exc).splitlines()[0] if str(exc) else exc)
             log.debug("failure detail", exc_info=True)
-            ledger.record(
+            remember(
                 source, Record(source=str(source), status="failed", reason=str(exc)[:500])
             )
             continue
@@ -871,7 +943,7 @@ def _process_all(
             log.warning("interrupted; Av1an progress is kept, rerun to resume")
             raise
 
-        ledger.record(source, record)
+        remember(source, record)
 
     log.info("library run complete: %s", ledger.summary())
     return failures

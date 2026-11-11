@@ -1,7 +1,8 @@
 """Build and run the Av1an command line.
 
-Av1an owns the hard parts: scene detection, chunking, parallel workers and resume. This module's only job is to translate config plus probed
-source properties into correct flags for Av1an and SvtAv1EncApp.
+Av1an owns the hard parts: scene detection, chunking, parallel workers and resume.
+This module's only job is to translate config plus probed source properties into
+correct flags for Av1an and SvtAv1EncApp.
 """
 
 from __future__ import annotations
@@ -60,6 +61,33 @@ def dovi_tonemap_filter(info: MediaInfo, cfg: Config) -> str:
         ":apply_dovi=1"
         ":format=yuv420p10"
     )
+
+
+# bwdif's parity for each interlaced field order: the field *shown* first, the
+# second letter. "tb" is coded top first but shown bottom first.
+SHOWN_FIRST = {"tt": "tff", "bt": "tff", "bb": "bff", "tb": "bff"}
+
+
+def deinterlace_filter(info: MediaInfo, cfg: Config) -> str:
+    """bwdif for a source to be deinterlaced (encode.deinterlace), else "".
+
+    One frame out per frame in: chunks, keyframes, the grain windows and verify
+    all count frames, so doubling them (send_field) would break every one.
+
+    Field order and which frames to treat come from the probe and the setting,
+    not from frame flags. The flags lie: capture.avi says progressive, and idet
+    found 39,019 of its frames bottom field first, 25,128 top first and 33,600
+    progressive. And they may not reach the filter at all through Av1an's
+    VapourSynth pipe, where bwdif would then take every frame as progressive and
+    top field first. Hence deint=all, and tff / bff to force the order.
+    """
+    mode = cfg.encode.deinterlace
+    if mode == "off":
+        return ""
+    parity = SHOWN_FIRST.get(info.field_order) if mode == "auto" else mode
+    if not parity:
+        return ""
+    return f"bwdif=mode=send_frame:parity={parity}:deint=all"
 
 
 def effective_color(info: MediaInfo, cfg: Config) -> tuple[str, str, str]:
@@ -328,9 +356,11 @@ def build_command(
         argv += ["--sc-downscale-height", str(enc.sc_downscale_height)]
 
     # Filters run inside Av1an's chunk pipeline, so no full-size intermediate file
-    # is ever written. Tonemapping comes first: everything after it works in the
+    # is ever written. Deinterlacing comes first, as it needs the fields as they
+    # were shot; then tonemapping, so that everything after it works in the
     # output colour space.
-    filters = [f for f in (dovi_tonemap_filter(info, cfg), denoise_filter) if f]
+    filters = [f for f in (deinterlace_filter(info, cfg), dovi_tonemap_filter(info, cfg),
+                           denoise_filter) if f]
     if filters:
         argv += ["-f", f"-vf {','.join(filters)}"]
 
