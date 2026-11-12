@@ -58,6 +58,20 @@ warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 # sudo, except as root: root has no need of it, and a container has no sudo.
 as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+# Run a command with the active virtualenv off PATH. VapourSynth embeds Python
+# and takes the first python3 on PATH as its home; from an activated venv that is
+# the venv's, without the vapoursynth module, and Av1an panics with "VSScript API
+# not available", even for --version. autotranscode leaves its venv out of its
+# children's PATH for the same reason (util.child_env).
+outside_venv() {
+  (
+    if [[ -n ${VIRTUAL_ENV:-} ]]; then
+      PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$VIRTUAL_ENV/bin" | paste -sd: -)
+      unset VIRTUAL_ENV
+    fi
+    "$@"
+  )
+}
 # Delete what a stage built from, and BUILD_DIR once nothing else is in it. Only
 # the stage's own trees: another bootstrap may be building in BUILD_DIR meanwhile.
 done_with() {
@@ -322,7 +336,7 @@ stage_av1an() {
   log "Installing Av1an (scene detection, chunking, parallelism, resume)"
   if [[ $OS == mac ]]; then
     brew install av1an
-    av1an --version | head -1
+    outside_venv av1an --version | head -1
     return
   fi
   ensure_cargo
@@ -335,7 +349,7 @@ stage_av1an() {
   RUSTFLAGS="-L $PREFIX/lib -C link-arg=-Wl,-rpath,$PREFIX/lib" \
     cargo install --git https://github.com/rust-av/Av1an --tag "v${AV1AN_VERSION}" \
       --locked av1an
-  av1an --version | head -1
+  outside_venv av1an --version | head -1
 }
 
 stage_grav1synth() {
