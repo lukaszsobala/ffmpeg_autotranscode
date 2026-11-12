@@ -41,7 +41,7 @@ silicon or Intel):
 | SVT-AV1 4.3.0 | built from source into `~/.local` | built from source into `~/.local` |
 | VapourSynth (Av1an will not link without it) | built from source into `~/.local` | Homebrew |
 | L-SMASH-Works VapourSynth plugin, for the `lsmash` chunk method | built from source into `~/.local/lib/vapoursynth` | built from source into Homebrew's plugin folder |
-| Av1an | `cargo install` | Homebrew |
+| Av1an 0.6.0 | `cargo install` from its git tag | Homebrew |
 | grav1synth 0.2.0, patched | built from the crate with `scripts/grav1synth-0.2.0-grain-flag.patch` | the same |
 | mkvtoolnix, Python 3.11+ | apt | Homebrew |
 

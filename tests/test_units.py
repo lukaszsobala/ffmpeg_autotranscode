@@ -2863,6 +2863,12 @@ class TestSourceTiming(unittest.TestCase):
         self.assertEqual(probe._stream_duration({"duration": "N/A"}), 0.0)
         self.assertEqual(probe._stream_duration({}), 0.0)
 
+    def test_the_muxer_s_duration_beats_a_copied_statistics_tag(self):
+        # As ffprobe showed a 61 s excerpt cut with -c copy from a 59-minute film.
+        tags = {"BPS-eng": "4937344", "DURATION-eng": "00:59:00.000000000",
+                "NUMBER_OF_FRAMES-eng": "177000", "DURATION": "00:01:00.980000000"}
+        self.assertAlmostEqual(probe._stream_duration({"tags": tags}), 60.98)
+
     def test_only_a_real_difference_in_length_counts_as_drift(self):
         self.assertTrue(encode.drifted(124.071, 111.649))
         self.assertFalse(encode.drifted(7200.000, 7200.042))   # a frame of rounding
@@ -3971,6 +3977,42 @@ class TestProgressRedraw(unittest.TestCase):
         self.assertIn("INFO a chunk finished\n", text)
         self.assertNotIn("Kbps", text)
         self.assertTrue(text.rstrip("\n").endswith("00:12:01"))
+
+    # As Av1an 0.5.2 and 0.6.0 print it for every source without subtitles.
+    AUDIO_WARNING = (
+        "\x1b[33mWARN\x1b[0m FFmpeg failed to encode audio!\n"
+        "Output {\n"
+        "    status: ExitStatus(\n"
+        "        unix_wait_status(\n"
+        "            59904,\n"
+        "        ),\n"
+        "    ),\n"
+        '    stdout: "",\n'
+        '    stderr: "[out#0/matroska @ 0xaaaad5685970] Output file does not contain any '
+        'stream\\nError opening output file /w/av1an/audio.mkv.\\nError opening output '
+        'files: Invalid argument\\n",\n'
+        "}\n"
+        'Params: "ffmpeg" "-y" "-hide_banner" "-loglevel" "error" "-i" "/w/film.avi" '
+        '"-map_metadata" "0" "-map" "0" "-c" "copy" "-vn" "-dn" "-an" "/w/av1an/audio.mkv"\n')
+
+    def feed_through(self, text: str) -> str:
+        out = io.StringIO()
+        screen = progress.Screen(out, width=80)
+        feed = progress.Feed(screen)
+        feed.feed(text.replace("\n", "\r\n").encode())
+        feed.end()
+        screen.finish()
+        return progress.ESCAPE.sub("", out.getvalue())
+
+    def test_av1an_failing_to_copy_audio_that_is_left_out_is_not_shown(self):
+        text = self.feed_through("INFO encode_file: Queue 136 Workers 1\n"
+                                 + self.AUDIO_WARNING + "INFO a chunk finished\n")
+        self.assertEqual(text, "INFO encode_file: Queue 136 Workers 1\nINFO a chunk finished\n")
+
+    def test_what_follows_the_audio_warning_in_another_shape_is_still_shown(self):
+        text = self.feed_through("WARN FFmpeg failed to encode audio!\n"
+                                 "Error: the scene list is unreadable\n")
+        self.assertEqual(text, "Error: the scene list is unreadable\n")
 
     def test_what_a_stopped_command_says_while_dying_is_dropped(self):
         out = io.StringIO()

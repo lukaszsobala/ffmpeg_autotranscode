@@ -36,9 +36,11 @@ ZIMG_VERSION="${ZIMG_VERSION:-release-3.0.6}"
 # that code, and since nothing here ever calls VapourSynth, newer buys us nothing.
 # (macOS takes Homebrew's VapourSynth instead, which builds there.)
 VAPOURSYNTH_VERSION="${VAPOURSYNTH_VERSION:-R72}"
-# The version autotranscode's Av1an flags and its ffmpeg shim were written against
+# The version autotranscode's Av1an flags and its ffmpeg shim were checked against
 # (see FFMPEG_SHIM in autotranscode/encode.py); its options change between releases.
-AV1AN_VERSION="${AV1AN_VERSION:-0.5.2}"
+# 0.6.0 is tagged on GitHub but not on crates.io, whose newest is 0.5.2, so it is
+# built from the tag.
+AV1AN_VERSION="${AV1AN_VERSION:-0.6.0}"
 # Built from the crate with a local patch; see stage_grav1synth.
 GRAV1SYNTH_VERSION="${GRAV1SYNTH_VERSION:-0.2.0}"
 # L-SMASH-Works tags stopped in 2023; this is the commit tested here (2026-09).
@@ -331,7 +333,8 @@ stage_av1an() {
   # then lets the finished binary find the libraries without LD_LIBRARY_PATH.
   PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
   RUSTFLAGS="-L $PREFIX/lib -C link-arg=-Wl,-rpath,$PREFIX/lib" \
-    cargo install av1an --version "$AV1AN_VERSION" --locked
+    cargo install --git https://github.com/rust-av/Av1an --tag "v${AV1AN_VERSION}" \
+      --locked av1an
   av1an --version | head -1
 }
 

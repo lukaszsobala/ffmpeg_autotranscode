@@ -10,7 +10,8 @@ one line when it fits, on two when it does not, the least needed figures dropped
 first. The film's name goes on a line of its own above it: what Av1an itself says
 names only the staged copy, and the line that named the film has long scrolled
 away by the time anyone looks. Anything else Av1an writes is passed through above
-both, as are this program's own log lines while it runs.
+both, as are this program's own log lines while it runs, save one harmless
+warning about audio (AUDIO_WARNING).
 
 Only when the terminal is one: written to a file, Av1an draws no bar anyway.
 """
@@ -34,7 +35,8 @@ COLUMNS, ROWS = 300, 50
 # Redraws at most this often; Av1an's own come ten times a second.
 REDRAW_SECONDS = 0.25
 
-# Av1an 0.5.2's bar (progress_bar.rs, INDICATIF_PROGRESS_TEMPLATE), colours removed:
+# Av1an's bar, the same in 0.5.2 and 0.6.0 (progress_bar.rs, INDICATIF_PROGRESS_TEMPLATE),
+# colours removed:
 #   00:12:01 [12/431 Chunks] ▐████    ▌  42% 9312/212784 (1.71 fps, eta 35h,
 #                                           4521.3 Kbps, est. 12.3 GiB)
 # and while scene detection does not yet know the length (INDICATIF_SC_SPINNER_TEMPLATE):
@@ -55,6 +57,16 @@ ESCAPE = re.compile(r"\x1b\[[0-9;?]*[@-~]|\x1b[@-_]")
 # A draw of the bar that BAR does not read, in a layout some other Av1an has. Dropped:
 # passed through, every draw of it would pile up above the bar as one long line.
 STRAY = re.compile(r"\d+:\d\d:\d\d +.*▐.*▌")
+# Av1an copies the source's audio aside whenever it has any, -a -an or not
+# (av1an-core 0.5.2 and 0.6.0, ffmpeg.rs encode_audio). With the audio left out, a source
+# without subtitles leaves ffmpeg nothing to write, and Av1an says so in a dozen
+# lines of Rust debug output before carrying on. Nothing is lost: the mux takes
+# audio and subtitles from the source. So the warning and its dump are dropped,
+# up to the "Params:" line that ends them.
+AUDIO_WARNING = re.compile(r"\bFFmpeg failed to encode audio!$")
+AUDIO_DUMP = re.compile(r'\s*(?:Output \{|status: \w+\(|\w+\(|\d+,|\),?|\}|'
+                        r'(?:stdout|stderr): ".*",)$')
+AUDIO_PARAMS = re.compile(r"\s*Params: ")
 
 PARTIAL_BLOCKS = " ▏▎▍▌▋▊▉"
 
@@ -263,6 +275,7 @@ class Feed:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._pending = ""   # output not yet ended by a break
         self._text = ""      # a line's text, gathered across cursor movements
+        self._in_audio_warning = False
 
     def feed(self, data: bytes) -> None:
         self._pending += self._decoder.decode(data)
@@ -288,8 +301,22 @@ class Feed:
         if rest:
             self._text = f"{self._text} {rest}" if self._text else rest
         if newline and self._text:
-            self.screen.write_above(self._text + "\n")
+            self._line(self._text)
             self._text = ""
+
+    def _line(self, text: str) -> None:
+        if self._in_audio_warning:
+            if AUDIO_PARAMS.match(text):
+                self._in_audio_warning = False
+                return
+            if AUDIO_DUMP.match(text):
+                return
+            # Not the dump as Av1an 0.5.2 and 0.6.0 print it: show the rest.
+            self._in_audio_warning = False
+        elif AUDIO_WARNING.search(text):
+            self._in_audio_warning = True
+            return
+        self.screen.write_above(text + "\n")
 
 
 def usable(stream: TextIO) -> bool:

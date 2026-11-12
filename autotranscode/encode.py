@@ -268,7 +268,7 @@ def chunk_method(cfg: Config, chain: Toolchain) -> str:
 
 
 # Av1an's own estimate of a worker's memory, in GB per megapixel of picture:
-# SVT-AV1's, plus the chunk method's (av1an-core 0.5.2, determine_workers).
+# SVT-AV1's, plus the chunk method's (av1an-core 0.5.2 and 0.6.0, determine_workers).
 SVT_GB_PER_MEGAPIXEL = 1.2
 CHUNK_GB_PER_MEGAPIXEL = {"lsmash": 0.3, "ffms2": 0.3, "bestsource": 0.3}
 OTHER_CHUNK_GB_PER_MEGAPIXEL = 0.1
@@ -496,7 +496,7 @@ def keep_source_timing(info: MediaInfo, encoded: Path, chain: Toolchain, work: P
              "(%.1fs)", actual, expected)
 
 
-# Av1an 0.5.2 (and master as of 2026-09) cuts each chunk out of a split segment
+# Av1an 0.5.2 and 0.6.0 cut each chunk out of a split segment
 # with `ffmpeg -vf select=between(n,a,b) -f yuv4mpegpipe -` and no -fps_mode, so
 # ffmpeg converts the selection to constant frame rate. On a 23.976 fps Matroska
 # source with millisecond timestamps that conversion duplicates a frame: the

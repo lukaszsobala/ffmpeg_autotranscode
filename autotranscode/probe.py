@@ -295,16 +295,23 @@ def _tag_int(stream: dict, name: str) -> int:
 
 def _stream_duration(stream: dict) -> float:
     """A stream's length in seconds: MP4 states it, Matroska tags it per track
-    ("DURATION": "00:01:51.649000000"). 0.0 when neither does."""
+    ("DURATION": "00:01:51.649000000"). 0.0 when neither does.
+
+    A plain DURATION goes before mkvmerge's DURATION-eng and the like. ffmpeg's
+    muxer measures its own, but copies the statistics through unchanged: a 61 s
+    excerpt cut from a 59-minute film with -c copy still said 00:59:00 in
+    DURATION-eng, and the encode looked 58 minutes short.
+    """
     try:
         if seconds := float(stream.get("duration") or 0):
             return seconds
     except ValueError:
         pass
-    for key, value in (stream.get("tags") or {}).items():
-        named = key.upper() == "DURATION" or key.upper().startswith("DURATION-")
-        if named and (match := re.fullmatch(r"(\d+):(\d+):(\d+(?:\.\d+)?)",
-                                            str(value).strip())):
+    tags = stream.get("tags") or {}
+    named = [key for key in tags
+             if key.upper() == "DURATION" or key.upper().startswith("DURATION-")]
+    for key in sorted(named, key=lambda key: key.upper() != "DURATION"):
+        if match := re.fullmatch(r"(\d+):(\d+):(\d+(?:\.\d+)?)", str(tags[key]).strip()):
             return int(match[1]) * 3600 + int(match[2]) * 60 + float(match[3])
     return 0.0
 

@@ -256,7 +256,7 @@ ROCK 5B:
 It is not worth reaching for. At preset 4 the encoder spends 151 ms per frame
 against 8.7 ms for single-threaded CPU decode, so decode is about 6% of the work,
 and Av1an offers no way to claim it: the string `hwaccel` does not appear anywhere
-in av1an-core 0.5.2. The only ffmpeg passes this project runs itself are the grain
+in av1an-core 0.6.0. The only ffmpeg passes this project runs itself are the grain
 probe and table build, which decode about eight seconds of video per film.
 
 A `machine.hwaccel_decode` option used to exist here. It was never read by
@@ -430,7 +430,9 @@ reads its bar back and draws its own to the real terminal's width: one line when
 everything fits, else the bar and time left on one line and the other figures that
 fit on a second. Other lines Av1an prints, and autotranscode's own log, appear
 above it. When the output is not a terminal, Av1an is run as before and draws no
-bar.
+bar. Nor does Av1an 0.6.0 draw one when `TERM` is `dumb` (0.5.2 drew it anyway):
+then only the lines above the bar appear. `screen`, tmux and terminal emulators
+all set a real terminal type.
 
 Without the bar, under Docker or systemd, the log said nothing between
 "encoding" and "done", which for a 4K film is days. So with no terminal a line

@@ -33,7 +33,7 @@ from .util import CommandError, digest, log, run_watched
 PART_SECONDS = 300
 
 # The index Av1an makes in its temp directory for each VapourSynth chunk method,
-# under split/ (av1an-core 0.5.2, generate_loadscript_text). The parts load the
+# under split/ (av1an-core 0.5.2 and 0.6.0, generate_loadscript_text). The parts load the
 # source the same way and share it, so the film is indexed once.
 INDEX_NAMES = {"lsmash": "cache.lwi", "ffms2": "cache.ffindex", "bestsource": "cache.bsindex"}
 
@@ -242,7 +242,7 @@ def source_script(source: Path, method: str, index_file: Path, start: int,
     """A VapourSynth script serving frames [start, end) of `source`, or to its end,
     and writing the whole film's frame count to `frames_file`.
 
-    Loaded as Av1an's own script loads it (av1an-core 0.5.2, loadscript.vpy), so
+    Loaded as Av1an's own script loads it (av1an-core 0.5.2 and 0.6.0, loadscript.vpy), so
     the frames, and the index, are the ones the encode will use.
     """
     src, idx = repr(str(source)), repr(str(index_file))
