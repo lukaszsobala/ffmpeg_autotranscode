@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "AV1 library transcoder built on Av1an, SVT-AV1, grav1synth and jellyfin-ffmpeg"
 readme = "README.md"
 requires-python = ">=3.11"          # tomllib
-license = "MIT"
+license = "0BSD"
 dependencies = []                    # stdlib only; the heavy lifting is external binaries
 
 [project.scripts]

@@ -101,7 +101,7 @@ anything else, the mux command runs on the first 5 seconds of the source, with a
 small black FFV1 clip in place of the encode: the video is copied whatever it is,
 so what is on trial is the source's audio, subtitles, fonts and chapters.
 With the mov_text conversion switched off, a test MP4 failed it in 0.14 s with
-ffmpeg's own message. All 397 files `run` would pick up in the library passed:
+ffmpeg's own message. All 397 files `run` would pick up in a test library passed:
 median 0.65 s, slowest 6.1 s.
 
 ffmpeg's own limits did not end it in time. `-t`, on the input or the output,
@@ -116,7 +116,7 @@ every track, which is where these failures happen.
 The encode always starts at 0, and ffmpeg shifts each input of the mux to start
 at 0 as well. A source whose video starts after its audio would lose the gap, so
 the mux puts it back with `-itsoffset`: a test file with video at 0.500 s came out
-at 0 without it. 30 of 397 files in the library have such a gap, 22 under 50 ms
+at 0 without it. 30 of the same 397 files have such a gap, 22 under 50 ms
 and the longest 120 ms.
 
 ffmpeg copies each track's tags, mkvmerge's statistics (`BPS`, `NUMBER_OF_BYTES`,
@@ -229,7 +229,7 @@ So `verify` pairs frames by index, and measures:
   grain left reads well above zero (38% on the test film, at every CRF from 32 to
   22).
 - **XPSNR**, for reference only, for the reasons above. It is 8-bit because
-  ffmpeg's `xpsnr` is broken for high bit depth here (a 10-bit file against itself
+  ffmpeg's `xpsnr` is broken for high bit depth (a 10-bit file against itself
   scores 9.98 dB, in ffmpeg 7.1 and jellyfin-ffmpeg 8.1 alike).
 
 Both PSNRs are measured with synthesised film grain switched off in the decoder,
@@ -300,11 +300,11 @@ n, it breaks whenever ALIGN(w, 8) x 5 > ALIGN(10w, 128) / 2. For even widths
 that is w mod 64 in {10, 12, 34, 36, 38, 50}, about one in five. 8-bit video,
 and any width that is a multiple of 8, are never affected. The formula picked
 out the broken widths exactly: 9 of 26 test clips from 626 to 1912 wide, and of
-31 library encodes (first 2,000 frames each) only Film F. Padding the width
+31 film encodes (first 2,000 frames each) only the one 1202 wide. Padding the width
 to 8 before sizing the planes, a one-line change, made MPP's own `mpi_dec_test`
 match dav1d on every frame of five broken test clips and of the 1202-wide film,
-grain included. Until a jellyfin-ffmpeg carries that fix, AV1 stays on dav1d
-here. The XPSNR and low-pass passes would stay on dav1d regardless: they need
+grain included. Until a jellyfin-ffmpeg carries that fix, AV1 stays on dav1d.
+The XPSNR and low-pass passes would stay on dav1d regardless: they need
 the grain off, and `av1_rkmpp` has no way to leave it off.
 
 Decoding was never the bottleneck anyway. The blur and PSNR filters are, and the
@@ -561,7 +561,7 @@ grain) and `verify` and `sample`, where every combed frame would otherwise count
 as damage the encoder did. The setting stays out of the settings digest while it
 is off, so its arrival kept every estimate.
 
-Of 523 video files in the library, the 86 flagged interlaced are all DVD `.VOB`s,
+Of 523 video files in a test library, the 86 flagged interlaced are all DVD `.VOB`s,
 which `library.extensions` leaves out.
 
 ## Dolby Vision

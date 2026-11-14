@@ -43,7 +43,7 @@ VAPOURSYNTH_VERSION="${VAPOURSYNTH_VERSION:-R72}"
 AV1AN_VERSION="${AV1AN_VERSION:-0.6.0}"
 # Built from the crate with a local patch; see stage_grav1synth.
 GRAV1SYNTH_VERSION="${GRAV1SYNTH_VERSION:-0.2.0}"
-# L-SMASH-Works tags stopped in 2023; this is the commit tested here (2026-09).
+# L-SMASH-Works tags stopped in 2023; this is the commit last tested (2026-09).
 LSMASH_WORKS_COMMIT="${LSMASH_WORKS_COMMIT:-7e63c8400a252f4dbbeea80cc3bfec895abf12cf}"
 PREFIX="${PREFIX:-$HOME/.local}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -454,3 +454,9 @@ Stdlib-only, so it runs on a bare board with no extra installs.
 ## Configuration
 
 See [config.example.toml](config.example.toml); every option is commented there.
+
+## License
+
+0BSD, see [LICENSE](LICENSE): do anything with it. The exception is
+`scripts/grav1synth-0.2.0-grain-flag.patch`, a change to grav1synth, which is
+MIT-licensed by its authors.
