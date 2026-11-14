@@ -33,7 +33,9 @@ class Record:
     denoise: str = ""
     seconds: float = 0.0
     finished_at: str = ""
-    # For a file that did not save enough: pipeline.settings_key when it was tried.
+    # For a skip that stands while its settings do: pipeline.settings_key for a
+    # file that did not save enough, pipeline.skip_key for one the library's skip
+    # settings rule out.
     settings: str = ""
 
     @property
@@ -152,10 +154,16 @@ class Ledger:
         record = self.get(source)
         return record if record and record.status == "done" else None
 
-    def no_saving(self, source: Path) -> Record | None:
-        """The record of an encode that came out too large, if that is the last word."""
+    def standing_skip(self, source: Path) -> Record | None:
+        """The record of a skip that stands while its `settings` do, if that is the
+        last word: an encode that came out too large, or a file ruled out."""
         record = self.get(source)
         return record if record and record.status == "skipped" and record.settings else None
+
+    def outputs(self) -> set[Path]:
+        """Where the finished encodes went."""
+        return {Path(record.output).resolve() for record in self.records.values()
+                if record.status == "done" and record.output}
 
     def record(self, source: Path, record: Record) -> None:
         with self._changing():

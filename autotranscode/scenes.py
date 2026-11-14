@@ -22,7 +22,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from . import encode
+from . import encode, progress
 from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
@@ -145,8 +145,10 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path, scenes: P
                 break
             folder.mkdir(parents=True, exist_ok=True)
             index_file.parent.mkdir(parents=True, exist_ok=True)
-            log.info("  scene detection, part %d of %d", ranges.index(todo[0]) + 1, len(ranges))
-            _detect_part(read, chain, cfg, method, index_file, *todo[0], folder)
+            number = ranges.index(todo[0]) + 1
+            log.debug("scene detection, part %d of %d", number, len(ranges))
+            with progress.noting(f"scenes, part {number} of {len(ranges)}"):
+                _detect_part(read, chain, cfg, method, index_file, *todo[0], folder)
         parts = [json.loads(part_path(folder, *bounds).read_text(encoding="utf-8"))
                  for bounds in ranges]
         merged = merge(parts, [start for start, _ in ranges])
@@ -219,7 +221,7 @@ def _detect_part(
     argv = encode.scene_command(chain, cfg, method, script, written, temp)
     if cfg.machine.nice > 0:
         argv = ["nice", "-n", str(cfg.machine.nice), *argv]
-    run_watched(argv, lambda: None, extra_path=chain.bin_dirs, redraw=True)
+    run_watched(argv, lambda: None, extra_path=chain.bin_dirs, redraw=True, quiet=True)
     if not whole_list(written):
         raise ValueError(f"Av1an wrote no scene list for frames {start} on")
     frames = int(json.loads(written.read_text(encoding="utf-8"))["frames"])

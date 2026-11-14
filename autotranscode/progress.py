@@ -67,11 +67,17 @@ AUDIO_WARNING = re.compile(r"\bFFmpeg failed to encode audio!$")
 AUDIO_DUMP = re.compile(r'\s*(?:Output \{|status: \w+\(|\w+\(|\d+,|\),?|\}|'
                         r'(?:stdout|stderr): ".*",)$')
 AUDIO_PARAMS = re.compile(r"\s*Params: ")
+# What Av1an and L-SMASH report while detecting the scenes of a part (av1an 0.6.0):
+# its INFO lines (the input's format, the scenes found), its "Scene detection"
+# heading and the index's progress. A film in 5-minute parts printed them all
+# again for every part, and the bar left with them, five lines a part.
+QUIET = re.compile(r"(?:INFO\b|Scene detection$|Creating lwi index file\b)")
 
 PARTIAL_BLOCKS = " ▏▎▍▌▋▊▉"
 
-# What the bars drawn now are about; see `showing`.
+# What the bars drawn now are about, and which step of it; see `showing`, `noting`.
 _title = ""
+_note = ""
 
 
 @contextlib.contextmanager
@@ -83,6 +89,17 @@ def showing(title: str) -> Iterator[None]:
         yield
     finally:
         _title = before
+
+
+@contextlib.contextmanager
+def noting(note: str) -> Iterator[None]:
+    """Add `note` after the title of every bar drawn inside the block."""
+    global _note
+    before, _note = _note, note
+    try:
+        yield
+    finally:
+        _note = before
 
 
 @dataclass(slots=True)
@@ -166,10 +183,24 @@ def render(status: Status, width: int) -> list[str]:
     return [f"{head} ▐{bar(fraction, cells)}▌ {tail}"[:width], _fit(figures, width)]
 
 
-def heading(title: str, width: int) -> str:
-    """`title` cut short, if need be, to the width `render` keeps to."""
+def heading(title: str, width: int, note: str = "") -> str:
+    """`title`, then `note`, cut short, if need be, to the width `render` keeps to.
+    The title is cut before the note: a film's name is often all that fits, and
+    then which part of its scene detection is running would never show."""
     width = max(width - 1, 20)
-    return title if len(title) <= width else title[:width - 1].rstrip() + "…"
+    if not (title and note):
+        return _cut(title or note, width)
+    tail = f" · {note}"
+    room = width - len(tail)
+    if len(title) <= room:
+        return title + tail
+    if room >= 10:   # enough of the name left to tell which film it is
+        return _cut(title, room) + tail
+    return _cut(title + tail, width)
+
+
+def _cut(text: str, width: int) -> str:
+    return text if len(text) <= width else text[:width - 1].rstrip() + "…"
 
 
 def _fit(figures: list[str], width: int) -> str:
@@ -194,10 +225,12 @@ class Screen:
     """The bar at the bottom of the terminal, under the title if there is one, with
     whatever else is written going above them. Safe to call from any thread."""
 
-    def __init__(self, out: TextIO, width: TextIO | int | None = None, title: str = ""):
+    def __init__(self, out: TextIO, width: TextIO | int | None = None, title: str = "",
+                 note: str = ""):
         self.out = out
         self._width = width
         self.title = title   # drawn on a line above the bar
+        self.note = note     # and this after it
         self.lock = threading.RLock()
         self.status: Status | None = None
         self._drawn = 0           # lines of the bar on the screen
@@ -235,12 +268,16 @@ class Screen:
         with self.lock:
             self.muted = True
 
-    def finish(self) -> None:
-        """Leave the last bar on the screen, the cursor below it, and draw no more."""
+    def finish(self, *, keep: bool = True) -> None:
+        """Leave the last bar on the screen, the cursor below it, and draw no more;
+        or, not to `keep` it, erase it."""
         with self.lock:
             if self._finished:
                 return
             self.muted = self._finished = True
+            if not keep:
+                self.clear()
+                return
             if self.status is not None:
                 self._redraw()
             if self._drawn:
@@ -258,8 +295,8 @@ class Screen:
         if self.status is not None:
             width = self.width()
             lines = render(self.status, width)
-            if self.title:
-                lines.insert(0, heading(self.title, width))
+            if self.title or self.note:
+                lines.insert(0, heading(self.title, width, self.note))
             self.out.write("\n".join(lines))
             self._drawn = len(lines)
             self._last_draw = time.monotonic()
@@ -268,20 +305,24 @@ class Screen:
 
 class Feed:
     """Av1an's terminal output, taken apart: its bar goes to the screen's bar,
-    every other line above it."""
+    every other line above it, save what is not to be shown: `quiet` drops its
+    progress reports as well (QUIET)."""
 
-    def __init__(self, screen: Screen):
+    def __init__(self, screen: Screen, *, quiet: bool = False):
         self.screen = screen
+        self.quiet = quiet
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._pending = ""   # output not yet ended by a break
         self._text = ""      # a line's text, gathered across cursor movements
+        self._returned = False   # a bare return came after it: what follows replaces it
         self._in_audio_warning = False
 
     def feed(self, data: bytes) -> None:
         self._pending += self._decoder.decode(data)
         start = 0
         for brk in BREAK.finditer(self._pending):
-            self._segment(self._pending[start:brk.start()], newline="\n" in brk.group())
+            self._segment(self._pending[start:brk.start()], newline="\n" in brk.group(),
+                          returned=brk.group() == "\r")
             start = brk.end()
         self._pending = self._pending[start:]
 
@@ -290,7 +331,7 @@ class Feed:
         self._segment(self._pending, newline=True)
         self._pending = ""
 
-    def _segment(self, raw: str, *, newline: bool) -> None:
+    def _segment(self, raw: str, *, newline: bool, returned: bool = False) -> None:
         if self.screen.muted:
             return
         status, rest = parse(ESCAPE.sub("", raw))
@@ -299,10 +340,18 @@ class Feed:
         elif STRAY.search(rest):
             return
         if rest:
-            self._text = f"{self._text} {rest}" if self._text else rest
-        if newline and self._text:
-            self._line(self._text)
+            # Text after a bare return is drawn over the line, as L-SMASH redraws
+            # "Creating lwi index file 12%": joined, its hundred draws made one line
+            # that wrapped over 30 rows of a 90-column terminal.
+            self._text = f"{self._text} {rest}" if self._text and not self._returned else rest
+            self._returned = False
+        if returned:
+            self._returned = True
+        if newline:
+            if self._text:
+                self._line(self._text)
             self._text = ""
+            self._returned = False
 
     def _line(self, text: str) -> None:
         if self._in_audio_warning:
@@ -315,6 +364,8 @@ class Feed:
             self._in_audio_warning = False
         elif AUDIO_WARNING.search(text):
             self._in_audio_warning = True
+            return
+        if self.quiet and QUIET.match(text):
             return
         self.screen.write_above(text + "\n")
 
@@ -335,14 +386,15 @@ class Relay:
     `stop()` before stopping it, and `close()` once it has exited.
     """
 
-    def __init__(self, out: TextIO | None = None):
+    def __init__(self, out: TextIO | None = None, *, quiet: bool = False):
         import fcntl
         import pty
         import struct
         import termios
 
         self.out = out or sys.stderr
-        self.screen = Screen(self.out, title=_title)
+        self.screen = Screen(self.out, title=_title, note=_note)
+        self.quiet = quiet
         self.master, self.child_fd = pty.openpty()
         fcntl.ioctl(self.child_fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLUMNS, 0, 0))
         self._thread = threading.Thread(target=self._read, daemon=True)
@@ -375,13 +427,13 @@ class Relay:
             if self._thread.ident is not None:
                 self._thread.join(1.0)
         finally:
-            self.screen.finish()
+            self.screen.finish(keep=not self.quiet)
             for handler, stream in self._handlers:
                 handler.setStream(stream)
             self._handlers.clear()
 
     def _read(self) -> None:
-        feed = Feed(self.screen)
+        feed = Feed(self.screen, quiet=self.quiet)
         while True:
             try:
                 data = os.read(self.master, 65536)

@@ -2771,7 +2771,7 @@ class TestNoSavingIsRemembered(unittest.TestCase):
         self.assertEqual(self.tries, 1)
         record = present(self.ledger.get(self.source))
         self.assertEqual(record.status, "skipped")
-        self.assertEqual(Ledger(self.root / "state.json").no_saving(self.source), record)
+        self.assertEqual(Ledger(self.root / "state.json").standing_skip(self.source), record)
 
     def test_tried_again_once_the_settings_change(self):
         self._run()
@@ -2779,10 +2779,10 @@ class TestNoSavingIsRemembered(unittest.TestCase):
         self._run()
         self.assertEqual(self.tries, 2)
 
-    def test_other_skips_are_not_remembered_this_way(self):
+    def test_a_skip_recorded_without_settings_does_not_stand(self):
         self.ledger.record(self.source, Record(source=str(self.source), status="skipped",
                                                reason="already av1"))
-        self.assertIsNone(self.ledger.no_saving(self.source))
+        self.assertIsNone(self.ledger.standing_skip(self.source))
 
 
 class TestChunkMethod(unittest.TestCase):
@@ -3191,6 +3191,86 @@ class TestEstimatesSteerTheRun(unittest.TestCase):
                                   pipeline.StopRequest())
         self.assertEqual(encoded, [c, d])
         self.assertIsNone(self.ledger.get(a), "a guess is not a verdict: nothing is recorded")
+
+    def test_the_count_carries_on_after_the_files_earlier_runs_settled(self):
+        a, b, c, d = self.files
+        self.ledger.record(b, Record(source=str(b), status="done", output="/out/b.mkv"))
+        self.ledger.record(d, Record(source=str(d), status="skipped", reason="too big",
+                                     settings=pipeline.settings_key(self.cfg, self.chain)))
+
+        def fake_process_one(source, *_args, **_kwargs):
+            return Record(source=str(source), status="done")
+
+        with (unittest.mock.patch.object(pipeline, "process_one", fake_process_one),
+              self.assertLogs("autotranscode", "INFO") as logs):
+            pipeline._process_all(self.files, self.chain, self.cfg, self.ledger,
+                                  pipeline.StopRequest())
+        messages = [record.getMessage() for record in logs.records]
+        self.assertIn("2 of them dealt with before (1 already transcoded, 1 did not save "
+                      "enough before): carrying on from 3", messages)
+        self.assertEqual([m for m in messages if m.startswith("[")],
+                         [f"[3/4] {a}", f"[4/4] {c}"])
+
+    def test_a_run_with_nothing_left_says_so(self):
+        for path in self.files:
+            self.ledger.record(path, Record(source=str(path), status="done", output="/o"))
+        with self.assertLogs("autotranscode", "INFO") as logs:
+            pipeline._process_all(self.files, self.chain, self.cfg, self.ledger,
+                                  pipeline.StopRequest())
+        self.assertIn("4 of them dealt with before (4 already transcoded): nothing left to do",
+                      [record.getMessage() for record in logs.records])
+
+    def _run_counting(self) -> list[Path]:
+        tried = []
+
+        def fake_process_one(source, *_args, **_kwargs):
+            tried.append(source)
+            raise pipeline.SkipFile("already av1", pipeline.skip_key(self.cfg))
+
+        with unittest.mock.patch.object(pipeline, "process_one", fake_process_one):
+            pipeline._process_all(self.files, self.chain, self.cfg, self.ledger,
+                                  pipeline.StopRequest())
+        return tried
+
+    def test_a_file_with_its_output_already_there_is_counted_without_a_probe(self):
+        a, b, _, _ = self.files
+        pipeline.output_for(b, self.cfg).write_bytes(b"encoded elsewhere")
+        tried = self._run_counting()
+        self.assertNotIn(b, tried)
+        self.assertIn(a, tried)
+        self.assertIsNone(self.ledger.get(b), "the output is the verdict: nothing is recorded")
+
+    def test_a_skip_for_what_the_file_is_stands_until_the_skip_settings_change(self):
+        self.assertEqual(len(self._run_counting()), 4)
+        self.assertEqual(self._run_counting(), [])
+        self.cfg.library.skip_codecs = ["av1", "vp9"]
+        self.assertEqual(len(self._run_counting()), 4)
+
+    def test_only_skips_for_what_the_file_is_carry_the_skip_settings(self):
+        key = pipeline.skip_key(self.cfg)
+        out = self.root / "out.mkv"
+        for info, settings in ((make_info(codec="av1"), key),
+                               (make_info(duration=30.0), key),
+                               (make_info(pix_fmt="unknown"), ""),
+                               (make_info(path=out), "")):
+            with self.assertRaises(pipeline.SkipFile) as caught:
+                pipeline.check_skip(info, out, self.cfg)
+            self.assertEqual(caught.exception.settings, settings, caught.exception)
+        out.write_bytes(b"x")
+        with self.assertRaises(pipeline.SkipFile) as caught:
+            pipeline.check_skip(make_info(), out, self.cfg)
+        self.assertEqual(caught.exception.settings, "")
+
+    def test_outputs_this_ledger_recorded_are_left_out_of_the_queue(self):
+        a, b, c, _ = self.files
+        output = pipeline.output_for(a, self.cfg)
+        output.write_bytes(b"x")
+        self.ledger.record(a, Record(source=str(a), status="done", output=str(output)))
+        self.ledger.record(b, Record(source=str(b), status="failed", output=str(c)))
+        found = pipeline.discover([self.root], self.cfg)
+        self.assertIn(output, found)
+        kept, left_out = pipeline.leave_out_outputs(found, self.ledger)
+        self.assertEqual((kept, left_out), (self.files, 1))
 
 
 class TestGrainStepResumes(unittest.TestCase):
@@ -4029,6 +4109,53 @@ class TestProgressRedraw(unittest.TestCase):
         self.assertNotIn("Terminated", text)
         self.assertNotIn("fwrite", text)
         self.assertTrue(text.endswith("00:12:01\n"))
+
+    INDEXING = "".join(f"Creating lwi index file {n}%\r" for n in range(101)) + "\n"
+
+    def test_a_line_redrawn_after_a_return_is_shown_once_as_last_drawn(self):
+        text = self.feed_through(self.INDEXING + "INFO encode_file: Queue 136\n")
+        self.assertEqual(text, "Creating lwi index file 100%\nINFO encode_file: Queue 136\n")
+
+    def test_quiet_drops_the_progress_reports_and_erases_the_bar(self):
+        out = io.StringIO()
+        screen = progress.Screen(out, width=80, title="Film", note="scenes, part 2 of 11")
+        feed = progress.Feed(screen, quiet=True)
+        feed.feed((self.INDEXING
+                   + "\x1b[32mINFO\x1b[0m encode_file: Input: 1920x1080 @ 25.000 fps\r\n"
+                   + "Scene detection\r\n"
+                   + "\r\x1b[2K00:00:45 ▐████████▌ 100% 7500/7500 (166.06 fps, eta 0s)"
+                   + "\r\n\x1b[32mINFO\x1b[0m encode_file: scenecut: found 60 scene(s)\r\n"
+                   + "Error: the scene list is unreadable\r\n").encode())
+        feed.end()
+        screen.finish(keep=False)
+        text = out.getvalue()
+        self.assertIn("Film · scenes, part 2 of 11", text)
+        self.assertIn("Error: the scene list is unreadable\n", text)
+        # The title and the bar, erased from the bottom up, the cursor left where
+        # the title began.
+        self.assertTrue(text.endswith("\r\x1b[2K\x1b[1A\x1b[2K"), repr(text[-40:]))
+        self.assertNotIn("INFO", text)
+        self.assertNotIn("lwi", text)
+        self.assertNotIn("Scene detection", text)
+
+    def test_a_long_title_is_cut_before_the_note(self):
+        title = "Blue.Planet.II.S01E01.1080p.BluRay.x264-SHORTBREHD"
+        note = "scenes, part 2 of 11"
+        self.assertEqual(progress.heading(title, 100, note), f"{title} · {note}")
+        cut = progress.heading(title, 60, note)
+        self.assertTrue(cut.endswith(f"… · {note}"), cut)
+        self.assertLess(len(cut), 60)
+        self.assertEqual(progress.heading("", 60, note), note)
+        self.assertEqual(progress.heading(title, 30, note), progress.heading(
+            f"{title} · {note}", 30))
+
+    def test_bars_drawn_while_noting_a_step_carry_the_note(self):
+        with progress.showing("Some Film"), progress.noting("scenes, part 1 of 3"):
+            relay = progress.Relay(io.StringIO(), quiet=True)
+        self.addCleanup(relay.close)
+        self.assertEqual((relay.screen.title, relay.screen.note),
+                         ("Some Film", "scenes, part 1 of 3"))
+        self.assertEqual(progress.Relay(io.StringIO()).screen.note, "")
 
     def test_a_child_draws_on_a_terminal_and_is_redrawn(self):
         out = io.StringIO()

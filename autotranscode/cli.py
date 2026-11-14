@@ -291,14 +291,14 @@ def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain)
     Each result is kept in the ledger. `run` works through a library in the same
     order and skips the files heading below the minimum savings.
     """
-    sources = pipeline.discover(inputs, cfg)
+    ledger = Ledger(cfg.state_path)
+    sources, _ = pipeline.leave_out_outputs(pipeline.discover(inputs, cfg), ledger)
     if not sources:
         log.error("no media files found")
         return 1
 
     roots = pipeline.library_roots(inputs)
     work = cfg.work_dir / "estimate"
-    ledger = Ledger(cfg.state_path)
     key = pipeline.size_key(cfg, chain)
     results: list[estimate.Estimate] = []
     skipped = 0
@@ -365,12 +365,12 @@ def cmd_estimate(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain)
 
 
 def cmd_plan(inputs: list[Path], cfg: config.Config, chain: tools.Toolchain) -> int:
-    sources = pipeline.discover(inputs, cfg)
+    ledger = Ledger(cfg.state_path)
+    sources, _ = pipeline.leave_out_outputs(pipeline.discover(inputs, cfg), ledger)
     if not sources:
         log.error("no media files found")
         return 1
     roots = pipeline.library_roots(inputs)
-    ledger = Ledger(cfg.state_path)
     sources, _ = pipeline.by_estimate(sources, ledger, cfg, chain,
                                       pipeline.under_way(sources, cfg))
     keys = pipeline.size_keys(cfg, chain)
@@ -492,7 +492,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolchain) -> int:
-    sources = pipeline.discover(args.inputs, cfg)
+    ledger = Ledger(cfg.state_path)
+    sources, outputs = pipeline.leave_out_outputs(pipeline.discover(args.inputs, cfg), ledger)
+    if outputs:
+        log.info("%d output(s) of earlier runs found with the sources, left out", outputs)
     if not sources:
         log.error("no media files found")
         return 1
@@ -502,7 +505,6 @@ def _run(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolchain) -
     log.info("%d file(s) queued, profile=%s preset=%d crf=%s grain=%s",
              len(sources), cfg.machine.profile, cfg.encode.preset, crf, cfg.grain.mode)
 
-    ledger = Ledger(cfg.state_path)
     started = pipeline.under_way(sources, cfg)
     sources, estimated = pipeline.by_estimate(sources, ledger, cfg, chain, started)
     if started:

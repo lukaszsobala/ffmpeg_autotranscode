@@ -194,7 +194,7 @@ def _judge(
     earlier = resume.fingerprint(work)
     if earlier and earlier.get("source") and earlier["source"][0] != source.stat().st_size:
         return True, f"source replaced since: {source.name}"
-    if (tried := ledger.no_saving(source)) and tried.settings in settings:
+    if (tried := ledger.standing_skip(source)) and tried.settings in settings:
         return True, f"would not save enough ({tried.reason}); `run` skips it"
     guess = ledger.guess(source, sizes)
     if guess and (short := watch.shortfall(cfg, guess.source_bytes, guess.projected_bytes)):

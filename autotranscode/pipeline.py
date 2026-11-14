@@ -36,7 +36,13 @@ from .util import CommandError, digest, human_duration, human_size, log
 
 
 class SkipFile(Exception):
-    """This file should not be transcoded; the message says why."""
+    """This file should not be transcoded; the message says why. With `settings`,
+    the digest of the settings that decided it, the verdict stands while they do:
+    the next run counts the file as dealt with, without probing it again."""
+
+    def __init__(self, message: str, settings: str = ""):
+        super().__init__(message)
+        self.settings = settings
 
 
 class OutputExists(Exception):
@@ -51,10 +57,6 @@ class Postponed(SkipFile):
 class NoSaving(SkipFile):
     """The encode would not save enough. `settings` is `settings_key` at the time,
     so that the file is not tried again until something that decides size changes."""
-
-    def __init__(self, message: str, settings: str):
-        super().__init__(message)
-        self.settings = settings
 
 
 # How many grain samples, and how long. They shape the grain table, which adds
@@ -124,6 +126,21 @@ def settings_key(cfg: Config, chain: Toolchain) -> str:
     again would spend the same hours to reach the same size.
     """
     return digest({**_size_settings(cfg, chain), **_savings(cfg)})
+
+
+def skip_key(cfg: Config) -> str:
+    """A digest of the settings that rule a file out by what it is: its codec,
+    length and bits per pixel, and its Dolby Vision.
+
+    Such a skip stands while this does, the file being the same (the ledger knows
+    a file by its path and size). Without it the skip was probed for again on
+    every run: an AV1 file, ours or another's, took a number in the count each time.
+    """
+    library = cfg.library
+    return digest({"skip_codecs": sorted(library.skip_codecs),
+                   "min_duration_sec": library.min_duration_sec,
+                   "min_bits_per_pixel": library.min_bits_per_pixel,
+                   "dolby_vision": asdict(cfg.dolby_vision)})
 
 
 def settings_keys(cfg: Config, chain: Toolchain) -> set[str]:
@@ -252,6 +269,19 @@ def library_roots(inputs: list[Path]) -> list[Path]:
     return [entry.expanduser().absolute() for entry in inputs if entry.expanduser().is_dir()]
 
 
+def leave_out_outputs(sources: list[Path], ledger: Ledger) -> tuple[list[Path], int]:
+    """`sources` without the outputs of encodes the ledger records, and how many
+    were left out.
+
+    Written beside their sources, as they are without `output.directory`, the
+    outputs were found with the library on the next run, each one counted in its
+    total and probed to be skipped as AV1.
+    """
+    outputs = ledger.outputs()
+    kept = [source for source in sources if source.resolve() not in outputs]
+    return kept, len(sources) - len(kept)
+
+
 def output_path(info: MediaInfo, cfg: Config, roots: Sequence[Path] = ()) -> Path:
     """Where the encode goes: next to the source, or in output.directory.
 
@@ -288,22 +318,24 @@ def unused_name(path: Path) -> Path:
 
 
 def check_skip(info: MediaInfo, output: Path, cfg: Config) -> None:
+    key = skip_key(cfg)
     if info.codec in cfg.library.skip_codecs:
-        raise SkipFile(f"already {info.codec}")
+        raise SkipFile(f"already {info.codec}", key)
     if info.duration and info.duration < cfg.library.min_duration_sec:
-        raise SkipFile(f"shorter than {cfg.library.min_duration_sec:.0f}s")
+        raise SkipFile(f"shorter than {cfg.library.min_duration_sec:.0f}s", key)
     floor = cfg.library.min_bits_per_pixel
     if floor > 0 and 0 < info.bits_per_pixel < floor:
         # Zero means the bitrate could not be read, which is not evidence of
         # anything, so only a positive measurement can skip a file.
         raise SkipFile(
             f"already {info.bits_per_pixel:.3f} bits/pixel, below {floor:.3f}: "
-            "too efficient to be worth re-encoding"
+            "too efficient to be worth re-encoding", key
         )
     if info.pix_fmt in {"", "unknown"}:
         # Av1an probes the source itself and aborts with "missing field `pix_fmt`"
         # when ffprobe cannot name the pixel format. Catching it here costs nothing
-        # and turns a confusing failure mid-encode into a clear skip.
+        # and turns a confusing failure mid-encode into a clear skip. Not one that
+        # stands, though: a newer ffprobe may name it.
         raise SkipFile("pixel format unreadable; Av1an cannot probe this file")
     check_dolby_vision(info, cfg)
     if output.resolve() == info.path.resolve():
@@ -327,7 +359,8 @@ def check_dolby_vision(info: MediaInfo, cfg: Config) -> None:
         return
 
     if cfg.dolby_vision.mode == "skip":
-        raise SkipFile(f"Dolby Vision profile {dv.name} (dolby_vision.mode = 'skip')")
+        raise SkipFile(f"Dolby Vision profile {dv.name} (dolby_vision.mode = 'skip')",
+                       skip_key(cfg))
 
     layer = info.base_layer
     if layer == "none":
@@ -339,7 +372,8 @@ def check_dolby_vision(info: MediaInfo, cfg: Config) -> None:
             return
         raise SkipFile(
             f"Dolby Vision profile {dv.name}: no base layer to fall back on "
-            "(set dolby_vision.profile5 = 'tonemap-sdr' to convert it to SDR instead)"
+            "(set dolby_vision.profile5 = 'tonemap-sdr' to convert it to SDR instead)",
+            skip_key(cfg),
         )
 
     if layer == "invalid":
@@ -886,6 +920,7 @@ def _process_all(
     failures = 0
     total = len(sources)
     settings = settings_keys(cfg, chain)
+    skips = skip_key(cfg)
     sizes = size_keys(cfg, chain)
 
     def remember(source: Path, record: Record) -> None:
@@ -894,31 +929,53 @@ def _process_all(
         if not dry_run:
             ledger.record(source, record)
 
-    for index, source in enumerate(sources, start=1):
-        log.info("[%d/%d] %s", index, total, source)
-
+    def settled(source: Path) -> tuple[str, str] | None:
+        """What an earlier run decided about `source`, and the detail, if it stands."""
         if done := ledger.already_done(source):
-            log.info("  skipping, already transcoded to %s", done.output)
-            continue
-        if (tried := ledger.no_saving(source)) and tried.settings in settings:
-            log.info("  skipping, did not save enough with the same settings before (%s)",
-                     tried.reason)
-            continue
+            return "already transcoded", f"to {done.output}"
+        if tried := ledger.standing_skip(source):
+            if tried.settings in settings:
+                return "did not save enough before", tried.reason
+            if tried.settings == skips:
+                return "skipped before", tried.reason
+        # What check_skip would find once the file was probed, found without it: an
+        # encode by another run (another machine, Docker), or one this ledger lost.
+        if (output := output_for(source, cfg, roots)).exists():
+            return "output already there", str(output)
         guess = ledger.guess(source, sizes)
         if guess and (short := watch.shortfall(cfg, guess.source_bytes, guess.projected_bytes)):
-            log.info("  skipping, estimated to come out %s", short)
-            continue
+            return "estimated to fall short", f"would come out {short}"
+        return None
+
+    # The files earlier runs settled are counted first, so the count carries on
+    # where they left off. Checked one by one as the loop reached them, they took
+    # numbers among the rest: the queue is sorted by estimate, and 124 done files of
+    # 397 sat anywhere in it, so a run picking up after them began at [1/397].
+    todo: list[Path] = []
+    kinds: dict[str, int] = {}
+    for source in sources:
+        if verdict := settled(source):
+            kind, detail = verdict
+            kinds[kind] = kinds.get(kind, 0) + 1
+            log.debug("%s: %s, %s", source, kind, detail)
+        else:
+            todo.append(source)
+    before = total - len(todo)
+    if before:
+        log.info("%d of them dealt with before (%s): %s", before,
+                 ", ".join(f"{count} {kind}" for kind, count
+                           in sorted(kinds.items(), key=lambda item: -item[1])),
+                 f"carrying on from {before + 1}" if todo else "nothing left to do")
+
+    for index, source in enumerate(todo, start=before + 1):
+        log.info("[%d/%d] %s", index, total, source)
 
         try:
             record = process_one(source, chain, cfg, dry_run=dry_run, roots=roots)
-        except NoSaving as exc:
+        except SkipFile as exc:
             log.info("  skipped: %s", exc)
             remember(source, Record(source=str(source), status="skipped",
                                     reason=str(exc), settings=exc.settings))
-            continue
-        except SkipFile as exc:
-            log.info("  skipped: %s", exc)
-            remember(source, Record(source=str(source), status="skipped", reason=str(exc)))
             continue
         except OutputExists as exc:
             failures += 1

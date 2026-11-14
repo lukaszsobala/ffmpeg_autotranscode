@@ -324,6 +324,15 @@ are asked whether to start it again with the new ones, finish it with the ones i
 started with, or leave it for now. Without a terminal to ask on, as under Docker or
 systemd, it is left for now unless `library.on_changed_settings` gives the answer.
 
+A rerun counts on from the earlier ones: the files they settled are counted
+first, in one line, and the next film is `[128/397]`, not `[1/397]`. Settled
+means transcoded, skipped for what the file is (already AV1, too short, too
+efficient, Dolby Vision it cannot carry: until those settings change), or tried
+and found not to save enough (until the settings that decide size change). A film
+whose output is already where this run would write it, from another machine or
+container, counts as settled too, and is not opened. Outputs written beside their
+sources are left out of the queue.
+
 ### Cleaning up
 
 A film's work directory holds its chunks, tens of gigabytes for 4K. A run removes

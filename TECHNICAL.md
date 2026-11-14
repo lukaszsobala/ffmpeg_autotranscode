@@ -434,6 +434,15 @@ bar. Nor does Av1an 0.6.0 draw one when `TERM` is `dumb` (0.5.2 drew it anyway):
 then only the lines above the bar appear. `screen`, tmux and terminal emulators
 all set a real terminal type.
 
+Text after a bare carriage return replaces the line it returned over, as on a
+terminal. L-SMASH draws its "Creating lwi index file N%" that way, and joined, its
+hundred draws wrapped over 30 rows. While scene detection runs in parts (see
+[Resuming](#resuming-in-detail)), the bar's title names the part, and Av1an's
+`INFO` lines, its "Scene detection" heading and the index's progress are dropped,
+the bar erased when the part ends: printed for every part, they left five lines a
+part, 55 for a 58-minute episode. Anything else Av1an says, an error above all, is
+still shown.
+
 Without the bar, under Docker or systemd, the log said nothing between
 "encoding" and "done", which for a 4K film is days. So with no terminal a line
 goes to the log once an hour: frames done, the speed, the time left, and the
@@ -486,6 +495,18 @@ starts is given a locale verified to exist, so transcodes are immune.
   changed size is treated as new. Commands can share it: each entry is written
   under a lock (`state.json.lock` beside it) against the file as it is on disk
   then, so an `estimate` started beside a long `run` loses nothing of either's.
+  A run counts the files earlier ones settled before it starts, so its count goes
+  on from theirs: checked as the loop reached them, the 124 done files of a
+  397-file queue sorted by estimate sat anywhere in it, and a restart began at
+  `[1/397]`. A skip for what the file is (codec, length, bits per pixel, Dolby
+  Vision) is recorded with a digest of the settings that decided it and stands
+  while they do; one recorded without, as before, was probed for again on every
+  run. An unreadable pixel format is not kept: a newer ffprobe may read it. An
+  output already at the path this run would write counts without opening the
+  source, so a film encoded by another machine, or in Docker, whose paths and
+  ledger differ, is not numbered among the films to do. The outputs the ledger
+  records are left out of the queue: written beside their sources, they were
+  found with the library and probed, each run, to be skipped as AV1.
 - **One `run` per work directory.** A second `run` would start on the film the
   first is encoding, since films already under way go first, then resume from the
   same chunks, share one staged copy and one output, and delete the staged source

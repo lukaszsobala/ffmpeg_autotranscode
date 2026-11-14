@@ -226,11 +226,13 @@ def run_watched(
     extra_path: Sequence[str] = (),
     extra_env: Mapping[str, str] | None = None,
     redraw: bool = False,
+    quiet: bool = False,
 ) -> str | None:
     """Run a long command with its output on the terminal, asking `check` every
     `every` seconds whether to stop it. Returns why it was stopped, or None when it
     ran to the end. `extra_env` is added to its environment. `redraw` is for Av1an:
-    its progress bar is redrawn to fit the terminal (`progress`).
+    its progress bar is redrawn to fit the terminal (`progress`); `quiet` also
+    drops its progress reports and erases the bar at the end (`progress.QUIET`).
 
     The command gets a process group of its own, so that stopping it stops its
     children too: Av1an's ffmpeg and encoder processes would otherwise run on to
@@ -239,7 +241,7 @@ def run_watched(
     """
     log.debug("exec: %s", shlex.join(argv))
     env = {**child_env(extra_path), **(extra_env or {})}
-    relay = progress.Relay() if redraw and progress.usable(sys.stderr) else None
+    relay = progress.Relay(quiet=quiet) if redraw and progress.usable(sys.stderr) else None
     output = relay.child_fd if relay else None
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
