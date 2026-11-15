@@ -935,16 +935,16 @@ def _process_all(
             return "already transcoded", f"to {done.output}"
         if tried := ledger.standing_skip(source):
             if tried.settings in settings:
-                return "did not save enough before", tried.reason
+                return "tried but saved too little", tried.reason
             if tried.settings == skips:
-                return "skipped before", tried.reason
+                return "ruled out (codec, length, bitrate or Dolby Vision)", tried.reason
         # What check_skip would find once the file was probed, found without it: an
         # encode by another run (another machine, Docker), or one this ledger lost.
         if (output := output_for(source, cfg, roots)).exists():
-            return "output already there", str(output)
+            return "with an output already in place", str(output)
         guess = ledger.guess(source, sizes)
         if guess and (short := watch.shortfall(cfg, guess.source_bytes, guess.projected_bytes)):
-            return "estimated to fall short", f"would come out {short}"
+            return "estimated to save too little", f"would come out {short}"
         return None
 
     # The files earlier runs settled are counted first, so the count carries on

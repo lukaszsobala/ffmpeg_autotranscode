@@ -3206,8 +3206,8 @@ class TestEstimatesSteerTheRun(unittest.TestCase):
             pipeline._process_all(self.files, self.chain, self.cfg, self.ledger,
                                   pipeline.StopRequest())
         messages = [record.getMessage() for record in logs.records]
-        self.assertIn("2 of them dealt with before (1 already transcoded, 1 did not save "
-                      "enough before): carrying on from 3", messages)
+        self.assertIn("2 of them dealt with before (1 already transcoded, 1 tried but saved "
+                      "too little): carrying on from 3", messages)
         self.assertEqual([m for m in messages if m.startswith("[")],
                          [f"[3/4] {a}", f"[4/4] {c}"])
 
