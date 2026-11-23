@@ -27,7 +27,7 @@ from collections.abc import Collection, Iterator, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from . import encode, grain, mux, progress, resume, scenes, watch
+from . import encode, grain, mux, progress, resume, scenes, update, watch
 from .config import Config
 from .probe import MediaInfo, probe
 from .state import Ledger, Record
@@ -184,6 +184,21 @@ def under_way(sources: list[Path], cfg: Config) -> set[Path]:
                 or next(work.glob("scenes-*.parts/*.json"), None)):
             found.add(source)
     return found
+
+
+def started_films(cfg: Config) -> list[Path]:
+    """Every source with work under way in this work directory, found from the work
+    directories themselves, for when there is no library to look through."""
+    sources = []
+    for named in sorted(cfg.work_dir.glob(f"*/{SOURCE_FILE}")):
+        try:
+            source = Path(named.read_text(encoding="utf-8").strip())
+        except OSError:
+            continue
+        if source.name and named.parent.name == source_digest(source):
+            sources.append(source)
+    found = under_way(sources, cfg)
+    return [source for source in sources if source in found]
 
 
 class StopRequest:
@@ -961,6 +976,7 @@ def _process_all(
         else:
             todo.append(source)
     before = total - len(todo)
+    begun = under_way(todo, cfg)
     if before:
         log.info("%d of them dealt with before (%s): %s", before,
                  ", ".join(f"{count} {kind}" for kind, count
@@ -968,6 +984,10 @@ def _process_all(
                  f"carrying on from {before + 1}" if todo else "nothing left to do")
 
     for index, source in enumerate(todo, start=before + 1):
+        # A queued update installs before a film no run had started: those that
+        # were finish with the tools they were started with.
+        if not dry_run and source not in begun and update.queued(cfg):
+            raise update.InstallQueued
         log.info("[%d/%d] %s", index, total, source)
 
         try:

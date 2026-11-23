@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import datetime as dt
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,7 +21,9 @@ from . import (
     probe,
     sample,
     tools,
+    update,
     verify,
+    versions,
     watch,
 )
 from .state import Guess, Ledger
@@ -149,6 +152,18 @@ def build_parser() -> argparse.ArgumentParser:
                                 "and snapshots")
 
     sub.add_parser("doctor", help="check that the required tools are present and capable")
+
+    update_cmd = sub.add_parser(
+        "update",
+        help="say whether there is a newer autotranscode and which tools it updates, "
+             "and queue it to install once the film in progress is finished",
+    )
+    update_cmd.add_argument("--check", action="store_true",
+                            help="only say whether there is an update (exit code 1 if so)")
+    update_cmd.add_argument("-y", "--yes", action="store_true",
+                            help="queue it (or install it, with nothing to finish) "
+                                 "without asking")
+    update_cmd.add_argument("--cancel", action="store_true", help="unqueue a queued update")
     sub.add_parser("status", help="summarise the state ledger")
 
     return parser
@@ -178,17 +193,40 @@ def apply_overrides(cfg: config.Config, args: argparse.Namespace) -> None:
     config.validate(cfg)
 
 
+def require(chain: tools.Toolchain, cfg: config.Config) -> None:
+    """Everything a transcode needs: the tools, their capabilities, their versions."""
+    tools.require(chain, cfg)
+    versions.require(chain, cfg)
+
+
 def cmd_doctor(cfg: config.Config, chain: tools.Toolchain) -> int:
     print(f"profile     {cfg.machine.profile}")
     print(tools.describe(chain))
+    checks = versions.check(chain)
+    print(f"\nautotranscode {__version__} was tested with:")
+    print(versions.describe(checks))
     print()
+    failed = 0
     try:
         tools.require(chain, cfg)
     except tools.ToolError as exc:
         print(exc)
+        failed = 1
+    try:
+        versions.require(chain, cfg, checks)
+    except tools.ToolError as exc:
+        print(exc)
+        failed = 1
+    if stages := versions.fixes(checks):
+        print(f"\nTo install the tested versions: ./scripts/bootstrap.sh {stages}")
+    if failed:
         print("\nSee scripts/bootstrap.sh for a working install sequence.")
         return 1
-    print("All prerequisites satisfied.")
+    if any(item.failed and item.pin.enforce for item in checks):
+        print("All prerequisites present, at versions not tested "
+              "(tools.versions = \"warn\").")
+    else:
+        print("All prerequisites satisfied.")
     if not chain.has_grain_pipeline:
         print("Note: grain pipeline unavailable; encoding will proceed without it.")
     if broken := unusable_locale_vars():
@@ -427,6 +465,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return cmd_doctor(cfg, chain)
 
+    if args.command == "update":
+        # The new code checks the new toolchain, in a process of its own.
+        doctor = [sys.executable, "-m", "autotranscode",
+                  *(["-c", str(args.config)] if args.config else []), "doctor"]
+        return update.main(cfg, chain, check_only=args.check, yes=args.yes, cancel=args.cancel,
+                           doctor=lambda: subprocess.run(doctor, check=False).returncode)
+
     if args.command == "clean":
         return cmd_clean(args, cfg, chain)
 
@@ -455,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.pick_only:
             try:
-                tools.require(chain, cfg)
+                require(chain, cfg)
             except tools.ToolError as exc:
                 log.error("%s", exc)
                 return 2
@@ -476,16 +521,33 @@ def main(argv: list[str] | None = None) -> int:
 
     # run
     try:
-        tools.require(chain, cfg)
+        require(chain, cfg)
     except tools.ToolError as exc:
-        log.error("%s", exc)
-        log.error("run 'autotranscode doctor' for details")
+        if args.dry_run or not update.queued(cfg):
+            log.error("%s", exc)
+            log.error("run 'autotranscode doctor' for details")
+            return 2
+        # Nothing can be encoded with these tools, so there is no film to finish
+        # first: install the queued update now. It is unqueued as it starts, so a
+        # failing one is not tried again by the command it starts again.
+        log.warning("%s", exc)
+        try:
+            with pipeline.only_run(cfg):
+                update.install_queued(cfg, chain)
+        except pipeline.AlreadyRunning as running:
+            log.error("%s; not starting a second one", running)
+            return 1
         return 2
 
     # A dry run writes nothing, so it may look ahead while a run is going.
     try:
         with contextlib.nullcontext() if args.dry_run else pipeline.only_run(cfg):
-            return _run(args, cfg, chain)
+            try:
+                return _run(args, cfg, chain)
+            except update.InstallQueued:
+                # Still holding the work directory; exec starts this command again.
+                update.install_queued(cfg, chain)
+                return 0
     except pipeline.AlreadyRunning as exc:
         log.error("%s; not starting a second one", exc)
         return 1
@@ -505,6 +567,8 @@ def _run(args: argparse.Namespace, cfg: config.Config, chain: tools.Toolchain) -
     log.info("%d file(s) queued, profile=%s preset=%d crf=%s grain=%s",
              len(sources), cfg.machine.profile, cfg.encode.preset, crf, cfg.grain.mode)
 
+    if not args.dry_run and (note := update.queued_note(cfg)):
+        log.info("%s", note)
     started = pipeline.under_way(sources, cfg)
     sources, estimated = pipeline.by_estimate(sources, ledger, cfg, chain, started)
     if started:

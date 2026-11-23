@@ -65,3 +65,15 @@
  
          self.packet_out.extend_from_slice(data.as_raw_slice());
  
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -814,6 +814,9 @@
+ }
+ 
+ #[derive(Parser, Debug)]
++// Names the patched build, so autotranscode can tell it from a stock 0.2.0,
++// which has no --version at all.
++#[clap(version = concat!(env!("CARGO_PKG_VERSION"), "+autotranscode.1"))]
+ pub struct Args {
+     #[clap(subcommand)]
+     command: Commands,

@@ -320,6 +320,14 @@ class Library:
 
 
 @dataclass(slots=True)
+class Tools:
+    # "enforce": `run` and `sample` refuse a tool whose version toolchain.toml does
+    # not accept, where it says to enforce it. "warn": log it and run anyway, for
+    # trying a newer build on purpose.
+    versions: str = "enforce"
+
+
+@dataclass(slots=True)
 class Config:
     paths: Paths = field(default_factory=Paths)
     machine: Machine = field(default_factory=Machine)
@@ -332,6 +340,7 @@ class Config:
     subtitles: Subtitles = field(default_factory=Subtitles)
     output: Output = field(default_factory=Output)
     library: Library = field(default_factory=Library)
+    tools: Tools = field(default_factory=Tools)
 
     @property
     def work_dir(self) -> Path:
@@ -534,6 +543,8 @@ def validate(cfg: Config) -> None:
         raise ConfigError("library.min_bits_per_pixel cannot be negative")
     if cfg.library.on_changed_settings not in {"ask", "restart", "continue", "skip"}:
         raise ConfigError("library.on_changed_settings must be ask, restart, continue or skip")
+    if cfg.tools.versions not in {"enforce", "warn"}:
+        raise ConfigError("tools.versions must be enforce or warn")
     if cfg.grain.mode not in {"auto", "always", "never"}:
         raise ConfigError("grain.mode must be auto, always or never")
     if cfg.grain.analysis not in {"sampled", "full"}:

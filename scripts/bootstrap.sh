@@ -20,33 +20,33 @@
 
 set -euo pipefail
 
-# Pinned, not taken from a package manager: distribution packages lag far behind
-# (Debian 13 has 2.3.0, without the dark bias the 1080p setting depends on), and
-# a release can move quality at the same CRF. The per-resolution settings were
-# judged on 4.0.0; 4.2.0 matched them within 0.2 dB on the 1080p excerpts and
-# encodes 5-10% faster on ARM. 4.3.0 keeps every option and default they use; its
-# release claims 5-8% better efficiency across presets, not yet re-judged on the
-# excerpts. Re-check the CRF curve on a few excerpts when moving this.
-SVT_AV1_VERSION="${SVT_AV1_VERSION:-v4.3.0}"
-ZIMG_VERSION="${ZIMG_VERSION:-release-3.0.6}"
-# Pinned deliberately, not lazily. R73 onward added Vulkan GPU filters whose
-# gpufilter.h does not compile against Debian 13's Vulkan headers
-# ("invalid conversion from 'const void*' to 'void*'"), and switched to a Meson
-# build that makes Cython mandatory. R72 is the last autotools release without
-# that code, and since nothing here ever calls VapourSynth, newer buys us nothing.
-# (macOS takes Homebrew's VapourSynth instead, which builds there.)
-VAPOURSYNTH_VERSION="${VAPOURSYNTH_VERSION:-R72}"
-# The version autotranscode's Av1an flags and its ffmpeg shim were checked against
-# (see FFMPEG_SHIM in autotranscode/encode.py); its options change between releases.
-# 0.6.0 is tagged on GitHub but not on crates.io, whose newest is 0.5.2, so it is
-# built from the tag.
-AV1AN_VERSION="${AV1AN_VERSION:-0.6.0}"
-# Built from the crate with a local patch; see stage_grav1synth.
-GRAV1SYNTH_VERSION="${GRAV1SYNTH_VERSION:-0.2.0}"
-# L-SMASH-Works tags stopped in 2023; this is the commit last tested (2026-09).
-LSMASH_WORKS_COMMIT="${LSMASH_WORKS_COMMIT:-7e63c8400a252f4dbbeea80cc3bfec895abf12cf}"
-PREFIX="${PREFIX:-$HOME/.local}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The versions come from autotranscode/toolchain.toml, which also tells `doctor`
+# what to expect, and which says why each is pinned where it is. Beside this
+# script is where the Dockerfile puts a copy. Each can still be overridden from
+# the environment, and `doctor` will then report it as untested.
+TOOLCHAIN="${TOOLCHAIN:-$SCRIPT_DIR/../autotranscode/toolchain.toml}"
+[[ -f $TOOLCHAIN ]] || TOOLCHAIN="$SCRIPT_DIR/toolchain.toml"
+# The version = "..." of one [section] of it.
+pin() {
+  local value
+  value=$(awk -v section="[$1]" '
+    /^\[/ { inside = ($1 == section); next }
+    inside && $1 == "version" { sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit }
+  ' "$TOOLCHAIN" 2>/dev/null)
+  [[ -n $value ]] || { printf 'no [%s] version in %s\n' "$1" "$TOOLCHAIN" >&2; exit 1; }
+  printf '%s' "$value"
+}
+FFMPEG_MAJOR="${FFMPEG_MAJOR:-$(pin ffmpeg | cut -d. -f1)}"
+SVT_AV1_VERSION="${SVT_AV1_VERSION:-v$(pin svtav1)}"
+ZIMG_VERSION="${ZIMG_VERSION:-release-$(pin zimg)}"
+VAPOURSYNTH_VERSION="${VAPOURSYNTH_VERSION:-R$(pin vapoursynth)}"
+AV1AN_VERSION="${AV1AN_VERSION:-$(pin av1an)}"
+# "0.2.0+autotranscode.1": the crate's version, then the patch's revision, which
+# the patch builds into `grav1synth --version`.
+GRAV1SYNTH_VERSION="${GRAV1SYNTH_VERSION:-$(pin grav1synth | cut -d+ -f1)}"
+LSMASH_WORKS_COMMIT="${LSMASH_WORKS_COMMIT:-$(pin lsmash)}"
+PREFIX="${PREFIX:-$HOME/.local}"
 BUILD_DIR="${BUILD_DIR:-$HOME/.cache/autotranscode-build}"
 # Sources and build trees are deleted once a stage has installed: nothing that runs
 # needs them, and they come to over 500 MB. KEEP_BUILD_DIR=1 keeps them, to look
@@ -125,10 +125,14 @@ install_portable_ffmpeg() {
     linux/x86_64)           platform=linux64 ;;
     *) die "no portable jellyfin-ffmpeg build for $OS/$(uname -m)" ;;
   esac
+  # The newest release of the pinned major: releases come newest first. sed, not
+  # head, reads to the end, so nothing upstream dies of SIGPIPE under pipefail.
   local url
-  url=$(curl -fsSL https://api.github.com/repos/jellyfin/jellyfin-ffmpeg/releases/latest \
-        | grep -o "https://[^\"]*_portable_${platform}-gpl\.tar\.xz" | head -1)
-  [[ -n $url ]] || die "could not find the ${platform} build in jellyfin-ffmpeg's latest release"
+  url=$(curl -fsSL "https://api.github.com/repos/jellyfin/jellyfin-ffmpeg/releases?per_page=50" \
+        | grep -o "https://[^\"]*_${FFMPEG_MAJOR}\.[^\"]*_portable_${platform}-gpl\.tar\.xz" \
+        | sed -n 1p)
+  [[ -n $url ]] || die "could not find a ${platform} build of jellyfin-ffmpeg ${FFMPEG_MAJOR} \
+in its recent releases"
   local dest="$PREFIX/lib/jellyfin-ffmpeg"
   log "Downloading ${url##*/} into ${dest}"
   mkdir -p "$dest"
@@ -141,7 +145,7 @@ install_portable_ffmpeg() {
 }
 
 stage_ffmpeg() {
-  log "Installing jellyfin-ffmpeg (has tonemapx and libvmaf, and rkmpp on Rockchip boards)"
+  log "Installing jellyfin-ffmpeg ${FFMPEG_MAJOR} (has tonemapx and libvmaf, and rkmpp on Rockchip boards)"
   FFMPEG_BIN=/usr/lib/jellyfin-ffmpeg/ffmpeg
   if [[ $OS == mac ]]; then
     install_portable_ffmpeg
@@ -167,14 +171,14 @@ stage_ffmpeg() {
         | as_root gpg --dearmor --yes -o /etc/apt/keyrings/jellyfin.gpg
       echo "deb [signed-by=/etc/apt/keyrings/jellyfin.gpg arch=${arch}] https://repo.jellyfin.org/${id} ${codename} main" \
         | as_root tee /etc/apt/sources.list.d/jellyfin.sources.list >/dev/null
-      if as_root apt-get update; then
-        # The highest major available, rather than a name that changes every
-        # release (jellyfin-ffmpeg6, 7, 8, ...).
-        pkg=$(apt-cache search --names-only '^jellyfin-ffmpeg[0-9]+$' \
-              | awk '{print $1}' | sort -V | tail -1)
+      # The pinned major, not the newest: a new major is a new toolchain, which
+      # toolchain.toml moves to once it has been tried.
+      if as_root apt-get update \
+          && apt-cache show "jellyfin-ffmpeg${FFMPEG_MAJOR}" >/dev/null 2>&1; then
+        pkg="jellyfin-ffmpeg${FFMPEG_MAJOR}"
       fi
       if [[ -z $pkg ]]; then
-        warn "Jellyfin's repository has nothing for ${id} ${codename}; removing it"
+        warn "Jellyfin's repository has no jellyfin-ffmpeg${FFMPEG_MAJOR} for ${id} ${codename}; removing it"
         as_root rm -f /etc/apt/sources.list.d/jellyfin.sources.list
         as_root apt-get update
       fi
@@ -319,7 +323,9 @@ stage_lsmash() {
   [[ -n $built ]] || die "the plugin did not build"
   mkdir -p "$plugins"
   install -m 755 "$built" "$plugins/"
-  log "Installed $(basename "$built") into ${plugins}"
+  # The plugin carries no version; this is how `doctor` knows which it is.
+  printf '%s\n' "$LSMASH_WORKS_COMMIT" > "$plugins/LSMASHSource.commit"
+  log "Installed $(basename "$built") (${LSMASH_WORKS_COMMIT:0:12}) into ${plugins}"
   done_with "$src"
 }
 
@@ -337,6 +343,7 @@ stage_av1an() {
   if [[ $OS == mac ]]; then
     brew install av1an
     outside_venv av1an --version | head -1
+    warn "This is Homebrew's Av1an, not necessarily ${AV1AN_VERSION}; \`autotranscode doctor\` says."
     return
   fi
   ensure_cargo
@@ -367,7 +374,7 @@ stage_grav1synth() {
     | tar -xz -C "$BUILD_DIR"
   patch -d "$src" -p1 < "$SCRIPT_DIR/grav1synth-${GRAV1SYNTH_VERSION}-grain-flag.patch"
   cargo install --path "$src" --locked --force
-  grav1synth --help >/dev/null 2>&1 || warn "grav1synth installed but --help failed"
+  grav1synth --version || warn "grav1synth installed but --version failed"
   done_with "$src"
 }
 

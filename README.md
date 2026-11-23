@@ -37,17 +37,22 @@ silicon or Intel):
 
 | | Debian / Ubuntu | macOS |
 |---|---|---|
-| jellyfin-ffmpeg | Jellyfin's apt repository; its portable build where the repository has no packages | its portable build, into `~/.local/lib/jellyfin-ffmpeg` |
+| jellyfin-ffmpeg 8 | Jellyfin's apt repository; its portable build where the repository has no packages | its portable build, into `~/.local/lib/jellyfin-ffmpeg` |
 | SVT-AV1 4.3.0 | built from source into `~/.local` | built from source into `~/.local` |
 | VapourSynth (Av1an will not link without it) | built from source into `~/.local` | Homebrew |
 | L-SMASH-Works VapourSynth plugin, for the `lsmash` chunk method | built from source into `~/.local/lib/vapoursynth` | built from source into Homebrew's plugin folder |
-| Av1an 0.6.0 | `cargo install` from its git tag | Homebrew |
+| Av1an 0.6.0 | `cargo install` from its git tag | Homebrew, whichever version it has (`doctor` says whether it is 0.6.0) |
 | grav1synth 0.2.0, patched | built from the crate with `scripts/grav1synth-0.2.0-grain-flag.patch` | the same |
 | mkvtoolnix, Python 3.11+ | apt | Homebrew |
 
-SVT-AV1 and grav1synth are pinned and patched for reasons given in
-[TECHNICAL.md](TECHNICAL.md#toolchain-choices). `doctor` and `run` refuse an
-encoder missing an option the configured quality relies on. On macOS, Homebrew's
+Every version comes from [autotranscode/toolchain.toml](autotranscode/toolchain.toml):
+one autotranscode release, one tested toolchain. `doctor` shows how the installed
+tools compare and which `bootstrap.sh` stages would bring them in line, and `run`
+refuses an untested SVT-AV1, Av1an, grav1synth or jellyfin-ffmpeg major (see
+[TECHNICAL.md](TECHNICAL.md#one-version-one-toolchain); `[tools] versions =
+"warn"` runs anyway). `autotranscode update` moves both forward together; see
+[Updating](#updating). `doctor` and `run` also refuse an encoder missing an option the configured
+quality relies on. On macOS, Homebrew's
 ffmpeg brings its own SVT-AV1 onto `PATH`; the script says so, and
 `paths.svtav1encapp` should then name the pinned build.
 
@@ -169,7 +174,8 @@ honoured). `-c` overrides it; with neither, the built-in defaults apply.
 
 | Command | Purpose |
 |---|---|
-| `doctor` | Check tools and capabilities; explain what is missing |
+| `doctor` | Check tools, capabilities and versions against the tested toolchain; explain what is missing and which `bootstrap.sh` stages fix it |
+| `update` | Say whether there is a newer version and which tools it updates; queue it to install once the film in progress is finished (`--check` only says, `--cancel` unqueues) |
 | `measure` | The old grain detector's scores (only for `grain.estimator = "grav1synth"`) |
 | `estimate` | Encode a few short excerpts per file and rank a library by what is worth transcoding; `run` then follows that ranking |
 | `verify` | Score an encode against its source where the eye looks: low-pass PSNR, grain retained, worst-frame snapshots |
@@ -333,6 +339,40 @@ whose output is already where this run would write it, from another machine or
 container, counts as settled too, and is not opened. Outputs written beside their
 sources are left out of the queue.
 
+### Updating
+
+```bash
+autotranscode update            # is there a newer version? queue it
+autotranscode update --check    # only say; exit code 1 when there is one
+autotranscode update --cancel   # unqueue it
+```
+
+```
+autotranscode 0.3.0 is available (this is 0.2.0).
+It updates: SVT-AV1 4.3.0 -> 4.4.0, Av1an 0.6.0 -> 0.7.0
+Queue it to install after the run (pid 4242) finishes Film (1975).mkv? [Y/n]
+```
+
+An update is a newer release (see
+[TECHNICAL.md](TECHNICAL.md#releases)); work on `main` between releases is not
+offered. Something is nearly always encoding, so an update is queued rather than installed
+under a run. The run going on, or the next `run` when the encode is stopped,
+finishes the film it is on with the tools it started it with, then pulls the new
+version, rebuilds the tools that need it (their output goes to
+`update.log` in the work directory), and starts its own command again, updated.
+It does this unattended, in a terminal, `screen` or a systemd unit alike. Only
+the tools `bootstrap.sh` builds into `~/.local` take part: jellyfin-ffmpeg and
+mkvmerge come from apt, which keeps them current. With nothing started at all,
+`update` installs straight away instead, and so it does when the installed tools
+are ones no run would encode with, since then nothing could finish first.
+
+A checkout with commits of its own or uncommitted changes is left alone, with a
+note on what to do. If a build fails, the run starts again anyway and, with tools
+other than the tested ones, refuses to encode, saying why. A version with no new
+tools needs no rebuild; `update` also offers to rebuild tools that are not the
+tested ones when there is no new version. In Docker, update the checkout on the
+host and rebuild the image instead.
+
 ### Cleaning up
 
 A film's work directory holds its chunks, tens of gigabytes for 4K. A run removes
@@ -459,6 +499,16 @@ python3 -m unittest discover -s tests -v
 ```
 
 Stdlib-only, so it runs on a bare board with no extra installs.
+
+## Releasing
+
+```bash
+scripts/release.sh 0.3.0 --push
+```
+
+Sets the version, runs the tests, tags `v0.3.0` and pushes it; machines running an
+older release then see it in `autotranscode update`. Release whenever
+`toolchain.toml` changes. See [TECHNICAL.md](TECHNICAL.md#releases).
 
 ## Configuration
 

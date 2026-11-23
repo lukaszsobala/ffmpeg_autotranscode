@@ -366,6 +366,69 @@ profile 5, but needs a Vulkan device the RK3588's Mali GPU does not provide.
 
 ## Toolchain choices
 
+### One version, one toolchain
+
+[autotranscode/toolchain.toml](autotranscode/toolchain.toml) names the version of
+every tool this release of autotranscode was tested with. `scripts/bootstrap.sh`
+installs from it, and `doctor` compares what is installed against it, so the
+installer and the app cannot drift apart. Changing a pin calls for a release.
+
+Passing on capability is not enough. An SVT-AV1 with every option the settings
+use can still be a release whose CRF lands elsewhere, and an Av1an that runs can
+still read its flags differently. So each pin says what else passes for it:
+
+| Tool | Accepts | Enforced |
+|---|---|---|
+| SVT-AV1, Av1an | that version only | yes |
+| grav1synth | that version, built with the patch | yes |
+| jellyfin-ffmpeg | its major, at that release or newer (Jellyfin's repository keeps only the newest) | yes |
+| VapourSynth | that release or newer (macOS takes Homebrew's) | no |
+| L-SMASH-Works | that commit | no |
+| mkvmerge, zimg | anything | no |
+
+Enforced means `run` and `sample` refuse to start; `doctor` reports all of them,
+with the `bootstrap.sh` stages that would put them right. `[tools] versions =
+"warn"` runs anyway, for trying a newer build on purpose.
+
+Two of them cannot say what they are. Stock grav1synth has no `--version`, so the
+patch adds one that names itself (`0.2.0+autotranscode.1`), which also tells a
+patched build from a stock one. The L-SMASH-Works plugin carries no version at all;
+bootstrap writes the commit it built into `LSMASHSource.commit` beside it, and
+`doctor` finds it through the path VapourSynth loaded the plugin from.
+
+### Releases
+
+A release is an annotated tag `vX.Y.Z` on `main`, on the commit whose
+`__version__` is X.Y.Z. `update` reads only those: it fetches the tags, takes the
+highest version, reads that tag's `toolchain.toml` to say which tools it rebuilds,
+and installs it by fast-forwarding the checkout's branch to the tag. Commits on
+`main` after the last release reach no machine until the next one, so `main` can
+carry unfinished work.
+
+`scripts/release.sh X.Y.Z` cuts one: from a clean `main` that is not behind
+`origin/main`, with X.Y.Z above the last release, it sets `__version__`, runs the
+tests (and stops if they fail), commits, and tags, with the tools that changed
+since the last release in the tag's message. `--push` pushes `main` and the tag
+and, with `gh` installed, makes a GitHub release page from the same text. The tag
+is what counts; the page is for people.
+
+### How a queued update is installed
+
+`update` writes `update.queued` into the work directory and nothing else. `run`
+notes the films that already had work under way when it began, which go first.
+Before each film it checks for the file, and before any film not among those, it
+installs the update instead of starting it. So a film is only ever encoded by
+one toolchain: the half-done one finishes on the old tools, and only new films
+meet the new ones.
+
+To install, the run removes the file (a failed build is not retried before every
+film), fast-forwards the checkout, runs the bootstrap stages that the new
+`toolchain.toml` and the installed tools disagree on, apt's left out, with their
+output in `update.log`, and execs its own command line again (`sys.orig_argv`). It
+holds `run.lock` throughout, so nothing else starts meanwhile. Python opens files
+close-on-exec, so the lock goes with the old image and the new one takes it, and
+the log file is opened for appending, so the log carries on.
+
 ### Why SVT-AV1 is pinned
 
 Distributions lag far behind: Debian 13 ships 2.3.0, which lacks the dark bias that
@@ -394,7 +457,9 @@ limited-range film; on a full-range phone clip it crushed the shadows and clippe
 the highlights. The patch clips only when the stream is limited range.
 
 A grav1synth from plain `cargo install` still works for limited-range sources at
-any other size.
+any other size, but `run` refuses it: it has no `--version`, which the patch adds,
+so there is no telling it from the broken build. `tools.versions = "warn"` lets it
+through.
 
 ### Why chunks come from L-SMASH-Works
 

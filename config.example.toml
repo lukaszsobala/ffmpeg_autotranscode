@@ -298,3 +298,10 @@ recursive = true
 # with the ones it started with; "skip" leaves it for now. A changed source always
 # starts again.
 on_changed_settings = "ask"
+
+[tools]
+# autotranscode/toolchain.toml names the tool versions this release was tested
+# with; `doctor` shows how the installed ones compare. "enforce" refuses to run
+# with an untested SVT-AV1, Av1an, grav1synth or jellyfin-ffmpeg major; "warn"
+# logs it and runs anyway, for trying a newer build on purpose.
+versions = "enforce"

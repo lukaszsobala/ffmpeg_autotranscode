@@ -47,6 +47,13 @@ class Toolchain:
     ffmpeg_version: str = ""
     svtav1_version: str = ""
     av1an_version: str = ""
+    # "0.2.0+autotranscode.1" from the patched build; "" from any other, which has
+    # no --version. See versions.py.
+    grav1synth_version: str = ""
+    mkvmerge_version: str = ""
+    vapoursynth_version: str = ""
+    # The L-SMASH-Works commit bootstrap recorded beside the plugin, or "".
+    lsmash_commit: str = ""
 
     # Reported by `doctor` to identify the ffmpeg build; nothing here consumes it.
     # See "Why there is no hardware acceleration" in the README before wiring it up.
@@ -65,6 +72,8 @@ class Toolchain:
     vspipe: str | None = None
     # Namespaces of the VapourSynth plugins that actually load ("lsmas", "ffms2").
     vapoursynth_plugins: set[str] = field(default_factory=set)
+    # Where each of them was loaded from, where VapourSynth says.
+    vapoursynth_plugin_paths: dict[str, str] = field(default_factory=dict)
 
     # ---- capability helpers -------------------------------------------------
 
@@ -224,9 +233,18 @@ def detect(cfg: Config) -> Toolchain:
             chain.svtav1_version = match.group(1)
         chain.svt_options = set(re.findall(r"--[a-z0-9][a-z0-9-]+", _capture([svt, "--help"])))
 
+    if chain.grav1synth and (
+        match := re.search(r"grav1synth\s+v?(\d\S*)", _capture([chain.grav1synth, "--version"]))
+    ):
+        chain.grav1synth_version = match.group(1)
+    if chain.mkvmerge and (
+        match := re.search(r"mkvmerge\s+v?(\d\S*)", _capture([chain.mkvmerge, "--version"]))
+    ):
+        chain.mkvmerge_version = match.group(1)
+
     chain.vspipe = _find_vspipe(chain)
     if chain.vspipe:
-        chain.vapoursynth_plugins = _vapoursynth_plugins(chain)
+        _probe_vapoursynth(chain)
     chain.big_cores = _big_cores() if shutil.which("taskset") else ""
     return chain
 
@@ -267,13 +285,23 @@ def _missing_svt_options(chain: Toolchain, cfg: Config) -> list[str]:
 # Av1an's VapourSynth chunk methods, and the plugin namespace each needs.
 VAPOURSYNTH_CHUNK_METHODS = {"lsmash": "lsmas", "ffms2": "ffms2", "bestsource": "bs"}
 
-# Loads nothing; reports which plugins VapourSynth found and could load.
+# Loads nothing; reports VapourSynth's release and which plugins it found and
+# could load, with where from.
 _PLUGIN_PROBE = """\
 import sys
 from vapoursynth import core
-sys.stderr.write("plugins: " + " ".join(p.namespace for p in core.plugins()) + "\\n")
+version = getattr(core, "core_version", None)
+sys.stderr.write("release: %s\\n"
+                 % (version.release_major if version else core.version_number()))
+for plugin in core.plugins():
+    sys.stderr.write("plugin: %s %s\\n"
+                     % (plugin.namespace, getattr(plugin, "plugin_path", "") or ""))
 core.std.BlankClip(length=1).set_output()
 """
+
+# Written by scripts/bootstrap.sh beside the L-SMASH-Works plugin, which carries
+# no version of its own: the commit it was built from.
+LSMASH_COMMIT_FILE = "LSMASHSource.commit"
 
 
 def _find_vspipe(chain: Toolchain) -> str | None:
@@ -287,14 +315,30 @@ def _find_vspipe(chain: Toolchain) -> str | None:
     return next((str(p / "vspipe") for p in places if (p / "vspipe").is_file()), None)
 
 
-def _vapoursynth_plugins(chain: Toolchain) -> set[str]:
+def _probe_vapoursynth(chain: Toolchain) -> None:
     assert chain.vspipe is not None
     with tempfile.TemporaryDirectory() as tmp:
         script = Path(tmp) / "plugins.vpy"
         script.write_text(_PLUGIN_PROBE, encoding="utf-8")
         output = _capture([chain.vspipe, "--info", str(script)], chain.bin_dirs)
-    match = re.search(r"^plugins: (.*)$", output, re.MULTILINE)
-    return set(match.group(1).split()) if match else set()
+    read_vapoursynth_probe(chain, output)
+
+
+def read_vapoursynth_probe(chain: Toolchain, output: str) -> None:
+    """Fill in what _PLUGIN_PROBE reported."""
+    if match := re.search(r"^release: (\d+)$", output, re.MULTILINE):
+        chain.vapoursynth_version = match.group(1)
+    for line in re.findall(r"^plugin: (.*)$", output, re.MULTILINE):
+        namespace, _, path = line.partition(" ")
+        chain.vapoursynth_plugins.add(namespace)
+        if path:
+            chain.vapoursynth_plugin_paths[namespace] = path
+    if plugin := chain.vapoursynth_plugin_paths.get("lsmas"):
+        try:
+            recorded = (Path(plugin).parent / LSMASH_COMMIT_FILE).read_text(encoding="utf-8")
+        except OSError:
+            recorded = ""
+        chain.lsmash_commit = recorded.strip()
 
 
 def require(chain: Toolchain, cfg: Config) -> None:
@@ -346,10 +390,11 @@ def describe(chain: Toolchain) -> str:
         f"ffprobe     {chain.ffprobe}",
         f"av1an       {chain.av1an or 'MISSING'}  ({chain.av1an_version or '-'})",
         f"svtav1      {chain.svtav1encapp or 'MISSING'}  ({chain.svtav1_version or '-'})",
-        f"grav1synth  {chain.grav1synth or 'MISSING'}",
-        f"mkvmerge    {chain.mkvmerge or 'MISSING'}",
+        f"grav1synth  {chain.grav1synth or 'MISSING'}  ({chain.grav1synth_version or '-'})",
+        f"mkvmerge    {chain.mkvmerge or 'MISSING'}  ({chain.mkvmerge_version or '-'})",
         f"vapoursynth {chain.vspipe or 'no'}  "
-        f"(plugins: {' '.join(sorted(chain.vapoursynth_plugins)) or 'none'})",
+        f"(R{chain.vapoursynth_version or '?'}; "
+        f"plugins: {' '.join(sorted(chain.vapoursynth_plugins)) or 'none'})",
         f"hdr10 meta  {'yes' if chain.has_hdr10_metadata else 'no'}  "
         "(--mastering-display / --content-light)",
         f"ac-bias     {'yes' if '--ac-bias' in chain.svt_options else 'no'}  (for 4K and 1080p)",

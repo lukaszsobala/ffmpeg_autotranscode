@@ -6,6 +6,7 @@ Deliberately stdlib-only (unittest, no pytest) so this runs on a bare board:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import io
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any, ClassVar, TypeVar
 
 from autotranscode import (
+    __version__,
     clean,
     cli,
     config,
@@ -42,8 +44,10 @@ from autotranscode import (
     sample,
     scenes,
     tools,
+    update,
     util,
     verify,
+    versions,
     watch,
 )
 from autotranscode.grain import DENOISE_LADDER, GrainReport, flatten_table
@@ -832,7 +836,7 @@ class TestOneRunPerWorkDir(unittest.TestCase):
         settings.write_text(f'[paths]\nwork_dir = "{self.cfg.paths.work_dir}"\n'
                             f'state_file = "{self.root / "state.json"}"\n', encoding="utf-8")
         source = self.root / "Film (1975).mkv"
-        with unittest.mock.patch.object(cli.tools, "detect", return_value=make_chain()), \
+        with unittest.mock.patch.object(cli.tools, "detect", return_value=tested_chain()), \
                 unittest.mock.patch.object(cli.tools, "require"), \
                 unittest.mock.patch.object(cli.pipeline, "discover", return_value=[source]), \
                 unittest.mock.patch.object(cli.pipeline, "process_all", return_value=0,
@@ -998,9 +1002,12 @@ class TestStopAndResume(unittest.TestCase):
             raise KeyboardInterrupt
 
         self._stub_encode(encoded)
+        # Python 3.14's shutil tries copy_file_range before sendfile; keep it to the
+        # one this patches.
         with unittest.mock.patch.object(pipeline.mux, "mux", fake_mux), \
                 unittest.mock.patch("os.rename", across_filesystems), \
                 unittest.mock.patch("os.sendfile", half_then_stop), \
+                unittest.mock.patch("shutil._USE_CP_COPY_FILE_RANGE", False, create=True), \
                 self.assertRaises(KeyboardInterrupt):
             pipeline.process_one(self.source, make_chain(), self.cfg)
 
@@ -2296,6 +2303,493 @@ class TestEncoderCapabilities(unittest.TestCase):
         cfg.encode.ac_bias = 0.0
         cfg.encode.tf_strength = {"3000": -1}
         self.assertEqual(self.problems(set(), cfg), "")
+
+
+def tested_chain(**overrides: Any) -> Toolchain:
+    """A chain at exactly the versions toolchain.toml names."""
+    pins = versions.load()
+    base: dict[str, Any] = dict(
+        ffmpeg_version=f"{pins['ffmpeg'].version}-Jellyfin",
+        svtav1_version=pins["svtav1"].version,
+        av1an_version=f"{pins['av1an'].version}-unstable",
+        grav1synth_version=pins["grav1synth"].version,
+        mkvmerge_version="92.0", vspipe="vspipe",
+        vapoursynth_version=pins["vapoursynth"].version,
+        vapoursynth_plugins={"lsmas", "std"}, lsmash_commit=pins["lsmash"].version,
+    )
+    base.update(overrides)
+    return make_chain(**base)
+
+
+class TestToolchainVersions(unittest.TestCase):
+    """One autotranscode version, one toolchain: doctor and run say when it is not."""
+
+    def pin(self, version: str, accept: str, enforce: bool = True) -> versions.Pin:
+        return versions.Pin("tool", version, accept, enforce, "tool")
+
+    def test_the_manifest_is_complete(self):
+        pins = versions.load()
+        bootstrap = (Path(__file__).parent.parent / "scripts" / "bootstrap.sh").read_text()
+        stages = re.search(r"stages=\((deps [^)]*)\)", bootstrap).group(1).split()
+        for name, pin in pins.items():
+            self.assertIn(pin.stage, stages, name)
+        # Every tool versions.py reads has a pin; zimg is only built for VapourSynth.
+        self.assertEqual(set(versions.installed_versions(make_chain())) | {"zimg"}, set(pins))
+
+    def test_bootstrap_reads_the_same_versions(self):
+        script = Path(__file__).parent.parent / "scripts" / "bootstrap.sh"
+        lines = script.read_text().splitlines()
+        first = next(i for i, line in enumerate(lines) if line.startswith("SCRIPT_DIR="))
+        last = next(i for i, line in enumerate(lines) if line.startswith("LSMASH_WORKS_COMMIT="))
+        header = "\n".join(lines[first:last + 1])
+        names = ["FFMPEG_MAJOR", "SVT_AV1_VERSION", "ZIMG_VERSION", "VAPOURSYNTH_VERSION",
+                 "AV1AN_VERSION", "GRAV1SYNTH_VERSION", "LSMASH_WORKS_COMMIT"]
+        env = {key: value for key, value in os.environ.items() if key not in names}
+        env["TOOLCHAIN"] = str(versions.MANIFEST)
+        with tempfile.TemporaryDirectory() as tmp:
+            pins_sh = Path(tmp) / "pins.sh"
+            pins_sh.write_text("set -euo pipefail\n" + header + "\n"
+                               + "".join(f'echo "${name}"\n' for name in names))
+            out = subprocess.run(["bash", str(pins_sh)], capture_output=True, text=True,
+                                 check=True, env=env).stdout.split()
+        pins = versions.load()
+        self.assertEqual(out, [
+            pins["ffmpeg"].version.split(".")[0], f"v{pins['svtav1'].version}",
+            f"release-{pins['zimg'].version}", f"R{pins['vapoursynth'].version}",
+            pins["av1an"].version, pins["grav1synth"].version.split("+")[0],
+            pins["lsmash"].version,
+        ])
+
+    def test_the_patch_names_the_build_the_manifest_expects(self):
+        version = versions.load()["grav1synth"].version
+        crate, _, revision = version.partition("+")
+        patch = (Path(__file__).parent.parent / "scripts"
+                 / f"grav1synth-{crate}-grain-flag.patch").read_text()
+        self.assertIn(f'"+{revision}"', patch)
+
+    def test_exact(self):
+        pin = self.pin("0.6.0", "exact")
+        self.assertEqual(versions.compare(pin, "0.6.0-unstable"), "ok")
+        self.assertEqual(versions.compare(pin, "0.6"), "ok")
+        self.assertEqual(versions.compare(pin, "0.5.2-unstable"), "older")
+        self.assertEqual(versions.compare(pin, "0.6.1"), "newer")
+
+    def test_exact_with_a_patch_needs_the_patch(self):
+        pin = self.pin("0.2.0+autotranscode.1", "exact")
+        self.assertEqual(versions.compare(pin, "0.2.0+autotranscode.1"), "ok")
+        self.assertEqual(versions.compare(pin, "0.2.0+autotranscode.2"), "different")
+        self.assertEqual(versions.compare(pin, "0.2.0"), "different")
+        # A stock build has no --version at all.
+        self.assertEqual(versions.compare(pin, ""), "unknown")
+
+    def test_same_major(self):
+        pin = self.pin("8.1.3", "same-major")
+        self.assertEqual(versions.compare(pin, "8.1.3-Jellyfin"), "ok")
+        self.assertEqual(versions.compare(pin, "8.2.0-Jellyfin"), "ok")
+        self.assertEqual(versions.compare(pin, "8.0.1-Jellyfin"), "older")
+        self.assertEqual(versions.compare(pin, "7.1.2-Jellyfin"), "older")
+        self.assertEqual(versions.compare(pin, "9.0-Jellyfin"), "newer")
+
+    def test_at_least_and_untracked(self):
+        self.assertEqual(versions.compare(self.pin("72", "at-least"), "73"), "ok")
+        self.assertEqual(versions.compare(self.pin("72", "at-least"), "71"), "older")
+        self.assertEqual(versions.compare(self.pin("97.0", "untracked"), "61.0"), "ok")
+        self.assertEqual(versions.compare(self.pin("97.0", "untracked"), ""), "ok")
+
+    def test_a_commit(self):
+        pin = self.pin("7e63c8400a252f4dbbeea80cc3bfec895abf12cf", "exact")
+        self.assertEqual(versions.compare(pin, "7e63c8400a252f4dbbeea80cc3bfec895abf12cf"), "ok")
+        self.assertEqual(versions.compare(pin, "7e63c84"), "ok")
+        self.assertEqual(versions.compare(pin, "0123abc"), "different")
+        self.assertEqual(versions.compare(pin, ""), "unknown")
+
+    def test_missing_is_left_to_the_capability_checks(self):
+        check = versions.Check(self.pin("1.0", "exact"), None,
+                               versions.compare(self.pin("1.0", "exact"), None))
+        self.assertEqual(check.status, "missing")
+        self.assertFalse(check.failed)
+
+    def test_the_tested_toolchain_passes(self):
+        checks = versions.check(tested_chain())
+        self.assertEqual({c.pin.name: c.status for c in checks if c.status != "ok"}, {})
+        versions.require(tested_chain(), config.Config(), checks)
+        self.assertEqual(versions.fixes(checks), "")
+
+    def test_an_untested_encoder_stops_the_run(self):
+        chain = tested_chain(av1an_version="0.5.2-unstable", grav1synth_version="")
+        with self.assertRaises(tools.ToolError) as caught:
+            versions.require(chain, config.Config())
+        message = str(caught.exception)
+        self.assertIn("av1an 0.5.2-unstable is older", message)
+        self.assertIn("scripts/bootstrap.sh av1an", message)
+        self.assertIn("grav1synth: cannot tell", message)
+        self.assertEqual(versions.fixes(versions.check(chain)), "av1an grav1synth")
+
+    def test_warn_runs_anyway(self):
+        cfg = config.Config()
+        cfg.tools.versions = "warn"
+        with self.assertLogs(util.log, "WARNING") as logs:
+            versions.require(tested_chain(svtav1_version="4.4.0"), cfg)
+        self.assertIn("svtav1 4.4.0 is newer", logs.output[0])
+
+    def test_what_is_not_enforced_is_only_reported(self):
+        chain = tested_chain(lsmash_commit="", vapoursynth_version="70")
+        checks = versions.check(chain)
+        versions.require(chain, config.Config(), checks)
+        self.assertEqual(versions.fixes(checks), "vapoursynth lsmash")
+        self.assertIn("UNKNOWN (not enforced)", versions.describe(checks))
+
+    def test_run_refuses_an_untested_toolchain_before_any_film(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Path(tmp) / "config.toml"
+            settings.write_text(f'[paths]\nwork_dir = "{tmp}/work"\n', encoding="utf-8")
+            chain = tested_chain(av1an_version="0.5.2-unstable")
+            with unittest.mock.patch.object(cli.tools, "detect", return_value=chain), \
+                    unittest.mock.patch.object(cli.tools, "require"), \
+                    unittest.mock.patch.object(cli.pipeline, "process_all") as process_all, \
+                    self.assertLogs(util.log, "ERROR") as logged:
+                code = cli.main(["-c", str(settings), "run", str(Path(tmp) / "a.mkv")])
+        self.assertEqual(code, 2)
+        process_all.assert_not_called()
+        self.assertIn("av1an 0.5.2-unstable is older", "\n".join(logged.output))
+
+    def test_an_unknown_setting_is_refused(self):
+        cfg = config.Config()
+        cfg.tools.versions = "ignore"
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
+
+    def test_the_vapoursynth_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = Path(tmp) / "libLSMASHSource.so"
+            plugin.touch()
+            (Path(tmp) / tools.LSMASH_COMMIT_FILE).write_text("7e63c84\n")
+            chain = make_chain()
+            tools.read_vapoursynth_probe(chain, (
+                "Warning: something\nrelease: 72\n"
+                f"plugin: lsmas {plugin}\nplugin: std \nOutput Index: 0\n"))
+        self.assertEqual(chain.vapoursynth_version, "72")
+        self.assertEqual(chain.vapoursynth_plugins, {"lsmas", "std"})
+        self.assertEqual(chain.lsmash_commit, "7e63c84")
+
+    def test_a_plugin_built_before_the_record_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            chain = make_chain()
+            tools.read_vapoursynth_probe(chain, f"release: 72\nplugin: lsmas {tmp}/x.so\n")
+        self.assertEqual(chain.lsmash_commit, "")
+
+
+GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def next_version(version: str) -> str:
+    """One patch release on: whatever a pin is now, a release that moves it."""
+    *head, last = version.split(".")
+    return ".".join([*head, str(int(last) + 1)])
+
+
+NEXT_AV1AN = next_version(versions.load()["av1an"].version)
+
+
+class TestUpdate(unittest.TestCase):
+    """`update` says whether there is a newer version and which tools it updates, and
+    queues it; `run` installs it before a film no run had started."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = config.Config()
+        self.cfg.paths.work_dir = str(self.root / "work")
+        patcher = unittest.mock.patch.dict(os.environ, GIT_ENV)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        upstream = self.root / "upstream"
+        (upstream / "autotranscode").mkdir(parents=True)
+        (upstream / "scripts").mkdir()
+        (upstream / "autotranscode" / "__init__.py").write_text(f'__version__ = "{__version__}"\n')
+        shutil.copy(versions.MANIFEST, upstream / "autotranscode" / versions.MANIFEST.name)
+        # Records the stages it is asked for.
+        (upstream / "scripts" / "bootstrap.sh").write_text(
+            f'echo "$@" >> "{self.root / "stages"}"\n')
+        self.git(upstream, "init", "-q", "-b", "main")
+        self.git(upstream, "add", ".")
+        self.git(upstream, "commit", "-qm", "first")
+        self.local = self.root / "local"
+        self.git(self.root, "clone", "-q", str(upstream), str(self.local))
+        self.upstream = upstream
+
+    def git(self, where: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(where), *args], check=True, text=True,
+                              capture_output=True).stdout
+
+    def release(self, version: str = "9.9.9", *, tag: bool = True, **pins: str) -> None:
+        (self.upstream / "autotranscode" / "__init__.py").write_text(
+            f'__version__ = "{version}"\n')
+        manifest = self.upstream / "autotranscode" / versions.MANIFEST.name
+        text, ours = manifest.read_text(), versions.load()
+        for name, value in (pins or {"av1an": NEXT_AV1AN}).items():
+            text = text.replace(f'version = "{ours[name].version}"', f'version = "{value}"')
+        manifest.write_text(text)
+        self.git(self.upstream, "commit", "-qam", f"Release {version}")
+        if tag:
+            self.git(self.upstream, "tag", "-a", f"v{version}", "-m", f"autotranscode {version}")
+
+    def update(self, chain: Toolchain | None = None, **options: Any) -> tuple[int, str]:
+        options.setdefault("doctor", lambda: 0)
+        options.setdefault("ask", lambda _prompt: "")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = update.main(self.cfg, chain or tested_chain(), root=self.local, **options)
+        return code, out.getvalue()
+
+    def stages(self) -> str:
+        path = self.root / "stages"
+        return path.read_text().strip() if path.exists() else ""
+
+    def pulled(self) -> bool:
+        return "9.9.9" in (self.local / "autotranscode" / "__init__.py").read_text()
+
+    def stopped_film(self, name: str = "Film (1975).mkv") -> Path:
+        source = self.root / name
+        work = Path(self.cfg.paths.work_dir) / pipeline.source_digest(source)
+        work.mkdir(parents=True)
+        (work / pipeline.SOURCE_FILE).write_text(str(source.resolve()))
+        (work / "scenes-0.json").write_text("{}")
+        return source
+
+    def test_up_to_date(self):
+        code, out = self.update()
+        self.assertEqual(code, 0)
+        self.assertIn("is the newest, with the tools it was tested with", out)
+        self.assertEqual(self.stages(), "")
+
+    def test_commits_without_a_new_version_are_no_update(self):
+        (self.upstream / "notes").write_text("x")
+        self.git(self.upstream, "add", "notes")
+        self.git(self.upstream, "commit", "-qm", "notes")
+        code, out = self.update()
+        self.assertEqual(code, 0)
+        self.assertIn("is the newest", out)
+
+    def test_a_version_on_the_branch_is_no_release(self):
+        self.release(tag=False)
+        code, out = self.update(check_only=True)
+        self.assertEqual(code, 0)
+        self.assertIn("is the newest", out)
+
+    def test_the_newest_release_is_the_highest_version_not_the_last_tag(self):
+        self.release("0.10.0")
+        self.release("0.9.0")   # tagged later, but older
+        code, out = self.update(check_only=True)
+        self.assertEqual(code, 1)
+        self.assertIn("autotranscode 0.10.0 is available", out)
+
+    def test_it_installs_the_release_not_the_branch_after_it(self):
+        self.release()
+        (self.upstream / "notes").write_text("unreleased")
+        self.git(self.upstream, "add", "notes")
+        self.git(self.upstream, "commit", "-qm", "work in progress")
+        code, out = self.update()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.pulled())
+        self.assertFalse((self.local / "notes").exists())
+        self.assertEqual(self.git(self.local, "rev-parse", "HEAD"),
+                         self.git(self.local, "rev-parse", "v9.9.9^{commit}"))
+        self.assertEqual(self.git(self.local, "branch", "--show-current").strip(), "main")
+
+    def test_check_names_the_version_and_the_tools_and_no_commits(self):
+        self.release()
+        code, out = self.update(check_only=True)
+        self.assertEqual(code, 1)
+        self.assertIn(f"autotranscode 9.9.9 is available (this is {__version__})", out)
+        self.assertIn(f"It updates: Av1an {versions.load()['av1an'].version} -> {NEXT_AV1AN}", out)
+        self.assertNotIn("Release 9.9.9", out)
+        self.assertFalse(self.pulled())
+
+    def test_what_apt_installs_takes_no_part(self):
+        self.release(ffmpeg="9.0.0", av1an=NEXT_AV1AN)
+        code, out = self.update(tested_chain(ffmpeg_version="7.1-Jellyfin",
+                                             mkvmerge_version="61.0"), check_only=True)
+        self.assertEqual(code, 1)
+        self.assertNotIn("ffmpeg", out)
+        self.assertNotIn("mkvmerge", out)
+        self.assertIn("Av1an", out)
+
+    def test_with_nothing_to_finish_it_installs_now(self):
+        self.release()
+        code, out = self.update()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.pulled())
+        self.assertEqual(self.stages(), "av1an")
+        self.assertIn("Updated.", out)
+
+    def test_a_version_that_moves_no_tool_rebuilds_nothing(self):
+        self.release(av1an=versions.load()["av1an"].version)
+        code, out = self.update()
+        self.assertEqual(code, 0, out)
+        self.assertIn("It updates no tools", out)
+        self.assertTrue(self.pulled())
+        self.assertEqual(self.stages(), "")
+
+    def test_declining_changes_nothing(self):
+        self.release()
+        code, _ = self.update(ask=lambda _prompt: "n")
+        self.assertEqual(code, 1)
+        self.assertFalse(self.pulled())
+        self.assertIsNone(update.queued(self.cfg))
+
+    def test_a_stopped_film_is_finished_first(self):
+        self.release()
+        source = self.stopped_film()
+        prompts: list[str] = []
+        code, out = self.update(ask=lambda prompt: prompts.append(prompt) or "")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Queue it to install once the next `autotranscode run` has finished "
+                      f"{source.name}? [Y/n]", prompts[0])
+        self.assertEqual(present(update.queued(self.cfg))["version"], "9.9.9")
+        self.assertFalse(self.pulled())
+        self.assertEqual(self.stages(), "")
+
+    def test_a_run_going_on_installs_it_after_its_film(self):
+        self.release()
+        source = self.stopped_film()
+        work = Path(self.cfg.paths.work_dir) / pipeline.source_digest(source)
+        with pipeline.only_run(self.cfg):
+            (work / pipeline.RUNNING_FILE).write_text(str(os.getpid()))
+            code, out = self.update(yes=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"after the run (pid {os.getpid()}) finishes {source.name}", out)
+        self.assertIsNotNone(update.queued(self.cfg))
+        self.assertFalse(self.pulled())
+
+    def test_queued_already_and_cancel(self):
+        self.release()
+        self.stopped_film()
+        self.update(yes=True)
+        code, out = self.update(yes=True)
+        self.assertEqual(code, 0)
+        self.assertIn("queued already", out)
+        code, out = self.update(cancel=True)
+        self.assertIn("cancelled", out)
+        self.assertIsNone(update.queued(self.cfg))
+
+    def test_a_diverged_checkout_is_not_touched(self):
+        self.release()
+        (self.local / "notes").write_text("x")
+        self.git(self.local, "add", "notes")
+        self.git(self.local, "commit", "-qm", "local")
+        code, out = self.update(yes=True)
+        self.assertEqual(code, 1)
+        self.assertIn("this checkout has commits that v9.9.9 does not", out)
+        self.assertEqual(self.stages(), "")
+
+    def test_uncommitted_changes_are_not_touched(self):
+        self.release()
+        (self.local / "autotranscode" / "__init__.py").write_text("# mine\n")
+        code, out = self.update(yes=True)
+        self.assertEqual(code, 1)
+        self.assertIn("uncommitted changes", out)
+
+    def test_tools_out_of_line_are_offered_without_a_new_version(self):
+        code, out = self.update(tested_chain(av1an_version="0.5.2"))
+        self.assertEqual(code, 0, out)
+        self.assertIn("not the ones it was tested with: Av1an 0.5.2 ->", out)
+        self.assertEqual(self.stages(), "av1an")
+
+    def test_tools_no_run_can_encode_with_are_rebuilt_now_not_queued(self):
+        # A board updated by hand from before tools reported their versions: a run
+        # refuses grav1synth, so none could finish the stopped film first.
+        source = self.stopped_film()
+        prompts: list[str] = []
+        code, out = self.update(tested_chain(grav1synth_version="", lsmash_commit=""),
+                                ask=lambda prompt: prompts.append(prompt) or "")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"No run can encode until grav1synth is rebuilt; {source.name} "
+                      "resumes after that.", out)
+        self.assertEqual(prompts, ["Install it now? [Y/n] "])
+        self.assertEqual(self.stages(), "lsmash grav1synth")
+        self.assertIsNone(update.queued(self.cfg))
+
+    def test_a_run_that_cannot_encode_installs_the_queued_update_first(self):
+        settings = self.root / "config.toml"
+        settings.write_text(f'[paths]\nwork_dir = "{self.cfg.paths.work_dir}"\n'
+                            f'state_file = "{self.root / "state.json"}"\n')
+        Path(self.cfg.paths.work_dir).mkdir()
+        Path(self.cfg.paths.work_dir, update.QUEUED).write_text('{"version": "9.9.9"}')
+        chain = tested_chain(grav1synth_version="")
+        with unittest.mock.patch.object(cli.tools, "detect", return_value=chain), \
+                unittest.mock.patch.object(cli.tools, "require"), \
+                unittest.mock.patch.object(cli.pipeline, "process_all") as process_all, \
+                unittest.mock.patch.object(cli.update, "install_queued") as install, \
+                self.assertLogs(util.log, "WARNING"):
+            code = cli.main(["-c", str(settings), "run", str(self.root / "a.mkv")])
+        install.assert_called_once()
+        process_all.assert_not_called()
+        self.assertEqual(code, 2)   # only when the exec did not happen
+
+    def test_a_run_installs_it_before_a_film_no_run_had_started(self):
+        stopped = self.stopped_film()
+        fresh = self.root / "New (2001).mkv"
+        Path(self.cfg.paths.work_dir, update.QUEUED).write_text('{"version": "9.9.9"}')
+        done: list[Path] = []
+
+        def encode(source, *_args, **_kwargs):
+            done.append(source)
+            return Record(source=str(source), status="done")
+
+        with unittest.mock.patch.object(pipeline, "process_one", encode), \
+                self.assertRaises(update.InstallQueued):
+            pipeline._process_all([stopped, fresh], make_chain(), self.cfg,
+                                  Ledger(self.root / "state.json"), pipeline.StopRequest())
+        self.assertEqual(done, [stopped])
+
+    def test_the_run_installs_and_starts_again(self):
+        self.release()
+        Path(self.cfg.paths.work_dir).mkdir()
+        Path(self.cfg.paths.work_dir, update.QUEUED).write_text('{"version": "9.9.9"}')
+        started: list[list[str]] = []
+        with unittest.mock.patch.object(update, "checkout", return_value=self.local), \
+                self.assertLogs(util.log, "INFO") as logs:
+            update.install_queued(self.cfg, tested_chain(),
+                                  lambda _exe, argv: started.append(argv))
+        self.assertTrue(self.pulled())
+        self.assertEqual(self.stages(), "av1an")
+        self.assertEqual(started, [sys.orig_argv])
+        self.assertIsNone(update.queued(self.cfg))
+        self.assertIn("installing the queued update to autotranscode 9.9.9",
+                      "\n".join(logs.output))
+
+    def test_a_failed_build_is_not_retried_before_every_film(self):
+        (self.upstream / "scripts" / "bootstrap.sh").write_text("echo nope; exit 3\n")
+        self.release()
+        Path(self.cfg.paths.work_dir).mkdir()
+        Path(self.cfg.paths.work_dir, update.QUEUED).write_text('{"version": "9.9.9"}')
+        started: list[list[str]] = []
+        with unittest.mock.patch.object(update, "checkout", return_value=self.local), \
+                self.assertLogs(util.log, "ERROR") as logs:
+            update.install_queued(self.cfg, tested_chain(),
+                                  lambda _exe, argv: started.append(argv))
+        self.assertIn("nope", "\n".join(logs.output))
+        self.assertEqual(len(started), 1)
+        self.assertIsNone(update.queued(self.cfg))
+
+    def test_run_hands_a_queued_install_over(self):
+        settings = self.root / "config.toml"
+        settings.write_text(f'[paths]\nwork_dir = "{self.cfg.paths.work_dir}"\n'
+                            f'state_file = "{self.root / "state.json"}"\n')
+        with unittest.mock.patch.object(cli.tools, "detect", return_value=tested_chain()), \
+                unittest.mock.patch.object(cli.tools, "require"), \
+                unittest.mock.patch.object(cli.pipeline, "discover",
+                                           return_value=[self.root / "a.mkv"]), \
+                unittest.mock.patch.object(cli.pipeline, "process_all",
+                                           side_effect=update.InstallQueued), \
+                unittest.mock.patch.object(cli.update, "install_queued") as install:
+            code = cli.main(["-c", str(settings), "run", str(self.root / "a.mkv")])
+        self.assertEqual(code, 0)
+        install.assert_called_once()
 
 
 class TestGrainTableScaling(unittest.TestCase):

@@ -1,0 +1,95 @@
+# The toolchain this version of autotranscode was tested with: one version of
+# each tool it drives. scripts/bootstrap.sh installs these, and `doctor` compares
+# what is installed against them. Changing a pin calls for a release
+# (scripts/release.sh), so one autotranscode version always means one toolchain.
+#
+# Each entry:
+#   version  the version tested
+#   accept   what else passes for it:
+#              exact       that version and no other
+#              same-major  that major, at that version or newer
+#              at-least    that version or newer
+#              untracked   anything; the version is only reported
+#   enforce  whether `run` and `sample` refuse a version `accept` does not pass
+#            (overridable with [tools] versions = "warn" in the config)
+#   stage    the scripts/bootstrap.sh stage that installs it
+#
+# Keep each version on one line as version = "...": bootstrap.sh reads this file
+# with awk, before any Python 3.11 is guaranteed to be there.
+
+[ffmpeg]
+# jellyfin-ffmpeg. Its apt repository carries only the newest build of each
+# major, so pinning a patch release is impossible; the major is the pin, and
+# bootstrap installs the jellyfin-ffmpeg<major> package.
+version = "8.1.3"
+accept = "same-major"
+enforce = true
+stage = "ffmpeg"
+
+[svtav1]
+# Pinned, not taken from a package manager: distribution packages lag far behind
+# (Debian 13 has 2.3.0, without the dark bias the 1080p setting depends on), and
+# a release can move quality at the same CRF. The per-resolution settings were
+# judged on 4.0.0; 4.2.0 matched them within 0.2 dB on the 1080p excerpts and
+# encodes 5-10% faster on ARM. 4.3.0 keeps every option and default they use; its
+# release claims 5-8% better efficiency across presets, not yet re-judged on the
+# excerpts. Re-check the CRF curve on a few excerpts when moving this.
+version = "4.3.0"
+accept = "exact"
+enforce = true
+stage = "svtav1"
+
+[av1an]
+# The version autotranscode's Av1an flags and its ffmpeg shim were checked against
+# (see FFMPEG_SHIM in autotranscode/encode.py); its options change between releases.
+# 0.6.0 is tagged on GitHub but not on crates.io, whose newest is 0.5.2, so it is
+# built from the tag.
+version = "0.6.0"
+accept = "exact"
+enforce = true
+stage = "av1an"
+
+[grav1synth]
+# Built from the crate with scripts/grav1synth-0.2.0-grain-flag.patch, which also
+# gives it a --version naming the patch: an unpatched 0.2.0 corrupts some sequence
+# headers (see TECHNICAL.md). Bump the part after "+" in the patch and here
+# together whenever the patch changes.
+version = "0.2.0+autotranscode.1"
+accept = "exact"
+enforce = true
+stage = "grav1synth"
+
+[vapoursynth]
+# Pinned deliberately, not lazily. R73 onward added Vulkan GPU filters whose
+# gpufilter.h does not compile against Debian 13's Vulkan headers
+# ("invalid conversion from 'const void*' to 'void*'"), and switched to a Meson
+# build that makes Cython mandatory. R72 is the last autotools release without
+# that code, and since nothing here ever calls VapourSynth, newer buys us nothing.
+# macOS takes Homebrew's VapourSynth instead, which builds there; hence at-least.
+version = "72"
+accept = "at-least"
+enforce = false
+stage = "vapoursynth"
+
+[zimg]
+# Built for VapourSynth only; nothing at run time reports it.
+version = "3.0.6"
+accept = "untracked"
+enforce = false
+stage = "vapoursynth"
+
+[lsmash]
+# L-SMASH-Works' VapourSynth plugin. Its tags stopped in 2023; this is the commit
+# last tested (2026-09). The plugin carries no version, so bootstrap records the
+# commit beside it, in LSMASHSource.commit.
+version = "7e63c8400a252f4dbbeea80cc3bfec895abf12cf"
+accept = "exact"
+enforce = false
+stage = "lsmash"
+
+[mkvmerge]
+# From the system's packages; anything recent concatenates chunks the same way.
+version = "97.0"
+accept = "untracked"
+enforce = false
+stage = "deps"

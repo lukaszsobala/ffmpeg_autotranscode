@@ -5,7 +5,8 @@
 #   docker compose run --rm autotranscode doctor
 #
 # The tools are built by scripts/bootstrap.sh, stage by stage, so the image and
-# a native install get the same pinned versions and the same grav1synth patch.
+# a native install get the same versions, those autotranscode/toolchain.toml pins,
+# and the same grav1synth patch.
 
 ARG DEBIAN_RELEASE=trixie
 
@@ -17,7 +18,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     BUILD_DIR=/build \
     CARGO_INSTALL_ROOT=/opt/autotranscode \
     PATH=/opt/autotranscode/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-COPY scripts/bootstrap.sh scripts/grav1synth-0.2.0-grain-flag.patch /src/
+COPY scripts/bootstrap.sh scripts/grav1synth-0.2.0-grain-flag.patch \
+     autotranscode/toolchain.toml /src/
 # One layer per stage, so that changing a pin rebuilds only what follows it.
 RUN /src/bootstrap.sh deps
 RUN /src/bootstrap.sh svtav1
@@ -48,7 +50,7 @@ RUN rm -rf "$PREFIX/include" "$PREFIX/lib/pkgconfig" "$PREFIX/share" "$PREFIX/.c
 FROM debian:${DEBIAN_RELEASE}-slim
 ENV DEBIAN_FRONTEND=noninteractive
 COPY --from=build /opt/autotranscode /opt/autotranscode
-COPY scripts/bootstrap.sh /tmp/bootstrap.sh
+COPY scripts/bootstrap.sh autotranscode/toolchain.toml /tmp/
 # jellyfin-ffmpeg from Jellyfin's repository, by the same stage a native install
 # uses; then the libraries the built tools need, Python, mkvtoolnix, and the time
 # zones that TZ names, for log times in local time. tini is
@@ -60,7 +62,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 mkvtoolnix tini tzdata \
       $(cat /opt/autotranscode/runtime-packages) \
  && apt-get purge -y --auto-remove curl gnupg \
- && rm -rf /var/lib/apt/lists/* /tmp/bootstrap.sh
+ && rm -rf /var/lib/apt/lists/* /tmp/bootstrap.sh /tmp/toolchain.toml
 # The prefix's own libraries (zimg, VapourSynth) and its Python module, which
 # VapourSynth's embedded interpreter imports too, then the app itself.
 RUN echo /opt/autotranscode/lib > /etc/ld.so.conf.d/autotranscode.conf && ldconfig \
