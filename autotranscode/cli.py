@@ -162,6 +162,8 @@ def build_parser() -> argparse.ArgumentParser:
                                   "film in the ledger)")
     regrain_cmd.add_argument("-n", "--dry-run", action="store_true",
                              help="list the films and their sources, change nothing")
+    regrain_cmd.add_argument("--force", action="store_true",
+                             help="also films whose grain the current method made already")
 
     sub.add_parser("doctor", help="check that the required tools are present and capable")
 
@@ -539,7 +541,8 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("%s", exc)
                 return 2
         try:
-            return regrain.main(cfg, chain, args.inputs, dry_run=args.dry_run)
+            return regrain.main(cfg, chain, args.inputs, dry_run=args.dry_run,
+                                force=args.force)
         except KeyboardInterrupt:
             return 130
 

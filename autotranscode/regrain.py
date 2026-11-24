@@ -11,6 +11,10 @@ grain estimated and calibrated scene by scene as `run` does now
 other track as it was. The new file is checked against the old one and then
 takes its place.
 
+A film whose grain the current method made (pipeline.grain_method, kept in the
+film with its scene cuts) is left as it is, so a regrain stopped on the third
+day starts again where it was; --force does such films again.
+
 Never beside a run: it would compete for the big cores, and the two share the
 work directory. It holds the work directory as a run does, so neither starts
 while the other works.
@@ -208,28 +212,47 @@ def find_scenes(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> l
     return scenes.starts(scene_list)
 
 
-def regrain_one(target: Target, chain: Toolchain, cfg: Config, ledger: Ledger) -> str:
+def kept(chain: Toolchain, output: Path, work: Path) -> cuts.Kept | None:
+    """What the film `output` keeps about itself (cuts.Kept), if anything."""
+    film = film_track(tracks(chain, output))
+    frames, _ = _video_packets(chain, output, film.index)
+    return cuts.attached(chain, output, frames, work)
+
+
+def done_already(chain: Toolchain, cfg: Config, output: Path, work: Path) -> bool:
+    """Whether the film's grain was made by the method regrain uses now."""
+    method = pipeline.grain_method(cfg, chain)
+    found = kept(chain, output, work) if output.is_file() else None
+    return bool(method) and found is not None and found.grain == method
+
+
+def regrain_one(target: Target, chain: Toolchain, cfg: Config, ledger: Ledger,
+                force: bool = False) -> str:
     """Regrain one film in place; what became of it, for the summary."""
     output, source = target.output, target.source
     if not output.is_file():
         return "skipped: the output is gone"
     if not source.is_file():
         return f"skipped: its source is gone ({source})"
-    info = probe(source, chain)
     work = pipeline._work_dir(source, cfg)
+    method = pipeline.grain_method(cfg, chain)
+    known = kept(chain, output, work)
+    if not force and known is not None and known.grain == method:
+        return "skipped: its grain is the current method's already"
+    info = probe(source, chain)
     running = work / pipeline.RUNNING_FILE
     running.write_text(str(os.getpid()), encoding="ascii")
     part = output.with_name(output.name + PART_SUFFIX)
+    table: Path | None = None
     try:
         found = tracks(chain, output)
         film = film_track(found)
         video = work / "regrain-video.mkv"
         run(extract_command(chain, output, film.index, video))
         frames = len(scenegrain.read_stream(chain, video).stamps)
-        starts = cuts.attached(chain, output, frames, work)
-        kept = starts is not None
-        if kept:
-            log.info("  scene list kept in the film: %d scenes", len(starts or ()))
+        starts = known.starts if known is not None else None
+        if starts is not None:
+            log.info("  scene list kept in the film: %d scenes", len(starts))
         else:
             starts = find_scenes(info, chain, cfg, work)
         new_video, table = pipeline.film_grain(info, video, starts, chain, cfg, work)
@@ -240,8 +263,10 @@ def regrain_one(target: Target, chain: Toolchain, cfg: Config, ledger: Ledger) -
             new_video = stripped
         flags, aspect = video_details(chain, output, film.index)
         run(remux_command(chain, output, found, film, new_video, flags, aspect, part))
-        if not kept and starts:
-            cuts.attach(chain, part, starts, frames, work)
+        if starts:
+            # Always written, replacing what the remux copied: it now says what
+            # made the grain, so a regrain started again leaves this film.
+            cuts.attach(chain, part, starts, frames, work, method)
         check(chain, output, part)
         os.replace(part, output)
     except BaseException:
@@ -255,7 +280,8 @@ def regrain_one(target: Target, chain: Toolchain, cfg: Config, ledger: Ledger) -
     return "regrained" if table is not None else "no grain to put back; grain removed"
 
 
-def main(cfg: Config, chain: Toolchain, inputs: list[Path], *, dry_run: bool = False) -> int:
+def main(cfg: Config, chain: Toolchain, inputs: list[Path], *, dry_run: bool = False,
+         force: bool = False) -> int:
     ledger = Ledger(cfg.state_path)
     found, strangers = targets(inputs, ledger)
     for stranger in strangers:
@@ -267,6 +293,9 @@ def main(cfg: Config, chain: Toolchain, inputs: list[Path], *, dry_run: bool = F
     if dry_run:
         for target in found:
             state = "ok" if target.source.is_file() else "SOURCE GONE"
+            work = cfg.work_dir / pipeline.source_digest(target.source)
+            if not force and done_already(chain, cfg, target.output, work):
+                state += "; its grain is current, left as it is"
             print(f"{target.output}\n    source: {target.source} [{state}]")
         print(f"{len(found)} film(s); nothing changed (dry run)")
         return 0
@@ -276,20 +305,21 @@ def main(cfg: Config, chain: Toolchain, inputs: list[Path], *, dry_run: bool = F
         return 2
     try:
         with pipeline.only_run(cfg):
-            return _regrain_all(found, chain, cfg, ledger)
+            return _regrain_all(found, chain, cfg, ledger, force)
     except pipeline.AlreadyRunning as exc:
         log.error("%s; regrain once it has finished", exc)
         return 1
 
 
-def _regrain_all(found: list[Target], chain: Toolchain, cfg: Config, ledger: Ledger) -> int:
+def _regrain_all(found: list[Target], chain: Toolchain, cfg: Config, ledger: Ledger,
+                 force: bool = False) -> int:
     failures = 0
     for number, target in enumerate(found, 1):
         log.info("[%d/%d] %s", number, len(found), target.output.name)
         started = time.monotonic()
         try:
             with progress.showing(target.output.stem):
-                outcome = regrain_one(target, chain, cfg, ledger)
+                outcome = regrain_one(target, chain, cfg, ledger, force)
         except KeyboardInterrupt:
             log.warning("stopped; the film is as it was, and a rerun carries on from the "
                         "grain estimate's finished parts")
@@ -298,6 +328,9 @@ def _regrain_all(found: list[Target], chain: Toolchain, cfg: Config, ledger: Led
             failures += 1
             detail = exc.stderr.strip()[-300:] if isinstance(exc, CommandError) else str(exc)
             log.error("  failed, the film is as it was: %s", detail)
+            continue
+        if outcome.startswith("skipped"):
+            log.info("  %s", outcome)
             continue
         log.info("  %s in %s (%s)", outcome,
                  human_duration(time.monotonic() - started),

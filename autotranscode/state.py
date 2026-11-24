@@ -14,7 +14,7 @@ import json
 import os
 import tempfile
 from collections.abc import Collection, Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -97,15 +97,20 @@ class Ledger:
             return
         records: dict[str, Record] = {}
         guesses: dict[str, Guess] = {}
+        # Fields this version does not know -- a newer one's -- are left out rather
+        # than the entry: dropping it, and saving, would lose a finished film's
+        # record to an older process running beside a newer one.
+        record_fields = {field.name for field in fields(Record)}
+        guess_fields = {field.name for field in fields(Guess)}
         for key, value in raw.get("records", {}).items():
             try:
-                records[key] = Record(**value)
-            except TypeError:
+                records[key] = Record(**{k: v for k, v in value.items() if k in record_fields})
+            except (TypeError, AttributeError):
                 log.debug("dropping incompatible state entry %s", key)
         for key, value in raw.get("estimates", {}).items():
             try:
-                guesses[key] = Guess(**value)
-            except TypeError:
+                guesses[key] = Guess(**{k: v for k, v in value.items() if k in guess_fields})
+            except (TypeError, AttributeError):
                 log.debug("dropping incompatible estimate %s", key)
         self.records, self.guesses = records, guesses
 

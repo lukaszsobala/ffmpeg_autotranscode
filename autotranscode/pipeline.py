@@ -476,15 +476,27 @@ def film_grain(read: MediaInfo, base: Path, scene_starts: Sequence[int] | None,
     return result.video, result.table
 
 
-def _keep_scenes(scene_list: Path, muxed: Path, chain: Toolchain, work: Path) -> None:
-    """Keep Av1an's scene cuts inside the film, for a later `regrain` (cuts.py).
-    A film is fine without them, so a failure here costs only a note."""
+def grain_method(cfg: Config, chain: Toolchain) -> str:
+    """What makes a film's grain with these settings, as kept in the film (cuts.py),
+    or "" for a method `regrain` does not make: SvtFgEssential, by the commit of
+    Essential it was built from. A new pin makes a new method, and regrain then
+    does every film again."""
+    if cfg.grain.mode == "never" or cfg.grain.estimator != "svtfg":
+        return ""
+    return f"svtfg {chain.svtfg_commit[:12] or 'unknown'}"
+
+
+def _keep_scenes(scene_list: Path, muxed: Path, chain: Toolchain, work: Path,
+                 grain: str = "") -> None:
+    """Keep Av1an's scene cuts inside the film, and what made its grain, for a later
+    `regrain` (cuts.py). A film is fine without them, so a failure here costs only
+    a note."""
     starts = scenes.starts(scene_list)
     frames = scenes.frame_count(scene_list)
     if not starts or not frames:
         return
     try:
-        cuts.attach(chain, muxed, starts, frames, work)
+        cuts.attach(chain, muxed, starts, frames, work, grain)
     except (CommandError, OSError) as exc:
         log.warning("  the scene list is not kept in the film: %s",
                     str(exc).splitlines()[0] if str(exc) else exc)
@@ -892,7 +904,7 @@ def _transcode(
     muxed = staged_out if staged_out is not None else final.with_name(final.name + ".part")
     muxed.unlink(missing_ok=True)
     mux.mux(video, read, muxed, chain, cfg)
-    _keep_scenes(scene_list, muxed, chain, work)
+    _keep_scenes(scene_list, muxed, chain, work, grain_method(cfg, chain))
 
     output_bytes = muxed.stat().st_size
     reason = watch.shortfall(cfg, info.size_bytes, output_bytes)

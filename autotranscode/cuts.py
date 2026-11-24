@@ -15,8 +15,10 @@ in every part tried, at 250 frames/s against Av1an's 120.
 And the cuts are kept inside the film, as a Matroska attachment
 (ATTACHMENT, a few kilobytes of JSON), so a later regrain needs no detection at
 all: `run` attaches Av1an's list to every film it encodes, and `regrain`
-attaches the cuts it found. Nothing plays an attachment; players and Jellyfin
-use them only for subtitle fonts.
+attaches the cuts it found. With them goes what made the film's grain, so a
+regrain stopped halfway, and started again, leaves the films it finished.
+Nothing plays an attachment; players and Jellyfin use them only for subtitle
+fonts.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import encode, essential, verify
@@ -214,25 +217,38 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> list[i
 # --- kept inside the film --------------------------------------------------------
 
 
-def attachment_text(starts: Sequence[int], frames: int) -> str:
-    return json.dumps({"frames": frames, "scene_starts": list(starts)}, separators=(",", ":"))
+@dataclass(frozen=True, slots=True)
+class Kept:
+    """What a film keeps about itself in its attachment."""
+    starts: list[int]   # its scene cuts, frame 0 first
+    # What made its grain (pipeline.grain_method), "" if not recorded: regrain
+    # leaves a film whose grain the current method already made.
+    grain: str = ""
 
 
-def parse(text: str, frames: int) -> list[int] | None:
-    """The scene starts in an attachment's text, if they fit a video of `frames`
+def attachment_text(starts: Sequence[int], frames: int, grain: str = "") -> str:
+    data: dict[str, object] = {"frames": frames, "scene_starts": list(starts)}
+    if grain:
+        data["grain"] = grain
+    return json.dumps(data, separators=(",", ":"))
+
+
+def parse(text: str, frames: int) -> Kept | None:
+    """What an attachment's text keeps, if its scene starts fit a video of `frames`
     frames: from 0, rising, all inside it. None otherwise."""
     try:
         data = json.loads(text)
         if int(data["frames"]) != frames:
             return None
         starts = [int(start) for start in data["scene_starts"]]
-    except (ValueError, KeyError, TypeError):
+        grain = str(data.get("grain") or "")
+    except (ValueError, KeyError, TypeError, AttributeError):
         return None
     if not starts or starts[0] != 0 or starts[-1] >= frames:
         return None
     if any(after <= before for before, after in itertools.pairwise(starts)):
         return None
-    return starts
+    return Kept(starts, grain)
 
 
 def attachment_index(chain: Toolchain, path: Path) -> int | None:
@@ -247,8 +263,8 @@ def attachment_index(chain: Toolchain, path: Path) -> int | None:
     return None
 
 
-def attached(chain: Toolchain, path: Path, frames: int, work: Path) -> list[int] | None:
-    """The scene starts kept in `path`, when it has them and they fit its `frames`."""
+def attached(chain: Toolchain, path: Path, frames: int, work: Path) -> Kept | None:
+    """What `path` keeps about itself, when it has an attachment that fits its `frames`."""
     index = attachment_index(chain, path)
     if index is None:
         return None
@@ -275,8 +291,9 @@ def mkvpropedit(chain: Toolchain) -> str | None:
 
 
 def attach(chain: Toolchain, path: Path, starts: Sequence[int], frames: int,
-           work: Path) -> bool:
-    """Keep `starts` inside the Matroska file `path`, in place of any list there.
+           work: Path, grain: str = "") -> bool:
+    """Keep `starts`, and what made the grain, inside the Matroska file `path`, in
+    place of any list there.
 
     Written in place by mkvpropedit, in a moment. False, with a note, when there
     is no MKVToolNix to do it: the film is fine without, and a regrain then
@@ -288,7 +305,7 @@ def attach(chain: Toolchain, path: Path, starts: Sequence[int], frames: int,
                  "not found")
         return False
     data = work / ATTACHMENT
-    data.write_text(attachment_text(starts, frames), encoding="utf-8")
+    data.write_text(attachment_text(starts, frames, grain), encoding="utf-8")
     try:
         argv = [tool, "-q", str(path)]
         if attachment_index(chain, path) is not None:

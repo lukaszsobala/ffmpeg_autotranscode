@@ -83,6 +83,9 @@ printf 'Tagged %s on %s\n%s\n' "$tag" "$(git rev-parse --short HEAD)" "$notes"
 
 if [[ $push != --push ]]; then
   printf '\nNot pushed. To publish:\n  git push origin main %s\n' "$tag"
+  # A push makes no GitHub release page; --push makes one with gh, and so does this.
+  printf '  gh release create %s --title %q --notes %q --verify-tag\n' \
+    "$tag" "autotranscode $version" "$notes"
   exit 0
 fi
 git push origin main "$tag"

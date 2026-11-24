@@ -202,6 +202,14 @@ VapourSynth's Bicubic, whose defaults are b = c = 1/3; ffmpeg's `scale` with
 hevc_rkmpp 58, the same 83 cuts. Unshrunk, it ran at 38 and missed two of them.
 Without av-scenechange, regrain falls back to Av1an's detection.
 
+The attachment also says what made the film's grain: `svtfg` and the Essential
+commit (`pipeline.grain_method`). `regrain` leaves a film whose grain the current
+method made, so a library-wide regrain of several days, stopped, starts again
+where it was, and films `run` encoded since are left alone; a new Essential pin
+makes every film due again. It is kept in the film rather than in the ledger,
+whose older versions dropped an entry with a field they did not know (and so,
+saving, lost it); the ledger now leaves such fields out instead.
+
 Film A regrained again with all of that took 1h01m instead of 1h19m:
 12 minutes to find the cuts (212 frames/s; the same 341 scenes, every one on a
 keyframe of the original encode, so Av1an's own), 26 for the estimate (99

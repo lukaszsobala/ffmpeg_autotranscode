@@ -459,6 +459,15 @@ class TestDiscovery(unittest.TestCase):
 
 
 class TestLedger(unittest.TestCase):
+    def test_a_newer_versions_field_does_not_lose_the_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            state.write_text(json.dumps({"records": {"/a.mkv::1": {
+                "source": "/a.mkv", "status": "done", "output": "/a.av1.mkv",
+                "from_the_future": 1}}, "estimates": {}}))
+            ledger = Ledger(state)
+            self.assertEqual(ledger.records["/a.mkv::1"].output, "/a.av1.mkv")
+
     def test_roundtrip_and_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "film.mkv"
@@ -5124,7 +5133,9 @@ class TestSceneCuts(unittest.TestCase):
 
     def test_a_kept_list_is_used_only_for_the_film_it_fits(self):
         text = cuts.attachment_text([0, 58, 125], 200)
-        self.assertEqual(cuts.parse(text, 200), [0, 58, 125])
+        self.assertEqual(cuts.parse(text, 200), cuts.Kept([0, 58, 125], ""))
+        self.assertEqual(cuts.parse(cuts.attachment_text([0, 9], 20, "svtfg abc"), 20),
+                         cuts.Kept([0, 9], "svtfg abc"))
         self.assertIsNone(cuts.parse(text, 201))
         for bad in ('{"frames": 200, "scene_starts": [5, 58]}',
                     '{"frames": 200, "scene_starts": [0, 58, 58]}',
@@ -5165,6 +5176,39 @@ class TestSceneCuts(unittest.TestCase):
                 unittest.mock.patch.object(regrain, "_duration", return_value=1.0):
             regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
 
+    def test_the_grain_method_names_the_estimator_build(self):
+        cfg = config.Config()
+        chain = make_chain(svtfg_commit="9f7ebdc5ffbe3c135b223dd618d5155b43427703")
+        self.assertEqual(pipeline.grain_method(cfg, chain), "svtfg 9f7ebdc5ffbe")
+        cfg.grain.estimator = "svt"
+        self.assertEqual(pipeline.grain_method(cfg, chain), "")
+        cfg.grain.estimator, cfg.grain.mode = "svtfg", "never"
+        self.assertEqual(pipeline.grain_method(cfg, chain), "")
+
+    def test_a_film_with_the_current_grain_is_left_unless_forced(self):
+        chain = make_chain(svtfg_commit="9f7ebdc5ffbe3c135b223dd618d5155b43427703")
+        with tempfile.TemporaryDirectory() as tmp:
+            output, source = Path(tmp) / "f.av1.mkv", Path(tmp) / "f.mkv"
+            output.write_bytes(b"x")
+            source.write_bytes(b"x")
+            cfg = config.Config()
+            cfg.paths.work_dir = str(Path(tmp) / "work")
+            target = regrain.Target(output, Record(source=str(source), status="done",
+                                                   output=str(output)))
+            current = cuts.Kept([0, 9], "svtfg 9f7ebdc5ffbe")
+            with unittest.mock.patch.object(regrain, "kept", return_value=current), \
+                    unittest.mock.patch.object(regrain, "probe") as probed:
+                outcome = regrain.regrain_one(target, chain, cfg, unittest.mock.Mock())
+            self.assertTrue(outcome.startswith("skipped"), outcome)
+            probed.assert_not_called()
+            older = cuts.Kept([0, 9], "")
+            for found, force in ((older, False), (current, True)):
+                with unittest.mock.patch.object(regrain, "kept", return_value=found), \
+                        unittest.mock.patch.object(regrain, "probe",
+                                                   side_effect=OSError("went on")), \
+                        self.assertRaisesRegex(OSError, "went on"):
+                    regrain.regrain_one(target, chain, cfg, unittest.mock.Mock(), force)
+
     def test_regrain_falls_back_to_av1an_when_the_detector_fails(self):
         chain = make_chain(scenechange="av-scenechange")
         with unittest.mock.patch.object(cuts, "detect", side_effect=essential.Mismatch("x")), \
@@ -5187,7 +5231,7 @@ class TestSceneCuts(unittest.TestCase):
             with unittest.mock.patch.object(cuts, "attach") as attach:
                 pipeline._keep_scenes(listing, Path("/out.part"), make_chain(), Path(tmp))
             attach.assert_called_once_with(unittest.mock.ANY, Path("/out.part"), [0, 12], 30,
-                                           Path(tmp))
+                                           Path(tmp), "")
             with unittest.mock.patch.object(cuts, "attach") as attach:
                 pipeline._keep_scenes(Path(tmp) / "none.json", Path("/o"), make_chain(), Path(tmp))
             attach.assert_not_called()

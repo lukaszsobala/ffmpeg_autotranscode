@@ -187,7 +187,7 @@ honoured). `-c` overrides it; with neither, the built-in defaults apply.
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
 | `run` | Transcode (`--dry-run` probes and measures but does not encode, and records nothing) |
 | `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
-| `regrain` | Give films already encoded the grain `run` makes now, estimated and calibrated scene by scene, without encoding again: each file is checked and replaced in place. Takes outputs or folders of them (none: every finished film); `--dry-run` lists them. Refuses while a run is going |
+| `regrain` | Give films already encoded the grain `run` makes now, estimated and calibrated scene by scene, without encoding again: each file is checked and replaced in place. Takes outputs or folders of them (none: every finished film); `--dry-run` lists them. Films whose grain the current method made already are left, so a regrain stopped partway starts again where it was; `--force` does them again. Refuses while a run is going |
 | `clean` | Remove work directories, staged copies and half-written outputs no run will use again; keeps what can be resumed (`--dry-run` lists, `--all` removes that too, `--samples` removes `sample` results) |
 
 Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
@@ -211,7 +211,9 @@ synthesises, so only the frame headers are rewritten. It needs each film's sourc
 
 Every film keeps its scene cuts inside it, as a small attachment that nothing
 plays (`autotranscode-scenes.json`), so a regrain does not have to find them
-again. Films encoded before this have none; regrain finds their cuts with
+again. With them goes what made the film's grain, so `regrain` leaves films that
+already have the current grain: over a library it can be stopped and started
+again, and films `run` encodes from now on are left too. Films encoded before this have none; regrain finds their cuts with
 av-scenechange, decoding on the hardware decoder where there is one, and adds
 them.
 
