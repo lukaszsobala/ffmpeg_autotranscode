@@ -174,6 +174,43 @@ windows spread over the film, measured as above:
 The new grain's one window outside that range was the end credits, where the
 source has almost no texture (σ 1.6): x0.29, where the old was x2.53.
 
+**Finding the cuts again.** Those 22 minutes of scene detection were Av1an
+redoing what it did at the encode: its list goes with the work directory. So every
+film now keeps its cuts inside it, as a Matroska attachment of a few kilobytes
+(`autotranscode-scenes.json`, written in place by mkvpropedit after the mux),
+which `regrain` reads if it fits the video's frame count. For the films encoded
+before, regrain finds the cuts itself (`cuts.py`) and attaches them. Av1an's
+detector is the av-scenechange crate (0.24.1 in Av1an 0.6.0's lock file); the
+crate's own command-line tool, given Av1an's options (`--min-scenecut 24
+--speed 0`), reads Y4M, so it can be fed by the video engine. Av1an decodes in
+software, and the detector itself barely uses a second thread:
+
+| Film A, 1080p H.264 | frames/s |
+|---|---|
+| Av1an, one five-minute part (all eight cores busy) | 120 |
+| Av1an, four parts at once | 139 |
+| av-scenechange on h264_rkmpp frames, unpinned (the scheduler keeps it on the A55s) | 56 |
+| the same, on one A76 | 94 |
+| the same, on all four A76s | 170 |
+| four parts at once, one per A76 | 250 |
+
+The cuts were Av1an's frame for frame in all six parts tried (120 cuts). At 4K
+Av1an detects on frames shrunk to `encode.sc_downscale_height` (1080) by
+VapourSynth's Bicubic, whose defaults are b = c = 1/3; ffmpeg's `scale` with
+`flags=bicubic:param0=1/3:param1=1/3` stands in for it. On Film G (2160p
+10-bit HEVC), four parts of 3,600 frames: Av1an 8.4 frames/s, av-scenechange on
+hevc_rkmpp 58, the same 83 cuts. Unshrunk, it ran at 38 and missed two of them.
+Without av-scenechange, regrain falls back to Av1an's detection.
+
+Film A regrained again with all of that took 1h01m instead of 1h19m:
+12 minutes to find the cuts (212 frames/s; the same 341 scenes, every one on a
+keyframe of the original encode, so Av1an's own), 26 for the estimate (99
+frames/s, its parts shrinking towards the end), 16 for calibration (four windows
+at a time), the source's frame times listed once instead of twice, and three
+minutes to remux, attach the cuts and check. Its factors came out as before (luma
+x1.19). A regrain of a film that carries its cuts skips the detection: about 49
+minutes.
+
 ### The old grain detector
 
 `measure` scores each file by the mean PSNR between it and a reference-denoised
@@ -205,6 +242,7 @@ source.mkv
    │                                     source, rescale each scene, rewrite
    │
    └── ffmpeg mux ...................... + audio, subtitles, chapters, metadata
+          ├── mkvpropedit .............. the scene cuts, kept in the film
           └── output.av1.mkv
 ```
 

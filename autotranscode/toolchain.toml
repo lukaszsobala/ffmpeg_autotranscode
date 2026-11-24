@@ -72,6 +72,18 @@ accept = "exact"
 enforce = true
 stage = "svtfg"
 
+[scenechange]
+# av-scenechange's own command-line tool, which `regrain` finds scene cuts with,
+# fed by the video engine (autotranscode/cuts.py). The crate Av1an 0.6.0 detects
+# scenes with, at the version its lock file takes, so the cuts are Av1an's. The
+# tool has no --version; bootstrap records the crate version beside it, in
+# av-scenechange.version. Not enforced: only regrain uses it, and regrain falls
+# back to Av1an's detection without it.
+version = "0.24.1"
+accept = "exact"
+enforce = false
+stage = "scenechange"
+
 [vapoursynth]
 # Pinned deliberately, not lazily. R73 onward added Vulkan GPU filters whose
 # gpufilter.h does not compile against Debian 13's Vulkan headers

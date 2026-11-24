@@ -33,6 +33,7 @@ from autotranscode import (
     clean,
     cli,
     config,
+    cuts,
     encode,
     essential,
     estimate,
@@ -2321,6 +2322,7 @@ def tested_chain(**overrides: Any) -> Toolchain:
         vapoursynth_version=pins["vapoursynth"].version,
         vapoursynth_plugins={"lsmas", "std"}, lsmash_commit=pins["lsmash"].version,
         svtfg_commit=pins["svtfg"].version,
+        scenechange="av-scenechange", scenechange_version=pins["scenechange"].version,
     )
     base.update(overrides)
     return make_chain(**base)
@@ -5087,20 +5089,113 @@ class TestRegrain(unittest.TestCase):
             regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
 
 
+class TestSceneCuts(unittest.TestCase):
+    def test_parts_of_five_minutes_cover_the_film_once(self):
+        parts = cuts.plan(25_000, 7_193)
+        self.assertEqual([(p.start, p.end) for p in parts],
+                         [(0, 7_193), (7_193, 14_386), (14_386, 25_000)])
+        self.assertEqual(cuts.plan(5_000, 7_193), [essential.Part(0, 5_000, (0,))])
+        self.assertEqual(cuts.plan(0, 7_193), [])
+
+    def test_4k_is_shrunk_as_av1an_shrinks_it(self):
+        cfg = config.Config()
+        self.assertEqual(cuts.downscale_filter(make_info(width=3840, height=2160), cfg),
+                         "scale=1920:1080:flags=bicubic:param0=1/3:param1=1/3")
+        self.assertEqual(cuts.downscale_filter(make_info(width=3840, height=1600), cfg),
+                         "scale=2592:1080:flags=bicubic:param0=1/3:param1=1/3")
+        self.assertEqual(cuts.downscale_filter(make_info(), cfg), "")
+        cfg.encode.sc_downscale_height = 0
+        self.assertEqual(cuts.downscale_filter(make_info(width=3840, height=2160), cfg), "")
+
+    def test_the_detector_gets_av1ans_options(self):
+        cfg = config.Config()
+        argv = cuts.detect_command(make_chain(scenechange="/bin/asc"), cfg)
+        self.assertEqual(argv, ["/bin/asc", "--min-scenecut", "24", "--speed", "0", "-"])
+        cfg.encode.sc_method = "fast"
+        self.assertIn("1", cuts.detect_command(make_chain(scenechange="/bin/asc"), cfg))
+
+    def test_a_kept_list_is_used_only_for_the_film_it_fits(self):
+        text = cuts.attachment_text([0, 58, 125], 200)
+        self.assertEqual(cuts.parse(text, 200), [0, 58, 125])
+        self.assertIsNone(cuts.parse(text, 201))
+        for bad in ('{"frames": 200, "scene_starts": [5, 58]}',
+                    '{"frames": 200, "scene_starts": [0, 58, 58]}',
+                    '{"frames": 200, "scene_starts": [0, 200]}',
+                    '{"frames": 200}', "not json"):
+            self.assertIsNone(cuts.parse(bad, 200), bad)
+
+    def test_a_part_is_kept_only_when_it_saw_every_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            part = Path(tmp) / "p.json"
+            part.write_text('{"scene_changes":[0,58],"frame_count":100}')
+            self.assertEqual(cuts._read_part(part, 100), [0, 58])
+            self.assertIsNone(cuts._read_part(part, 101))
+
+    def test_the_list_is_attached_in_place_replacing_an_old_one(self):
+        chain = make_chain()
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(cuts, "mkvpropedit", return_value="mkvpropedit"), \
+                unittest.mock.patch.object(cuts, "attachment_index", return_value=4), \
+                unittest.mock.patch.object(cuts, "run") as ran:
+            self.assertTrue(cuts.attach(chain, Path("/f.mkv"), [0, 9], 20, Path(tmp)))
+        argv = ran.call_args.args[0]
+        self.assertEqual(argv[:3], ["mkvpropedit", "-q", "/f.mkv"])
+        self.assertLess(argv.index("--delete-attachment"), argv.index("--add-attachment"))
+        self.assertEqual(argv[argv.index("--attachment-mime-type") + 1], "application/json")
+
+    def test_no_mkvtoolnix_means_no_list_and_no_failure(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(cuts, "mkvpropedit", return_value=None):
+            self.assertFalse(cuts.attach(make_chain(), Path("/f.mkv"), [0], 9, Path(tmp)))
+
+    def test_regrain_allows_the_list_it_adds(self):
+        film = regrain.Track(0, "video", "av1", False)
+        listing = regrain.Track(1, "attachment", "", False,
+                                (("filename", cuts.ATTACHMENT), ("mimetype", "application/json")))
+        with unittest.mock.patch.object(regrain, "tracks", side_effect=[[film], [film, listing]]), \
+                unittest.mock.patch.object(regrain, "_video_packets", return_value=(9, "0")), \
+                unittest.mock.patch.object(regrain, "_duration", return_value=1.0):
+            regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
+
+    def test_regrain_falls_back_to_av1an_when_the_detector_fails(self):
+        chain = make_chain(scenechange="av-scenechange")
+        with unittest.mock.patch.object(cuts, "detect", side_effect=essential.Mismatch("x")), \
+                unittest.mock.patch.object(scenes, "prepare", return_value=Path("/s.json")), \
+                unittest.mock.patch.object(scenes, "detect") as av1an, \
+                unittest.mock.patch.object(scenes, "starts", return_value=[0, 7]):
+            found = regrain.find_scenes(make_info(), chain, config.Config(), Path("/w"))
+        av1an.assert_called_once()
+        self.assertEqual(found, [0, 7])
+        with unittest.mock.patch.object(cuts, "detect", return_value=[0, 3]) as fast:
+            self.assertEqual(regrain.find_scenes(make_info(), chain, config.Config(),
+                                                 Path("/w")), [0, 3])
+        fast.assert_called_once()
+
+    def test_a_run_keeps_av1ans_list_in_the_film(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            listing = Path(tmp) / "scenes.json"
+            listing.write_text(json.dumps({"frames": 30, "scenes": [
+                {"start_frame": 0, "end_frame": 12}, {"start_frame": 12, "end_frame": 30}]}))
+            with unittest.mock.patch.object(cuts, "attach") as attach:
+                pipeline._keep_scenes(listing, Path("/out.part"), make_chain(), Path(tmp))
+            attach.assert_called_once_with(unittest.mock.ANY, Path("/out.part"), [0, 12], 30,
+                                           Path(tmp))
+            with unittest.mock.patch.object(cuts, "attach") as attach:
+                pipeline._keep_scenes(Path(tmp) / "none.json", Path("/o"), make_chain(), Path(tmp))
+            attach.assert_not_called()
+
+
 class TestFilmGrainRoute(unittest.TestCase):
     def test_frames_that_do_not_match_fall_back_to_the_samples(self):
         cfg = config.Config()
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
-            listing = work / "scenes.json"
-            listing.write_text(json.dumps({"frames": 10, "scenes": [
-                {"start_frame": 0, "end_frame": 10}]}))
             with unittest.mock.patch.object(essential, "frames_table",
                                             side_effect=essential.Mismatch("short")), \
                     unittest.mock.patch.object(
                         pipeline, "_sampled_grain",
                         return_value=(work / "g.mkv", work / "t.tbl")) as old:
-                video, table = pipeline.film_grain(make_info(), work / "e.mkv", listing,
+                video, table = pipeline.film_grain(make_info(), work / "e.mkv", [0],
                                                    make_chain(), cfg, work)
         old.assert_called_once()
         self.assertEqual((video.name, present(table).name), ("g.mkv", "t.tbl"))
@@ -5109,12 +5204,9 @@ class TestFilmGrainRoute(unittest.TestCase):
         cfg = config.Config()
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
-            listing = work / "scenes.json"
-            listing.write_text(json.dumps({"frames": 10, "scenes": [
-                {"start_frame": 0, "end_frame": 10}]}))
             with unittest.mock.patch.object(essential, "frames_table", return_value=work / "f"), \
                     unittest.mock.patch.object(scenegrain, "apply",
                                                return_value=scenegrain.Result(False, None, None)):
-                video, table = pipeline.film_grain(make_info(), work / "e.mkv", listing,
+                video, table = pipeline.film_grain(make_info(), work / "e.mkv", [0],
                                                    make_chain(), cfg, work)
         self.assertEqual((video.name, table), ("e.mkv", None))

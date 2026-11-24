@@ -9,6 +9,7 @@ tools that already do the hard parts well:
 | [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) 4.x | The encoder (`SvtAv1EncApp`) |
 | [grav1synth](https://github.com/rust-av/grav1synth) | Writes a film grain table into the AV1 bitstream |
 | [SvtFgEssential](https://github.com/nekotrix/SVT-AV1-Essential) | Estimates the film's grain, frame by frame (SVT-AV1-Essential's standalone estimator; only this tool, not its encoder) |
+| [av-scenechange](https://github.com/rust-av/av-scenechange) | Finds scene cuts for `regrain`: the detector Av1an uses, fed by the hardware decoder where there is one |
 | [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) 8 | Probing, muxing, and `tonemapx` for Dolby Vision profile 5 |
 
 This repository contributes only the policy layer: what to encode, how grainy it is,
@@ -45,6 +46,7 @@ silicon or Intel):
 | Av1an 0.6.0 | `cargo install` from its git tag | Homebrew, whichever version it has (`doctor` says whether it is 0.6.0) |
 | grav1synth 0.2.0, patched | built from the crate with `scripts/grav1synth-0.2.0-grain-flag.patch` | the same |
 | SvtFgEssential, from SVT-AV1-Essential v4.3.1 | built from source into `~/.local/bin`, its commit recorded beside it | the same |
+| av-scenechange 0.24.1 | `cargo install`, its version recorded beside it | the same |
 | mkvtoolnix, Python 3.11+ | apt | Homebrew |
 
 Every version comes from [autotranscode/toolchain.toml](autotranscode/toolchain.toml):
@@ -206,6 +208,12 @@ Films encoded before this got one grain table for the whole film, from SVT-AV1's
 estimate on a few seconds of samples. `autotranscode regrain` gives them the new
 grain without encoding them again: AV1 carries grain as parameters the decoder
 synthesises, so only the frame headers are rewritten. It needs each film's source.
+
+Every film keeps its scene cuts inside it, as a small attachment that nothing
+plays (`autotranscode-scenes.json`), so a regrain does not have to find them
+again. Films encoded before this have none; regrain finds their cuts with
+av-scenechange, decoding on the hardware decoder where there is one, and adds
+them.
 
 Only with `grain.estimator = "grav1synth"` or `grain.denoise_before_encode` does
 the old detector, and so `grain.threshold_db`, come into play. `measure` prints its

@@ -58,6 +58,10 @@ class Toolchain:
     # SVT-AV1-Essential commit bootstrap recorded beside it (SVTFG_COMMIT_FILE), or "".
     svtfg: str | None = None
     svtfg_commit: str = ""
+    # av-scenechange's command-line tool, which `regrain` finds scene cuts with,
+    # and the crate version bootstrap recorded beside it (SCENECHANGE_VERSION_FILE).
+    scenechange: str | None = None
+    scenechange_version: str = ""
 
     # Reported by `doctor` to identify the ffmpeg build; nothing here consumes it.
     # See "Why there is no hardware acceleration" in the README before wiring it up.
@@ -255,6 +259,9 @@ def detect(cfg: Config) -> Toolchain:
     chain.svtfg = _find_svtfg(cfg.paths.svtfg, chain)
     if chain.svtfg:
         chain.svtfg_commit = read_svtfg_commit(chain.svtfg)
+    chain.scenechange = _find_scenechange(cfg.paths.scenechange, chain)
+    if chain.scenechange:
+        chain.scenechange_version = read_scenechange_version(chain.scenechange)
     chain.vspipe = _find_vspipe(chain)
     if chain.vspipe:
         _probe_vapoursynth(chain)
@@ -339,6 +346,31 @@ def _find_svtfg(configured: str, chain: Toolchain) -> str | None:
 def read_svtfg_commit(binary: str) -> str:
     try:
         return (Path(binary).parent / SVTFG_COMMIT_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+# Written by scripts/bootstrap.sh beside av-scenechange: the crate version it
+# installed. The tool has no --version.
+SCENECHANGE_VERSION_FILE = "av-scenechange.version"
+
+
+def _find_scenechange(configured: str, chain: Toolchain) -> str | None:
+    """av-scenechange as configured, else where cargo installs: beside our Av1an or
+    grav1synth, or in ~/.cargo/bin, which a systemd unit's PATH leaves out."""
+    if found := _which(configured):
+        return found
+    if "/" in configured:
+        return None
+    places = [Path(tool).parent for tool in (chain.av1an, chain.grav1synth) if tool]
+    places.append(Path.home() / ".cargo" / "bin")
+    return next((str(p / configured) for p in places if (p / configured).is_file()), None)
+
+
+def read_scenechange_version(binary: str) -> str:
+    try:
+        return (Path(binary).parent / SCENECHANGE_VERSION_FILE).read_text(
+            encoding="utf-8").strip()
     except OSError:
         return ""
 
@@ -437,6 +469,8 @@ def describe(chain: Toolchain) -> str:
         f"grav1synth  {chain.grav1synth or 'MISSING'}  ({chain.grav1synth_version or '-'})",
         f"svtfg       {chain.svtfg or 'MISSING'}  "
         f"({chain.svtfg_commit[:12] or 'commit not recorded'})",
+        f"scenechange {chain.scenechange or 'MISSING'}  "
+        f"({chain.scenechange_version or 'version not recorded'})",
         f"mkvmerge    {chain.mkvmerge or 'MISSING'}  ({chain.mkvmerge_version or '-'})",
         f"vapoursynth {chain.vspipe or 'no'}  "
         f"(R{chain.vapoursynth_version or '?'}; "

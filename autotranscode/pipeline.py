@@ -27,7 +27,19 @@ from collections.abc import Collection, Iterator, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from . import encode, essential, grain, mux, progress, resume, scenegrain, scenes, update, watch
+from . import (
+    cuts,
+    encode,
+    essential,
+    grain,
+    mux,
+    progress,
+    resume,
+    scenegrain,
+    scenes,
+    update,
+    watch,
+)
 from .config import Config
 from .probe import MediaInfo, probe
 from .state import Ledger, Record
@@ -435,8 +447,8 @@ def _calibrate_grain(
     return True
 
 
-def film_grain(read: MediaInfo, base: Path, scene_list: Path, chain: Toolchain, cfg: Config,
-               work: Path) -> tuple[Path, Path | None]:
+def film_grain(read: MediaInfo, base: Path, scene_starts: Sequence[int] | None,
+               chain: Toolchain, cfg: Config, work: Path) -> tuple[Path, Path | None]:
     """`base` (an encode, with grain or without) with the film's grain from
     SvtFgEssential, calibrated scene by scene: the stream to mux, and its table
     (None when the source has no grain worth putting back).
@@ -446,7 +458,7 @@ def film_grain(read: MediaInfo, base: Path, scene_list: Path, chain: Toolchain, 
     be matched one for one -- a source whose decoder finds other frames than
     Av1an's did -- fall back to the estimate from samples.
     """
-    starts = scenes.starts(scene_list)
+    starts = list(scene_starts) if scene_starts else None
     if starts is None:
         starts = scenegrain.read_stream(chain, base).keyframes
         log.info("  no scene list; the encode's keyframes stand in for its scenes")
@@ -462,6 +474,20 @@ def film_grain(read: MediaInfo, base: Path, scene_list: Path, chain: Toolchain, 
         return base, None
     log.info("  film grain applied from table")
     return result.video, result.table
+
+
+def _keep_scenes(scene_list: Path, muxed: Path, chain: Toolchain, work: Path) -> None:
+    """Keep Av1an's scene cuts inside the film, for a later `regrain` (cuts.py).
+    A film is fine without them, so a failure here costs only a note."""
+    starts = scenes.starts(scene_list)
+    frames = scenes.frame_count(scene_list)
+    if not starts or not frames:
+        return
+    try:
+        cuts.attach(chain, muxed, starts, frames, work)
+    except (CommandError, OSError) as exc:
+        log.warning("  the scene list is not kept in the film: %s",
+                    str(exc).splitlines()[0] if str(exc) else exc)
 
 
 def _sampled_grain(read: MediaInfo, base: Path, chain: Toolchain, cfg: Config,
@@ -837,7 +863,7 @@ def _transcode(
 
     video = encoded
     if whole_film:
-        video, table = film_grain(read, encoded, scene_list, chain, cfg, work)
+        video, table = film_grain(read, encoded, scenes.starts(scene_list), chain, cfg, work)
     elif table:
         grainy = work / "grainy.mkv"
         # No fallback here on purpose. The encoder strips grain whether or not it
@@ -866,6 +892,7 @@ def _transcode(
     muxed = staged_out if staged_out is not None else final.with_name(final.name + ".part")
     muxed.unlink(missing_ok=True)
     mux.mux(video, read, muxed, chain, cfg)
+    _keep_scenes(scene_list, muxed, chain, work)
 
     output_bytes = muxed.stat().st_size
     reason = watch.shortfall(cfg, info.size_bytes, output_bytes)

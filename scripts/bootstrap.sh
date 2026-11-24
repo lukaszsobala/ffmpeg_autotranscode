@@ -8,7 +8,7 @@
 #   ./scripts/bootstrap.sh            # everything
 #   ./scripts/bootstrap.sh ffmpeg     # just one stage
 #
-# Stages: deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth svtfg verify
+# Stages: deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth svtfg scenechange verify
 #
 # On Linux only the `deps` and `ffmpeg` stages use sudo, and only to run apt-get;
 # as root, as in the Dockerfile, they run it directly.
@@ -46,6 +46,7 @@ AV1AN_VERSION="${AV1AN_VERSION:-$(pin av1an)}"
 # the patch builds into `grav1synth --version`.
 GRAV1SYNTH_VERSION="${GRAV1SYNTH_VERSION:-$(pin grav1synth | cut -d+ -f1)}"
 SVTFG_COMMIT="${SVTFG_COMMIT:-$(pin svtfg)}"
+SCENECHANGE_VERSION="${SCENECHANGE_VERSION:-$(pin scenechange)}"
 LSMASH_WORKS_COMMIT="${LSMASH_WORKS_COMMIT:-$(pin lsmash)}"
 PREFIX="${PREFIX:-$HOME/.local}"
 BUILD_DIR="${BUILD_DIR:-$HOME/.cache/autotranscode-build}"
@@ -87,7 +88,7 @@ case "$(uname -s)" in
     command -v apt-get >/dev/null || die "this script installs with apt-get (Debian, Ubuntu \
 and derivatives). On another distribution install by hand: build tools, cmake, nasm, \
 pkg-config, mkvtoolnix, Python 3.11+ and the ffmpeg development headers, then run the \
-ffmpeg, svtav1, vapoursynth, lsmash, av1an, grav1synth and svtfg stages, which need no package \
+ffmpeg, svtav1, vapoursynth, lsmash, av1an, grav1synth, svtfg and scenechange stages, which need no package \
 manager."
     JOBS="${JOBS:-$(nproc)}"
     ;;
@@ -413,6 +414,21 @@ stage_svtfg() {
   done_with "$src"
 }
 
+stage_scenechange() {
+  # av-scenechange's own command-line tool: `regrain` finds scene cuts with it on
+  # frames from the video engine, twice as fast as Av1an's detection. The crate
+  # Av1an detects with, at the version Av1an's lock file takes. Builds in under a
+  # minute once Av1an has filled cargo's cache.
+  log "Installing av-scenechange ${SCENECHANGE_VERSION} (scene cuts for regrain)"
+  ensure_cargo
+  cargo install av-scenechange --version "$SCENECHANGE_VERSION" --locked --force
+  # It has no --version: this is how `doctor` knows which it is.
+  # Where cargo put it: CARGO_INSTALL_ROOT (as in the Dockerfile), else CARGO_HOME.
+  local bin="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
+  printf '%s\n' "$SCENECHANGE_VERSION" > "$bin/av-scenechange.version"
+  [[ -x $bin/av-scenechange ]] || die "av-scenechange did not install"
+}
+
 # The first Python on PATH that is 3.11 or newer (tomllib), or nothing.
 find_python() {
   local candidate
@@ -452,7 +468,7 @@ EOF
 main() {
   local stages=("$@")
   if [[ ${#stages[@]} -eq 0 ]]; then
-    stages=(deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth svtfg verify)
+    stages=(deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth svtfg scenechange verify)
   fi
   for stage in "${stages[@]}"; do
     case "$stage" in
@@ -464,6 +480,7 @@ main() {
       av1an)      stage_av1an ;;
       grav1synth) stage_grav1synth ;;
       svtfg)      stage_svtfg ;;
+      scenechange) stage_scenechange ;;
       verify)     stage_verify ;;
       *)          die "unknown stage: $stage" ;;
     esac

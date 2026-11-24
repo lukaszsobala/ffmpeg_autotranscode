@@ -5,7 +5,8 @@ turns into grain, so a better grain table needs no new encode: grav1synth
 rewrites the headers, replacing whatever grain was there (applying a table over
 an earlier one gave, frame for frame, the pictures of applying it to the encode
 without grain). So for each finished film: its source is found in the ledger,
-its grain estimated and calibrated scene by scene as `run` does now
+its scene cuts read from the film, or found and then kept in it (cuts.py), its
+grain estimated and calibrated scene by scene as `run` does now
 (pipeline.film_grain), the video track rewritten, and the file remuxed with every
 other track as it was. The new file is checked against the old one and then
 takes its place.
@@ -23,9 +24,9 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import pipeline, progress, scenes
+from . import cuts, pipeline, progress, scenegrain, scenes
 from .config import Config
-from .probe import probe
+from .probe import MediaInfo, probe
 from .state import Ledger, Record
 from .tools import Toolchain
 from .util import CommandError, human_duration, human_size, log, run
@@ -148,6 +149,11 @@ def remux_command(chain: Toolchain, output: Path, found: list[Track], film: Trac
     return [*argv, "-f", "matroska", str(part)]
 
 
+def _without_scene_list(found: list[Track]) -> list[Track]:
+    return [track for track in found
+            if not (track.kind == "attachment" and ("filename", cuts.ATTACHMENT) in track.tags)]
+
+
 def _video_packets(chain: Toolchain, path: Path, index: int) -> tuple[int, str]:
     out = run([chain.ffprobe, "-v", "error", "-select_streams", str(index),
                "-show_entries", "packet=pts", "-of", "csv=p=0", str(path)]).stdout.split()
@@ -164,8 +170,9 @@ def _duration(chain: Toolchain, path: Path) -> float:
 
 
 def check(chain: Toolchain, old: Path, new: Path) -> None:
-    """Raise ValueError unless `new` is `old` with the film track's grain changed."""
-    before, after = tracks(chain, old), tracks(chain, new)
+    """Raise ValueError unless `new` is `old` with the film track's grain changed
+    (and the scene list kept in it, which may be new)."""
+    before, after = (_without_scene_list(tracks(chain, path)) for path in (old, new))
     if [(t.kind, t.codec) for t in before] != [(t.kind, t.codec) for t in after]:
         raise ValueError(f"the tracks changed: {[(t.kind, t.codec) for t in before]} -> "
                          f"{[(t.kind, t.codec) for t in after]}")
@@ -180,6 +187,25 @@ def check(chain: Toolchain, old: Path, new: Path) -> None:
     longer = abs(_duration(chain, new) - _duration(chain, old))
     if longer > DURATION_TOLERANCE:
         raise ValueError(f"the length changed by {longer:.2f}s")
+
+
+def find_scenes(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> list[int] | None:
+    """The source's scene cuts: by av-scenechange on the video engine (cuts.detect),
+    else by Av1an as `run` finds them. None when neither finds any; the encode's
+    keyframes then stand in."""
+    if chain.scenechange:
+        try:
+            return cuts.detect(read, chain, cfg, work)
+        except (CommandError, ValueError) as exc:
+            detail = exc.stderr.strip()[-200:] if isinstance(exc, CommandError) else str(exc)
+            log.warning("  scene detection by av-scenechange failed (%s); Av1an detects "
+                        "them instead", detail)
+    else:
+        log.info("  av-scenechange not found (scripts/bootstrap.sh scenechange); Av1an "
+                 "detects the scenes")
+    scene_list = scenes.prepare(read, chain, cfg, work)
+    scenes.detect(read, chain, cfg, work, scene_list)
+    return scenes.starts(scene_list)
 
 
 def regrain_one(target: Target, chain: Toolchain, cfg: Config, ledger: Ledger) -> str:
@@ -199,9 +225,14 @@ def regrain_one(target: Target, chain: Toolchain, cfg: Config, ledger: Ledger) -
         film = film_track(found)
         video = work / "regrain-video.mkv"
         run(extract_command(chain, output, film.index, video))
-        scene_list = scenes.prepare(info, chain, cfg, work)
-        scenes.detect(info, chain, cfg, work, scene_list)
-        new_video, table = pipeline.film_grain(info, video, scene_list, chain, cfg, work)
+        frames = len(scenegrain.read_stream(chain, video).stamps)
+        starts = cuts.attached(chain, output, frames, work)
+        kept = starts is not None
+        if kept:
+            log.info("  scene list kept in the film: %d scenes", len(starts or ()))
+        else:
+            starts = find_scenes(info, chain, cfg, work)
+        new_video, table = pipeline.film_grain(info, video, starts, chain, cfg, work)
         if table is None:
             stripped = work / "regrain-plain.mkv"
             run([chain.grav1synth or "grav1synth", "remove", str(video), "-o", str(stripped),
@@ -209,6 +240,8 @@ def regrain_one(target: Target, chain: Toolchain, cfg: Config, ledger: Ledger) -
             new_video = stripped
         flags, aspect = video_details(chain, output, film.index)
         run(remux_command(chain, output, found, film, new_video, flags, aspect, part))
+        if not kept and starts:
+            cuts.attach(chain, part, starts, frames, work)
         check(chain, output, part)
         os.replace(part, output)
     except BaseException:

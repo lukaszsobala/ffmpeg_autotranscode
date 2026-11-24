@@ -35,6 +35,7 @@ RUN site="$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
 RUN /src/bootstrap.sh lsmash
 RUN CARGO_BUILD_JOBS="${JOBS:-$(nproc)}" /src/bootstrap.sh av1an
 RUN CARGO_BUILD_JOBS="${JOBS:-$(nproc)}" /src/bootstrap.sh grav1synth
+RUN CARGO_BUILD_JOBS="${JOBS:-$(nproc)}" /src/bootstrap.sh scenechange
 # Keep what runs, drop what only built things. Then name the Debian packages the
 # binaries link against, so the runtime image installs exactly those.
 RUN rm -rf "$PREFIX/include" "$PREFIX/lib/pkgconfig" "$PREFIX/share" "$PREFIX/.crates"* \

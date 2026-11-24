@@ -39,7 +39,8 @@ BUILD_LOG = "update.log"     # bootstrap.sh's output, when a run installs an upd
 # Installed and kept current by the system's package manager, not by `update`.
 SYSTEM_STAGES = {"deps", "ffmpeg"}
 NAMES = {"svtav1": "SVT-AV1", "av1an": "Av1an", "grav1synth": "grav1synth",
-         "vapoursynth": "VapourSynth", "lsmash": "L-SMASH-Works", "svtfg": "SvtFgEssential"}
+         "vapoursynth": "VapourSynth", "lsmash": "L-SMASH-Works", "svtfg": "SvtFgEssential",
+         "scenechange": "av-scenechange"}
 GIT_TIMEOUT = 60
 
 

@@ -54,6 +54,9 @@ class Paths:
     # SVT-AV1-Essential's grain estimator, for grain.estimator = "svtfg". Found
     # beside SvtAv1EncApp or in ~/.local/bin when not on PATH.
     svtfg: str = "SvtFgEssential"
+    # av-scenechange's command-line tool, which `regrain` finds scene cuts with.
+    # Found beside Av1an or in ~/.cargo/bin when not on PATH.
+    scenechange: str = "av-scenechange"
     mkvmerge: str = "mkvmerge"
     work_dir: str = "~/.cache/autotranscode"
     state_file: str = "~/.cache/autotranscode/state.json"

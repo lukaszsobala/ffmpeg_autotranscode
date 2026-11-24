@@ -174,6 +174,13 @@ def starts(path: Path) -> list[int] | None:
     return found or None
 
 
+def frame_count(path: Path) -> int:
+    """The frame count of a whole scene list, or 0."""
+    if not whole_list(path):
+        return 0
+    return int(json.loads(path.read_text(encoding="utf-8"))["frames"])
+
+
 def plan(frames: int, length: int) -> list[tuple[int, int | None]]:
     """The parts of a film of `frames` frames: `length` each, the last running to
     the end, so between one and two lengths long."""
