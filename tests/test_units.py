@@ -13,6 +13,7 @@ import io
 import itertools
 import json
 import locale
+import logging
 import os
 import random
 import re
@@ -59,6 +60,44 @@ from autotranscode.probe import ContentLight, DolbyVision, MasteringDisplay, Med
 from autotranscode.state import Guess, Ledger, Record
 from autotranscode.tools import Toolchain
 from autotranscode.util import MIB, CommandError
+
+
+class _CurrentStderr(logging.StreamHandler):
+    """Writes each record to whatever sys.stderr is at that moment: under a
+    buffered run, the test's own buffer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFormatter(logging.Formatter("%(levelname)-7s %(message)s"))
+
+    @property  # type: ignore[override]
+    def stream(self):
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, _value) -> None:
+        pass
+
+
+# Many tests take the failure paths on purpose, and their warnings and errors
+# looked like real ones in the output. The package's log goes to the current
+# stderr (not to the handler cli.main sets on the root logger, which keeps the
+# stderr of the test that made it), and load_tests buffers each test's output:
+# a passing test shows nothing, a failing one shows its log with the failure.
+util.log.addHandler(_CurrentStderr())
+util.log.setLevel(logging.INFO)
+util.log.propagate = False
+
+
+class _BufferedSuite(unittest.TestSuite):
+    def run(self, result, debug=False):
+        result.buffer = True
+        return super().run(result, debug)
+
+
+def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None):
+    return _BufferedSuite(tests)
+
 
 TABLE = """filmgrn1
 E 0 3000000 1 7391 1
