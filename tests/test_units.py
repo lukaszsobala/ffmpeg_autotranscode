@@ -4988,6 +4988,41 @@ class TestStoppingWorkers(unittest.TestCase):
         self.assertEqual(len(started), 2)
 
 
+class TestChildrenLeaveTheTerminal(unittest.TestCase):
+    """No child reads the terminal: ffmpeg turns its echo off while it runs and on
+    as it exits, so several at once (or one killed) left a regrain's terminal
+    without echo, and a key typed there reached them (q quits ffmpeg)."""
+
+    # Run in the foreground on purpose, the terminal theirs: a build the user
+    # watches (bootstrap.sh may ask for a password), and `doctor` after an update.
+    INTERACTIVE: ClassVar[set[tuple[str, str]]] = {("update.py", "argv"), ("cli.py", "doctor")}
+
+    def test_every_child_is_given_its_input(self):
+        import ast
+        missing = []
+        for path in sorted(Path(util.__file__).parent.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "subprocess"
+                        and node.func.attr in {"run", "Popen", "call", "check_output"}):
+                    continue
+                if any(k.arg in {"stdin", "input"} for k in node.keywords):
+                    continue
+                first = node.args[0] if node.args else None
+                name = first.id if isinstance(first, ast.Name) else ""
+                if (path.name, name) not in self.INTERACTIVE:
+                    missing.append(f"{path.name}:{node.lineno}")
+        self.assertEqual(missing, [])
+
+    def test_run_gives_none(self):
+        done = subprocess.CompletedProcess([], 0, "", "")
+        with unittest.mock.patch.object(util.subprocess, "run", return_value=done) as ran:
+            util.run(["true"])
+        self.assertIs(ran.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+
 class TestSceneList(unittest.TestCase):
     def test_scene_starts_are_the_cuts_not_the_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5106,27 +5141,74 @@ class TestRegrain(unittest.TestCase):
             self.assertEqual(regrain.main(self.cfg, make_chain(), [self.out]), 2)
         work.assert_not_called()
 
+    @staticmethod
+    def _remux(found, film, aspect="", rest=Path("/rest.mkv")):
+        return regrain.remux_command(make_chain(), rest, found, film, Path("/new.mkv"),
+                                     Path("/base.mkv"), aspect, Path("/o.part"))
+
     def test_every_track_keeps_its_place(self):
-        found = [regrain.Track(0, "video", "av1", False), regrain.Track(1, "audio", "opus", False),
+        found = [regrain.Track(0, "video", "av1", False, flags=("default",)),
+                 regrain.Track(1, "audio", "opus", False),
                  regrain.Track(2, "subtitle", "subrip", False),
                  regrain.Track(3, "attachment", "ttf", False)]
-        argv = regrain.remux_command(make_chain(), Path("/o.mkv"), found, found[0],
-                                     Path("/v.mkv"), ["default"], "", Path("/o.part"))
+        argv = self._remux(found, found[0])
+        self.assertEqual(argv[argv.index("-i") + 1:argv.index("-i") + 2], ["/new.mkv"])
         maps = [argv[i + 1] for i, a in enumerate(argv) if a == "-map"]
-        self.assertEqual(maps, ["1:0", "0:1", "0:2", "0:3"])
+        self.assertEqual(maps, ["0:0", "2:0", "2:1", "2:2"])
         self.assertIn("-copyts", argv)
         self.assertEqual(argv[argv.index("-disposition:0") + 1], "default")
+        # The chapters and the film's own tags come with the rest.
+        self.assertEqual(argv[argv.index("-map_chapters") + 1], "2")
+        self.assertEqual(argv[argv.index("-map_metadata") + 1], "2")
 
     def test_every_tracks_tags_are_mapped(self):
         # One stream mapping turns off ffmpeg's own copying for every stream: the
         # first regrain of Film A lost every language and the
-        # commentary's title.
+        # commentary's title. The film track's come from the track taken out.
         found = [regrain.Track(0, "audio", "ac3", False), regrain.Track(1, "video", "av1", False),
                  regrain.Track(2, "attachment", "ttf", False)]
-        argv = regrain.remux_command(make_chain(), Path("/o.mkv"), found, found[1],
-                                     Path("/v.mkv"), [], "", Path("/o.part"))
+        argv = self._remux(found, found[1])
         self.assertEqual([argv[argv.index(f"-map_metadata:s:{n}") + 1] for n in range(3)],
-                         ["0:s:0", "0:s:1", "0:s:2"])
+                         ["2:s:0", "1:s:0", "2:s:1"])
+
+    def test_every_tracks_dispositions_are_set(self):
+        # Left to itself ffmpeg marks the first of several subtitles default when
+        # none is: Film H's English subtitles would have come on by
+        # themselves.
+        found = [regrain.Track(0, "video", "av1", False, flags=("default",)),
+                 regrain.Track(1, "subtitle", "subrip", False),
+                 regrain.Track(2, "subtitle", "hdmv_pgs_subtitle", False,
+                               flags=("default", "forced"))]
+        argv = self._remux(found, found[0])
+        self.assertEqual([argv[argv.index(f"-disposition:{n}") + 1] for n in range(3)],
+                         ["default", "0", "default+forced"])
+
+    def test_a_changed_disposition_is_caught(self):
+        before = [regrain.Track(0, "video", "av1", False),
+                  regrain.Track(1, "subtitle", "subrip", False)]
+        after = [before[0], replace(before[1], flags=("default",))]
+        with unittest.mock.patch.object(regrain, "tracks", side_effect=[before, after]), \
+                self.assertRaisesRegex(ValueError, "dispositions"):
+            regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
+
+    def test_one_read_takes_the_film_apart(self):
+        argv = regrain.split_command(make_chain(), Path("/f.mkv"), 1, Path("/v.mkv"),
+                                     Path("/r.mkv"))
+        self.assertEqual(argv.count("-i"), 1)
+        self.assertEqual(argv[argv.index("/v.mkv") - 6:argv.index("/v.mkv") - 4],
+                         ["-map", "0:1"])
+        rest = argv[argv.index("/v.mkv") + 1:]
+        self.assertEqual(rest[:4], ["-map", "0", "-map", "-0:1"])
+        self.assertIn("-map_chapters", rest)
+        self.assertEqual(rest[-1], "/r.mkv")
+        alone = regrain.split_command(make_chain(), Path("/f.mkv"), 0, Path("/v.mkv"), None)
+        self.assertEqual(alone[-1], "/v.mkv")
+
+    def test_a_film_with_no_other_track_takes_everything_from_the_track(self):
+        found = [regrain.Track(0, "video", "av1", False)]
+        argv = self._remux(found, found[0], rest=None)
+        self.assertEqual(argv.count("-i"), 2)
+        self.assertEqual(argv[argv.index("-map_chapters") + 1], "1")
 
     def test_lost_tags_are_caught(self):
         before = [regrain.Track(0, "video", "av1", False),
@@ -5139,10 +5221,9 @@ class TestRegrain(unittest.TestCase):
     def test_a_film_track_after_cover_art_is_the_one_replaced(self):
         found = [regrain.Track(0, "video", "mjpeg", True), regrain.Track(1, "video", "av1", False)]
         film = regrain.film_track(found)
-        argv = regrain.remux_command(make_chain(), Path("/o.mkv"), found, film, Path("/v.mkv"),
-                                     [], "2.39:1", Path("/o.part"))
+        argv = self._remux(found, film, aspect="2.39:1")
         maps = [argv[i + 1] for i, a in enumerate(argv) if a == "-map"]
-        self.assertEqual(maps, ["0:0", "1:0"])
+        self.assertEqual(maps, ["2:0", "0:0"])
         self.assertEqual(argv[argv.index("-aspect:1") + 1], "2.39:1")
 
     def test_a_changed_file_is_not_put_in_place(self):
@@ -5155,6 +5236,24 @@ class TestRegrain(unittest.TestCase):
                                            side_effect=[(100, "0"), (99, "0")]), \
                 self.assertRaises(ValueError):
             regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
+
+    def test_a_moved_track_or_lost_chapter_is_caught(self):
+        before = [regrain.Track(0, "video", "av1", False), regrain.Track(1, "audio", "ac3", False)]
+        was = regrain.Layout(100.0, (("video", "0.000"), ("audio", "0.000")),
+                             (("0.0", "50.0", "One"), ("50.0", "100.0", "Two")))
+        for now in (replace(was, starts=(("video", "0.000"), ("audio", "0.042"))),
+                    replace(was, chapters=was.chapters[:1])):
+            with unittest.mock.patch.object(regrain, "tracks", return_value=before), \
+                    unittest.mock.patch.object(regrain, "_video_packets", return_value=(9, "0")), \
+                    unittest.mock.patch.object(regrain, "layout", side_effect=[was, now]), \
+                    self.assertRaises(ValueError):
+                regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
+        with unittest.mock.patch.object(regrain, "tracks", return_value=before), \
+                unittest.mock.patch.object(regrain, "_video_packets", return_value=(9, "0")) as n, \
+                unittest.mock.patch.object(regrain, "layout", side_effect=[was, was]):
+            regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"), Path("/v.mkv"))
+        # The film is counted from the track taken out of it, not read whole.
+        self.assertEqual(n.call_args_list[0].args[1:], (Path("/v.mkv"), 0))
 
 
 class TestSceneCuts(unittest.TestCase):
@@ -5224,7 +5323,8 @@ class TestSceneCuts(unittest.TestCase):
                                 (("filename", cuts.ATTACHMENT), ("mimetype", "application/json")))
         with unittest.mock.patch.object(regrain, "tracks", side_effect=[[film], [film, listing]]), \
                 unittest.mock.patch.object(regrain, "_video_packets", return_value=(9, "0")), \
-                unittest.mock.patch.object(regrain, "_duration", return_value=1.0):
+                unittest.mock.patch.object(regrain, "layout",
+                                           return_value=regrain.Layout(1.0, (), ())):
             regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
 
     def test_the_grain_method_names_the_estimator_build(self):
@@ -5246,20 +5346,196 @@ class TestSceneCuts(unittest.TestCase):
             cfg.paths.work_dir = str(Path(tmp) / "work")
             target = regrain.Target(output, Record(source=str(source), status="done",
                                                    output=str(output)))
-            current = cuts.Kept([0, 9], "svtfg 9f7ebdc5ffbe")
-            with unittest.mock.patch.object(regrain, "kept", return_value=current), \
+            current = cuts.attachment_text([0, 9], 20, "svtfg 9f7ebdc5ffbe")
+            with unittest.mock.patch.object(regrain, "kept_text", return_value=current), \
                     unittest.mock.patch.object(regrain, "probe") as probed:
                 outcome = regrain.regrain_one(target, chain, cfg, unittest.mock.Mock())
             self.assertTrue(outcome.startswith("skipped"), outcome)
             probed.assert_not_called()
-            older = cuts.Kept([0, 9], "")
-            for found, force in ((older, False), (current, True)):
-                with unittest.mock.patch.object(regrain, "kept", return_value=found), \
+            older = cuts.attachment_text([0, 9], 20)
+            for found, force in ((older, False), (current, True), (None, False)):
+                with unittest.mock.patch.object(regrain, "kept_text", return_value=found), \
                         unittest.mock.patch.object(regrain, "probe",
                                                    side_effect=OSError("went on")), \
                         self.assertRaisesRegex(OSError, "went on"):
                     regrain.regrain_one(target, chain, cfg, unittest.mock.Mock(), force)
 
+    def test_what_made_the_grain_is_read_without_counting_frames(self):
+        text = cuts.attachment_text([0, 58, 125], 200, "svtfg abc")
+        self.assertEqual(cuts.parse(text, None), cuts.Kept([0, 58, 125], "svtfg abc"))
+        self.assertIsNone(cuts.parse('{"frames": 100, "scene_starts": [0, 100]}', None))
+
+
+class TestStagedRegrain(unittest.TestCase):
+    """With staging on, regrain reads the library's disks twice and writes once."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.library = self.tmp / "library"
+        self.library.mkdir()
+        self.output = self.library / "Film.av1.mkv"
+        self.source = self.library / "Film.mkv"
+        self.output.write_bytes(b"the old film")
+        self.source.write_bytes(b"the source")
+        self.cfg = config.Config()
+        self.cfg.paths.work_dir = str(self.tmp / "work")
+        self.cfg.staging.enabled = True
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _regrain(self, tracks: list | None = None, **patches: Any) -> list[list[str]]:
+        commands: list[list[str]] = []
+        found = tracks or [regrain.Track(0, "video", "av1", False),
+                           regrain.Track(1, "audio", "opus", False)]
+        staged = self.cfg.staging_dir / (pipeline.source_digest(self.source) + ".mkv")
+        self.source_at_remux: bool | None = None
+
+        def ran(argv, *_args, **_kwargs):
+            commands.append([str(arg) for arg in argv])
+            if str(argv[-1]).endswith((regrain.STAGED_NEW, regrain.PART_SUFFIX)):
+                self.source_at_remux = staged.exists()    # the remux: the new film
+                Path(argv[-1]).write_bytes(b"the new film")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        work = pipeline._work_dir(self.source, self.cfg)
+        defaults: dict[str, Any] = dict(
+            kept_text=None, probe=make_info(path=self.source, size_bytes=10),
+            tracks=found, find_scenes=[0, 5], video_details=([], ""), check=None)
+        defaults.update(patches)
+        target = regrain.Target(self.output, Record(source=str(self.source), status="done",
+                                                    output=str(self.output)))
+        grain = patches.pop("film_grain", (work / "grainy.mkv", work / "grain.tbl"))
+        defaults.pop("film_grain", None)
+        with contextlib.ExitStack() as stack:
+            for name, value in defaults.items():
+                how = ({"side_effect": value} if isinstance(value, BaseException)
+                       else {"return_value": value})
+                stack.enter_context(unittest.mock.patch.object(regrain, name, **how))
+            stack.enter_context(unittest.mock.patch.object(regrain, "run", side_effect=ran))
+            stack.enter_context(unittest.mock.patch.object(
+                scenegrain, "read_stream", return_value=unittest.mock.Mock(stamps=[0] * 10)))
+            how = ({"side_effect": grain} if isinstance(grain, BaseException)
+                   else {"return_value": grain})
+            self.film_grain = stack.enter_context(unittest.mock.patch.object(
+                pipeline, "film_grain", **how))
+            stack.enter_context(unittest.mock.patch.object(cuts, "attach", return_value=True))
+            regrain.regrain_one(target, make_chain(), self.cfg, unittest.mock.Mock())
+        return commands
+
+    def _library(self) -> list[str]:
+        return sorted(p.name for p in self.library.iterdir())
+
+    def test_the_film_is_read_once_and_the_new_one_written_back(self):
+        commands = self._regrain()
+        reading = [argv for argv in commands if any(str(self.library) in a for a in argv)]
+        # One read takes the film apart; the remux works from the parts.
+        self.assertEqual(len(reading), 1)
+        self.assertEqual(reading[0][reading[0].index("-i") + 1], str(self.output))
+        self.assertIn(str(pipeline._work_dir(self.source, self.cfg) / regrain.REST), reading[0])
+        # The estimate and calibration decode the staged source, gone by the remux.
+        read = self.film_grain.call_args.args[0]
+        self.assertEqual(read.path.parent, self.cfg.staging_dir)
+        self.assertIs(self.source_at_remux, False)
+        self.assertEqual(self.output.read_bytes(), b"the new film")
+        self.assertEqual(self._library(), ["Film.av1.mkv", "Film.mkv"])
+        self.assertEqual(list(self.cfg.staging_dir.iterdir()), [])
+
+    def test_without_staging_it_works_in_place(self):
+        self.cfg.staging.enabled = False
+        commands = self._regrain()
+        self.assertTrue(commands[-1][-1].endswith(regrain.PART_SUFFIX))
+        self.assertEqual(self.output.read_bytes(), b"the new film")
+        self.assertEqual(self._library(), ["Film.av1.mkv", "Film.mkv"])
+
+    def test_a_stop_during_the_grain_keeps_the_staged_source(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self._regrain(film_grain=KeyboardInterrupt())
+        self.assertEqual(self.output.read_bytes(), b"the old film")
+        digest = pipeline.source_digest(self.source)
+        self.assertEqual([p.name for p in self.cfg.staging_dir.iterdir()], [f"{digest}.mkv"])
+        work = pipeline._work_dir(self.source, self.cfg)
+        self.assertTrue((work / regrain.VIDEO_NOTE).is_file())
+
+    def test_a_stop_at_the_end_leaves_the_old_film_and_nothing_half_made(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self._regrain(check=KeyboardInterrupt())
+        self.assertEqual(self.output.read_bytes(), b"the old film")
+        self.assertEqual(list(self.cfg.staging_dir.iterdir()), [])
+        self.assertEqual(self._library(), ["Film.av1.mkv", "Film.mkv"])
+
+    def test_a_failure_drops_the_staged_source(self):
+        with self.assertRaises(CommandError):
+            self._regrain(film_grain=CommandError(["x"], 1, "boom"))
+        self.assertEqual(list(self.cfg.staging_dir.iterdir()), [])
+        self.assertEqual(self.output.read_bytes(), b"the old film")
+
+    def test_no_room_puts_the_new_film_beside_the_old_one(self):
+        self.cfg.staging_dir.mkdir(parents=True)
+        roomy = shutil.disk_usage(self.cfg.staging_dir)
+        with unittest.mock.patch.object(regrain.shutil, "disk_usage",
+                                        return_value=roomy._replace(free=4)):
+            path = regrain._new_film_path(self.output, self.source, self.cfg, local=True)
+        self.assertEqual(path, self.output.with_name(self.output.name + regrain.PART_SUFFIX))
+        self.assertEqual(regrain._new_film_path(self.output, self.source, self.cfg, True).parent,
+                         self.cfg.staging_dir)
+
+    def test_a_film_taken_apart_whole_is_used_again_while_it_is_the_films(self):
+        work = self.tmp / "w"
+        work.mkdir()
+        found = [regrain.Track(0, "video", "av1", False), regrain.Track(1, "audio", "ac3", False)]
+
+        def split(argv, *_a, **_k):
+            for name in (regrain.VIDEO, regrain.REST):
+                (work / name).write_bytes(b"part")
+
+        with unittest.mock.patch.object(regrain, "run", side_effect=split) as ran:
+            video, rest = regrain.take_apart(make_chain(), self.output, found, found[0], work)
+            self.assertEqual((video, rest), (work / regrain.VIDEO, work / regrain.REST))
+            regrain.take_apart(make_chain(), self.output, found, found[0], work)
+            self.assertEqual(ran.call_count, 1)
+            os.utime(self.output, ns=(0, 0))    # the film changed since
+            regrain.take_apart(make_chain(), self.output, found, found[0], work)
+            self.assertEqual(ran.call_count, 2)
+            (work / regrain.REST).unlink()      # a part gone: taken apart again
+            regrain.take_apart(make_chain(), self.output, found, found[0], work)
+            self.assertEqual(ran.call_count, 3)
+            # Stopped while taking it apart: the note goes first, so no half parts.
+            ran.side_effect = KeyboardInterrupt
+            os.utime(self.output, ns=(1, 1))
+            with self.assertRaises(KeyboardInterrupt):
+                regrain.take_apart(make_chain(), self.output, found, found[0], work)
+            self.assertFalse((work / regrain.VIDEO_NOTE).exists())
+        alone = [found[0]]
+        with unittest.mock.patch.object(regrain, "run", side_effect=split):
+            _, rest = regrain.take_apart(make_chain(), self.output, alone, alone[0], work)
+        self.assertIsNone(rest)
+
+    def test_cuts_found_are_kept_for_a_rerun(self):
+        work = self.tmp / "w"
+        work.mkdir()
+        with unittest.mock.patch.object(regrain, "find_scenes", return_value=[0, 40]) as found:
+            first = regrain.scene_starts(make_info(), make_chain(), self.cfg, work, 100)
+            again = regrain.scene_starts(make_info(), make_chain(), self.cfg, work, 100)
+            self.assertEqual(found.call_count, 1)
+            regrain.scene_starts(make_info(), make_chain(), self.cfg, work, 120)
+            self.assertEqual(found.call_count, 2)    # for another frame count: found again
+        self.assertEqual(first, [0, 40])
+        self.assertEqual(again, [0, 40])
+
+    def test_put_back_leaves_the_old_film_when_the_copy_fails(self):
+        new = self.tmp / "new.mkv"
+        new.write_bytes(b"the new film")
+        with unittest.mock.patch.object(regrain.shutil, "copyfile",
+                                        side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            regrain.put_back(new, self.output)
+        self.assertEqual(self.output.read_bytes(), b"the old film")
+        self.assertFalse((self.library / ("Film.av1.mkv" + regrain.PART_SUFFIX)).exists())
+
+
+class TestRegrainScenes(unittest.TestCase):
     def test_regrain_falls_back_to_av1an_when_the_detector_fails(self):
         chain = make_chain(scenechange="av-scenechange")
         with unittest.mock.patch.object(cuts, "detect", side_effect=essential.Mismatch("x")), \

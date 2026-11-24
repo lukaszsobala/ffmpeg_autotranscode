@@ -169,7 +169,8 @@ def _encode_sample(
     log.debug("exec: %s | %s", " ".join(decode), " ".join(compress))
     started = time.monotonic()
     env = child_env(chain.bin_dirs)
-    with subprocess.Popen(decode, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as src:
+    with subprocess.Popen(decode, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, env=env) as src:
         assert src.stdout is not None
         encoder = subprocess.run(
             compress, stdin=src.stdout, capture_output=True, text=True,

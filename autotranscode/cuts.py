@@ -30,6 +30,7 @@ import os
 import queue
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -117,8 +118,8 @@ def _detect_part(chain: Toolchain, cfg: Config, read: MediaInfo, times: Sequence
         # scheduler it runs on an RK3588's little cores at a third of the speed.
         pin = ["taskset", "-c", core] if core else []
         detect = [*nice, *pin, *detect_command(chain, cfg)]
-        with subprocess.Popen(decode, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              env=env) as source:
+        with subprocess.Popen(decode, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=env) as source:
             with subprocess.Popen(detect, stdin=source.stdout, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, env=env) as detector:
                 children.add(source, detector)
@@ -228,18 +229,21 @@ def attachment_text(starts: Sequence[int], frames: int, grain: str = "") -> str:
     return json.dumps(data, separators=(",", ":"))
 
 
-def parse(text: str, frames: int) -> Kept | None:
+def parse(text: str, frames: int | None) -> Kept | None:
     """What an attachment's text keeps, if its scene starts fit a video of `frames`
-    frames: from 0, rising, all inside it. None otherwise."""
+    frames: from 0, rising, all inside it. None otherwise. With `frames` None, the
+    frames it says it was made for stand in: enough to read what made the grain
+    without counting the film's frames, which reads the whole file."""
     try:
         data = json.loads(text)
-        if int(data["frames"]) != frames:
+        made_for = int(data["frames"])
+        if frames is not None and made_for != frames:
             return None
         starts = [int(start) for start in data["scene_starts"]]
         grain = str(data.get("grain") or "")
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
-    if not starts or starts[0] != 0 or starts[-1] >= frames:
+    if not starts or starts[0] != 0 or starts[-1] >= made_for:
         return None
     if any(after <= before for before, after in itertools.pairwise(starts)):
         return None
@@ -258,22 +262,28 @@ def attachment_index(chain: Toolchain, path: Path) -> int | None:
     return None
 
 
-def attached(chain: Toolchain, path: Path, frames: int, work: Path) -> Kept | None:
-    """What `path` keeps about itself, when it has an attachment that fits its `frames`."""
+def attachment(chain: Toolchain, path: Path) -> str | None:
+    """The text of `path`'s scene list, if it has one: read from the file's head,
+    without reading the rest. Dumped into a directory of its own, so that a dry
+    run, which has no work directory, can read it too."""
     index = attachment_index(chain, path)
     if index is None:
         return None
-    dumped = work / ATTACHMENT
-    dumped.unlink(missing_ok=True)
-    try:
-        run([chain.ffmpeg, "-hide_banner", "-v", "error", "-y",
-             f"-dump_attachment:{index}", str(dumped), "-i", str(path),
-             "-map", "0:v:0", "-frames:v", "0", "-f", "null", "-"])
-        return parse(dumped.read_text(encoding="utf-8"), frames)
-    except (CommandError, OSError):
-        return None
-    finally:
-        dumped.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="autotranscode-") as folder:
+        dumped = Path(folder) / ATTACHMENT
+        try:
+            run([chain.ffmpeg, "-hide_banner", "-v", "error", "-y",
+                 f"-dump_attachment:{index}", str(dumped), "-i", str(path),
+                 "-map", "0:v:0", "-frames:v", "0", "-f", "null", "-"])
+            return dumped.read_text(encoding="utf-8")
+        except (CommandError, OSError):
+            return None
+
+
+def attached(chain: Toolchain, path: Path, frames: int) -> Kept | None:
+    """What `path` keeps about itself, when it has an attachment that fits its `frames`."""
+    text = attachment(chain, path)
+    return parse(text, frames) if text is not None else None
 
 
 def mkvpropedit(chain: Toolchain) -> str | None:

@@ -238,7 +238,8 @@ def measure(chain: Toolchain, windows: Sequence[Window], source: Path, base: Pat
         if children.stopping.is_set():
             raise CommandError(argv, -1, "stopped")
         log.debug("exec: %s", shlex.join(argv))
-        with subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE,
                               text=True, errors="replace",
                               env=child_env(chain.bin_dirs)) as child:
             children.add(child)

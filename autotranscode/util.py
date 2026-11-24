@@ -189,9 +189,13 @@ def run(
         return Completed(argv, 0, "", "", 0.0)
 
     started = time.monotonic()
+    # Never the terminal's input: ffmpeg turns its echo off while it runs and back
+    # on as it exits, and several at once (or one killed) left it off for good;
+    # a key typed there would also reach them (q quits ffmpeg).
     proc = subprocess.run(
         argv,
         cwd=cwd,
+        stdin=subprocess.DEVNULL,
         capture_output=capture,
         text=True,
         errors="replace",

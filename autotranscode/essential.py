@@ -172,8 +172,8 @@ def _run_part(chain: Toolchain, cfg: Config, read: MediaInfo, times: Sequence[fl
     if children.stopping.is_set():
         return
     estimate = [*nice, *pin, *estimate_command(chain, written, cuts)]
-    with subprocess.Popen(decode, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          env=env) as source:
+    with subprocess.Popen(decode, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, env=env) as source:
         with subprocess.Popen(estimate,
                               stdin=source.stdout, stdout=subprocess.DEVNULL,
                               stderr=subprocess.PIPE, env=env) as estimator:

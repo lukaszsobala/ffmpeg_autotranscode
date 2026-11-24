@@ -206,6 +206,9 @@ calibration_window = 4       # frames per window, each just after a keyframe
 # disk would keep it busy just as reading did. The net effect is one read at the
 # start, one write at the end, and an idle disk in between.
 #
+# `regrain` stages as well: the source is copied, the film taken apart (one read),
+# the new film put together locally and written back once.
+#
 # Worth turning on when the library is on different (slower) storage than
 # paths.work_dir. Pointless when they are the same device.
 enabled = false

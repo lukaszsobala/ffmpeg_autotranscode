@@ -155,6 +155,48 @@ earlier one gave, frame for frame, the pictures of applying it to the encode
 without grain. The new file must have the same tracks, the same video packets
 and the same length before it replaces the old one.
 
+Unstaged, a regrain kept the library's disks busy for the whole hour: the source
+read in full three times (frame times, cuts, estimate) and sought into by
+calibration, the film read three times (its frame count for the skip check, the
+track taken out, the remux), the new file written, and both read again by the
+check: some 80 GB read for a 1080p film, much of it seeking between four
+places at once, where one sequential pass over each file does. With `[staging]`
+on, regrain copies the source (`run`'s copy, reused), takes the film apart in one
+read of it (one ffmpeg, two outputs: the film track, and every other track with
+the chapters and tags), puts the new film together from the parts, and writes
+the checked file back beside the old one before renaming it over: one read of
+each and a write per film, and nothing between.
+
+A first version copied the whole film as well and took the track out of the
+copy: the video twice over for nothing, and the source kept to the end, 130 GB
+at once for Film C (42 GB source, 23 GB film). Now the copy of the
+source goes once the final grain is written; the track taken out stays to the
+end (the remux takes the film track's tags from it, and the check counts its
+packets instead of reading the film again), which costs nothing at the peak,
+since the source is gone by then. On Film A the peak was the source,
+both video tracks and 0.7 GB of the rest: 26 GB.
+
+Putting a film together from its parts showed one thing a single remux had
+hidden. Writing the rest, ffmpeg marks the first of several subtitle tracks
+default when none is (Film H's English subtitles would have come on by
+themselves); the remux in use had escaped it only because setting one track's
+disposition turns that off for the whole file. Every track's dispositions are now
+set by hand from the film, and the check compares them, with each audio and video
+track's start time and the chapters. Five films taken apart and put together
+again (Film I's 42 tracks and 38 chapters, fonts, PGS subtitles, audio
+starting 54 ms before the video) came out with every track's packets, every
+attachment, tag and disposition as they were. Whether to leave a film is read from the
+scene list's attachment alone, at the head of the file, rather than from a count
+of its frames, which read the whole film.
+
+A stopped regrain used to redo more than it said. Detection deletes its parts
+once it has joined them, and the cuts went into the film only at the end, so a
+rerun found them again (24 minutes for Film C's 340,106 frames)
+before the estimate's parts, keyed by those cuts, were any use; and the video
+track was taken out again over a complete copy. The cuts are now kept in the
+work directory as soon as found (`regrain-scenes.json`), and the track with a
+note of the film it came from (size, time, track), written once it is whole.
+
 **On a whole film.** Film A (1080p, 157,013 frames, 341 scenes) was
 regrained on the RK3588 in 1h19m: 22 minutes of scene detection (Av1an's, as a
 run makes it; detecting at 540 lines was four times slower, its downscaler

@@ -66,7 +66,8 @@ def checkout() -> Path | None:
 def _git(root: Path, *args: str, check: bool = True) -> str:
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), *args], capture_output=True, text=True, check=False,
+            ["git", "-C", str(root), *args], stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, check=False,
             timeout=GIT_TIMEOUT, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except subprocess.TimeoutExpired:
         raise UpdateError(f"git {args[0]} took longer than {GIT_TIMEOUT}s") from None
@@ -146,7 +147,8 @@ RELEASE_TAG = re.compile(r"v(\d+\.\d+\.\d+)")
 
 def _is_ancestor(root: Path, older: str, newer: str) -> bool:
     return subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", older, newer],
-                          capture_output=True, check=False).returncode == 0
+                          stdin=subprocess.DEVNULL, capture_output=True,
+                          check=False).returncode == 0
 
 
 def latest_release(root: Path, *, fetch: bool = True) -> str | None:

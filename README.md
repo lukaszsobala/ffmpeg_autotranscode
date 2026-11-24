@@ -187,7 +187,7 @@ honoured). `-c` overrides it; with neither, the built-in defaults apply.
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
 | `run` | Transcode (`--dry-run` probes and measures but does not encode, and records nothing) |
 | `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
-| `regrain` | Give films already encoded the grain `run` makes now, estimated and calibrated scene by scene, without encoding again: each file is checked and replaced in place. Takes outputs or folders of them (none: every finished film); `--dry-run` lists them. Films whose grain the current method made already are left, so a regrain stopped partway starts again where it was; `--force` does them again. Refuses while a run is going |
+| `regrain` | Give films already encoded the grain `run` makes now, estimated and calibrated scene by scene, without encoding again: each file is checked and replaced in place. Takes outputs or folders of them (none: every finished film); `--dry-run` lists them. Films whose grain the current method made already are left, so a regrain stopped partway starts again where it was; `--force` does them again. Works on staged copies when `[staging]` is on. Refuses while a run is going |
 | `clean` | Remove work directories, staged copies and half-written outputs no run will use again; keeps what can be resumed (`--dry-run` lists, `--all` removes that too, `--samples` removes `sample` results) |
 
 Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
@@ -439,6 +439,17 @@ enabled = true
 directory = ""          # empty => <work_dir>/staging
 min_free_multiple = 1.5 # free space needed: the copy, plus room for the output
 ```
+
+`regrain` stages too. The source is copied; the film is read once, taken apart
+into its video track and the rest; the new film is put together locally from
+those and written back once it has been checked. The library's disks see one
+read of each file at the start and one write at the end, instead of about an
+hour of reading and seeking for a 1080p film. The copy of the source goes as soon
+as the grain is final, so at most the source, the film's video track twice (as
+it was and with the new grain) and the rest are on local storage at once: about
+86 GB for a four-hour remux. A regrain stopped partway keeps the source's copy,
+the film's parts, the scene cuts and the grain estimate's finished parts, so the
+rerun redoes none of them.
 
 It never fails a file: if the directory is unusable, there is not enough free
 space, or the copy fails, it logs why and works in place instead. Leave it off when

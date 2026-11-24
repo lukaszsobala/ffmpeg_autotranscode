@@ -345,7 +345,8 @@ def estimate_with_svt(info: MediaInfo, chain: Toolchain, cfg: Config, work: Path
                 "--film-grain", str(cfg.grain.svt_level), "--film-grain-denoise", "0"]
     env = child_env(chain.bin_dirs)
     try:
-        with subprocess.Popen(decode, stdout=subprocess.PIPE, env=env) as source:
+        with subprocess.Popen(decode, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              env=env) as source:
             encoder = subprocess.run(compress, stdin=source.stdout, capture_output=True,
                                      text=True, errors="replace", env=env)
         if encoder.returncode != 0:
