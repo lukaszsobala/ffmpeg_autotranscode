@@ -388,8 +388,14 @@ A checkout with commits of its own or uncommitted changes is left alone, with a
 note on what to do. If a build fails, the run starts again anyway and, with tools
 other than the tested ones, refuses to encode, saying why. A version with no new
 tools needs no rebuild; `update` also offers to rebuild tools that are not the
-tested ones when there is no new version. In Docker, update the checkout on the
-host and rebuild the image instead.
+tested ones when there is no new version, and installs tools a new version adds.
+In Docker, update the checkout on the host and rebuild the image instead.
+
+**From 0.2.0:** 0.3.0 adds two tools, SvtFgEssential and av-scenechange, which
+0.2.0's `update` does not know to build. After it, `run` stops with
+"SvtFgEssential not found"; build both once with
+`scripts/bootstrap.sh svtfg scenechange` and start it again. Later updates
+install tools a release adds by themselves.
 
 ### Cleaning up
 

@@ -108,17 +108,23 @@ class Update:
         return self.newer or bool(self.changes)
 
 
+def _to_build(item: versions.Check) -> bool:
+    """Whether bootstrap is to build this tool: not the version `pins` name, or not
+    installed at all -- a tool a release adds (0.3.0 added SvtFgEssential, which
+    `run` cannot do without). Apt's are left out."""
+    return (item.failed or item.status == "missing") and item.pin.stage not in SYSTEM_STAGES
+
+
 def changes(chain: Toolchain, pins: dict[str, versions.Pin]) -> list[Change]:
-    """The tools bootstrap builds that `pins` would have rebuilt; apt's left out."""
+    """The tools bootstrap builds that `pins` would have built or rebuilt."""
     return [Change(item.pin.name, item.installed, item.pin.version)
-            for item in versions.check(chain, pins)
-            if item.failed and item.pin.stage not in SYSTEM_STAGES]
+            for item in versions.check(chain, pins) if _to_build(item)]
 
 
 def stages(chain: Toolchain, pins: dict[str, versions.Pin]) -> str:
     """The bootstrap stages `changes` needs, in bootstrap's order."""
-    return versions.fixes([item for item in versions.check(chain, pins)
-                           if item.pin.stage not in SYSTEM_STAGES])
+    return versions.fixes([item for item in versions.check(chain, pins) if _to_build(item)],
+                          missing=True)
 
 
 def blocking(chain: Toolchain, root: Path) -> list[Change]:
@@ -130,7 +136,7 @@ def blocking(chain: Toolchain, root: Path) -> list[Change]:
     pins = versions.load(root / "autotranscode" / versions.MANIFEST.name)
     return [Change(item.pin.name, item.installed, item.pin.version)
             for item in versions.check(chain, pins)
-            if item.failed and item.pin.enforce and item.pin.stage not in SYSTEM_STAGES]
+            if _to_build(item) and item.pin.enforce]
 
 
 # A release is an annotated tag vX.Y.Z on the commit whose __version__ is X.Y.Z;

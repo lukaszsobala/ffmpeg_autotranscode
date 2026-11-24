@@ -176,11 +176,13 @@ def describe(checks: list[Check]) -> str:
     )
 
 
-def fixes(checks: list[Check]) -> str:
-    """One bootstrap command for every failing pin, in the order bootstrap runs them."""
+def fixes(checks: list[Check], *, missing: bool = False) -> str:
+    """One bootstrap command for every failing pin (and, with `missing`, every tool
+    not installed), in the order bootstrap runs them."""
     order = ["deps", "ffmpeg", "svtav1", "vapoursynth", "lsmash", "av1an", "grav1synth",
              "svtfg", "scenechange"]
-    stages = {item.pin.stage for item in checks if item.failed}
+    stages = {item.pin.stage for item in checks
+              if item.failed or (missing and item.status == "missing")}
     return " ".join(stage for stage in order if stage in stages)
 
 

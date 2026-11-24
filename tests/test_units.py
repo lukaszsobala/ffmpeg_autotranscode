@@ -2633,6 +2633,14 @@ class TestUpdate(unittest.TestCase):
         self.assertEqual(self.stages(), "av1an")
         self.assertIn("Updated.", out)
 
+    def test_tools_a_release_adds_are_installed(self):
+        # 0.3.0 added SvtFgEssential and av-scenechange: absent, not wrong.
+        self.release(av1an=versions.load()["av1an"].version)
+        code, out = self.update(tested_chain(svtfg=None, scenechange=None))
+        self.assertEqual(code, 0, out)
+        self.assertIn("SvtFgEssential not installed", out)
+        self.assertEqual(self.stages(), "svtfg scenechange")
+
     def test_a_version_that_moves_no_tool_rebuilds_nothing(self):
         self.release(av1an=versions.load()["av1an"].version)
         code, out = self.update()
