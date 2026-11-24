@@ -132,6 +132,26 @@ def _which(candidate: str) -> str | None:
     return shutil.which(candidate)
 
 
+def _find(configured: str, *places: Path) -> str | None:
+    """`configured` as _which finds it, else, for a bare name, the first of
+    `places` that has it. bootstrap.sh installs into ~/.cargo/bin and ~/.local/bin,
+    which a shell has on PATH only once ~/.profile says so, and a systemd unit
+    never: Av1an and grav1synth built, and `doctor` calling them missing."""
+    if found := _which(configured):
+        return found
+    if "/" in configured:
+        return None
+    return next((str(p / configured) for p in places if (p / configured).is_file()), None)
+
+
+def _cargo_bin() -> Path:
+    return Path.home() / ".cargo" / "bin"
+
+
+def _local_bin() -> Path:
+    return Path.home() / ".local" / "bin"
+
+
 def _find_ffmpeg(configured: str, name: str) -> str | None:
     """Prefer jellyfin-ffmpeg: it ships tonemapx, rkmpp/rkrga and a current SVT-AV1."""
     if configured not in {"ffmpeg", "ffprobe"}:
@@ -237,9 +257,9 @@ def detect(cfg: Config) -> Toolchain:
     chain = Toolchain(
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
-        av1an=_which(cfg.paths.av1an),
-        svtav1encapp=_which(cfg.paths.svtav1encapp),
-        grav1synth=_which(cfg.paths.grav1synth),
+        av1an=_find(cfg.paths.av1an, _cargo_bin()),
+        svtav1encapp=_find(cfg.paths.svtav1encapp, _local_bin()),
+        grav1synth=_find(cfg.paths.grav1synth, _cargo_bin()),
         mkvmerge=_which(cfg.paths.mkvmerge),
     )
 
@@ -369,14 +389,10 @@ SVTFG_COMMIT_FILE = "SvtFgEssential.commit"
 def _find_svtfg(configured: str, chain: Toolchain) -> str | None:
     """SvtFgEssential as configured, else beside our SvtAv1EncApp or in
     ~/.local/bin, where bootstrap puts it: a systemd unit's PATH leaves that out."""
-    if found := _which(configured):
-        return found
-    if "/" in configured:
-        return None
-    places = [Path.home() / ".local" / "bin"]
+    places = [_local_bin()]
     if chain.svtav1encapp:
         places.insert(0, Path(chain.svtav1encapp).parent)
-    return next((str(p / configured) for p in places if (p / configured).is_file()), None)
+    return _find(configured, *places)
 
 
 def read_svtfg_commit(binary: str) -> str:
@@ -394,13 +410,8 @@ SCENECHANGE_VERSION_FILE = "av-scenechange.version"
 def _find_scenechange(configured: str, chain: Toolchain) -> str | None:
     """av-scenechange as configured, else where cargo installs: beside our Av1an or
     grav1synth, or in ~/.cargo/bin, which a systemd unit's PATH leaves out."""
-    if found := _which(configured):
-        return found
-    if "/" in configured:
-        return None
     places = [Path(tool).parent for tool in (chain.av1an, chain.grav1synth) if tool]
-    places.append(Path.home() / ".cargo" / "bin")
-    return next((str(p / configured) for p in places if (p / configured).is_file()), None)
+    return _find(configured, *places, _cargo_bin())
 
 
 def read_scenechange_version(binary: str) -> str:
@@ -414,12 +425,10 @@ def read_scenechange_version(binary: str) -> str:
 def _find_vspipe(chain: Toolchain) -> str | None:
     """vspipe on PATH, or installed beside our SvtAv1EncApp: a systemd unit's PATH
     leaves out ~/.local/bin, where the bootstrap script puts both."""
-    if found := shutil.which("vspipe"):
-        return found
-    places = [Path.home() / ".local" / "bin"]
+    places = [_local_bin()]
     if chain.svtav1encapp:
         places.insert(0, Path(chain.svtav1encapp).parent)
-    return next((str(p / "vspipe") for p in places if (p / "vspipe").is_file()), None)
+    return _find("vspipe", *places)
 
 
 def _probe_vapoursynth(chain: Toolchain) -> None:

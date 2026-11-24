@@ -5137,6 +5137,25 @@ class TestSvtfgDependency(unittest.TestCase):
                 self.assertEqual(tools._find_svtfg("SvtFgEssential", chain),
                                  str(Path(tmp) / "SvtFgEssential"))
 
+    def test_cargo_tools_are_found_off_path(self):
+        # Av1an and grav1synth built into ~/.cargo/bin, which was not on PATH:
+        # doctor called both missing.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".cargo" / "bin").mkdir(parents=True)
+            (home / ".local" / "bin").mkdir(parents=True)
+            (home / ".cargo" / "bin" / "av1an").write_text("")
+            (home / ".local" / "bin" / "SvtAv1EncApp").write_text("")
+            with unittest.mock.patch.object(tools.shutil, "which", return_value=None), \
+                    unittest.mock.patch.object(tools.Path, "home", return_value=home):
+                self.assertEqual(tools._find("av1an", tools._cargo_bin()),
+                                 str(home / ".cargo" / "bin" / "av1an"))
+                self.assertEqual(tools._find("SvtAv1EncApp", tools._local_bin()),
+                                 str(home / ".local" / "bin" / "SvtAv1EncApp"))
+                self.assertIsNone(tools._find("grav1synth", tools._cargo_bin()))
+                # A path in the config is taken as it is, not looked for elsewhere.
+                self.assertIsNone(tools._find("/opt/av1an", tools._cargo_bin()))
+
     def test_an_unrecorded_build_is_unknown(self):
         checks = {c.pin.name: c for c in versions.check(tested_chain(svtfg_commit=""))}
         self.assertEqual(checks["svtfg"].status, "unknown")
