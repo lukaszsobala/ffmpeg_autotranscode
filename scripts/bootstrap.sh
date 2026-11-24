@@ -8,7 +8,7 @@
 #   ./scripts/bootstrap.sh            # everything
 #   ./scripts/bootstrap.sh ffmpeg     # just one stage
 #
-# Stages: deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth verify
+# Stages: deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth svtfg verify
 #
 # On Linux only the `deps` and `ffmpeg` stages use sudo, and only to run apt-get;
 # as root, as in the Dockerfile, they run it directly.
@@ -45,6 +45,7 @@ AV1AN_VERSION="${AV1AN_VERSION:-$(pin av1an)}"
 # "0.2.0+autotranscode.1": the crate's version, then the patch's revision, which
 # the patch builds into `grav1synth --version`.
 GRAV1SYNTH_VERSION="${GRAV1SYNTH_VERSION:-$(pin grav1synth | cut -d+ -f1)}"
+SVTFG_COMMIT="${SVTFG_COMMIT:-$(pin svtfg)}"
 LSMASH_WORKS_COMMIT="${LSMASH_WORKS_COMMIT:-$(pin lsmash)}"
 PREFIX="${PREFIX:-$HOME/.local}"
 BUILD_DIR="${BUILD_DIR:-$HOME/.cache/autotranscode-build}"
@@ -86,7 +87,8 @@ case "$(uname -s)" in
     command -v apt-get >/dev/null || die "this script installs with apt-get (Debian, Ubuntu \
 and derivatives). On another distribution install by hand: build tools, cmake, nasm, \
 pkg-config, mkvtoolnix, Python 3.11+ and the ffmpeg development headers, then run the \
-ffmpeg, svtav1, vapoursynth, lsmash, av1an and grav1synth stages, which need no package manager."
+ffmpeg, svtav1, vapoursynth, lsmash, av1an, grav1synth and svtfg stages, which need no package \
+manager."
     JOBS="${JOBS:-$(nproc)}"
     ;;
   Darwin)
@@ -378,6 +380,39 @@ stage_grav1synth() {
   done_with "$src"
 }
 
+stage_svtfg() {
+  # SVT-AV1-Essential's standalone grain estimator, for grain.estimator = "svtfg"
+  # (the default). Only this tool is built from Essential: mainline SVT-AV1 stays
+  # the encoder. It needs nothing beyond what the svtav1 stage does, and builds in
+  # under a minute.
+  log "Building SvtFgEssential (SVT-AV1-Essential ${SVTFG_COMMIT:0:12})"
+  mkdir -p "$BUILD_DIR"
+  local src="$BUILD_DIR/SVT-AV1-Essential"
+  if [[ ! -d $src/.git ]]; then
+    git init -q "$src"
+    git -C "$src" remote add origin https://github.com/nekotrix/SVT-AV1-Essential.git
+  fi
+  git -C "$src" fetch --depth 1 origin "$SVTFG_COMMIT"
+  git -C "$src" checkout -q FETCH_HEAD
+  rm -rf "$src/build" "$src/Bin"
+  cmake -S "$src" -B "$src/build" \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_APPS=OFF -DBUILD_TESTING=OFF \
+    -DBUILD_SHARED_LIBS=OFF -DSVT_AV1_LTO=OFF
+  cmake --build "$src/build" --target SvtFgEssential -j "$JOBS"
+  local built="$src/Bin/Release/SvtFgEssential"
+  [[ -x $built ]] || die "SvtFgEssential did not build"
+  # Without privileges when the prefix is ours, which is the default.
+  into_prefix() { if [[ -w ${PREFIX} || ! -e ${PREFIX} ]]; then "$@"; else as_root "$@"; fi; }
+  into_prefix mkdir -p "$PREFIX/bin"
+  into_prefix install -m 755 "$built" "$PREFIX/bin/SvtFgEssential"
+  # Its --version names the tool (1.0.0), not the estimator, which lives in the
+  # codec library and changes with Essential's releases: this is how `doctor`
+  # knows which it is.
+  printf '%s\n' "$SVTFG_COMMIT" | into_prefix tee "$PREFIX/bin/SvtFgEssential.commit" >/dev/null
+  "$PREFIX/bin/SvtFgEssential" --version
+  done_with "$src"
+}
+
 # The first Python on PATH that is 3.11 or newer (tomllib), or nothing.
 find_python() {
   local candidate
@@ -417,7 +452,7 @@ EOF
 main() {
   local stages=("$@")
   if [[ ${#stages[@]} -eq 0 ]]; then
-    stages=(deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth verify)
+    stages=(deps ffmpeg svtav1 vapoursynth lsmash av1an grav1synth svtfg verify)
   fi
   for stage in "${stages[@]}"; do
     case "$stage" in
@@ -428,6 +463,7 @@ main() {
       lsmash)     stage_lsmash ;;
       av1an)      stage_av1an ;;
       grav1synth) stage_grav1synth ;;
+      svtfg)      stage_svtfg ;;
       verify)     stage_verify ;;
       *)          die "unknown stage: $stage" ;;
     esac

@@ -54,6 +54,10 @@ class Toolchain:
     vapoursynth_version: str = ""
     # The L-SMASH-Works commit bootstrap recorded beside the plugin, or "".
     lsmash_commit: str = ""
+    # SvtFgEssential, the grain estimator of grain.estimator = "svtfg", and the
+    # SVT-AV1-Essential commit bootstrap recorded beside it (SVTFG_COMMIT_FILE), or "".
+    svtfg: str | None = None
+    svtfg_commit: str = ""
 
     # Reported by `doctor` to identify the ffmpeg build; nothing here consumes it.
     # See "Why there is no hardware acceleration" in the README before wiring it up.
@@ -61,6 +65,8 @@ class Toolchain:
     # Rockchip MPP decoders ("h264_rkmpp", "av1_rkmpp"...). verify decodes with
     # them where they give the same frames as software; see verify.decode_args.
     rkmpp_decoders: set[str] = field(default_factory=set)
+    # Every decoder this ffmpeg has ("libdav1d", "hevc"...).
+    decoders: set[str] = field(default_factory=set)
     # The fast cores, as a taskset list ("4,5,6,7" on an RK3588), when the CPU
     # has some much slower ones. Empty otherwise. See _big_cores, verify.ffmpeg_argv.
     big_cores: str = ""
@@ -207,10 +213,14 @@ def detect(cfg: Config) -> Toolchain:
         for line in _capture([ffmpeg, "-hide_banner", "-hwaccels"]).splitlines()[1:]
         if line.strip()
     }
-    chain.rkmpp_decoders = {
+    chain.decoders = {
         parts[1]
         for line in _capture([ffmpeg, "-hide_banner", "-decoders"]).splitlines()
-        if len(parts := line.split()) > 2 and parts[1].endswith("_rkmpp")
+        if len(parts := line.split()) > 2 and parts[0][:1] in {"V", "A", "S"}
+        and parts[1] != "="
+    }
+    chain.rkmpp_decoders = {
+        name for name in chain.decoders if name.endswith("_rkmpp")
     } if _rockchip_video_engine() else set()
     chain.filters = {
         parts[1]
@@ -242,6 +252,9 @@ def detect(cfg: Config) -> Toolchain:
     ):
         chain.mkvmerge_version = match.group(1)
 
+    chain.svtfg = _find_svtfg(cfg.paths.svtfg, chain)
+    if chain.svtfg:
+        chain.svtfg_commit = read_svtfg_commit(chain.svtfg)
     chain.vspipe = _find_vspipe(chain)
     if chain.vspipe:
         _probe_vapoursynth(chain)
@@ -304,6 +317,32 @@ core.std.BlankClip(length=1).set_output()
 LSMASH_COMMIT_FILE = "LSMASHSource.commit"
 
 
+# Written by scripts/bootstrap.sh beside SvtFgEssential: the SVT-AV1-Essential
+# commit it was built from. The tool's --version names only the tool (1.0.0),
+# which stays put while the estimator in the codec library changes.
+SVTFG_COMMIT_FILE = "SvtFgEssential.commit"
+
+
+def _find_svtfg(configured: str, chain: Toolchain) -> str | None:
+    """SvtFgEssential as configured, else beside our SvtAv1EncApp or in
+    ~/.local/bin, where bootstrap puts it: a systemd unit's PATH leaves that out."""
+    if found := _which(configured):
+        return found
+    if "/" in configured:
+        return None
+    places = [Path.home() / ".local" / "bin"]
+    if chain.svtav1encapp:
+        places.insert(0, Path(chain.svtav1encapp).parent)
+    return next((str(p / configured) for p in places if (p / configured).is_file()), None)
+
+
+def read_svtfg_commit(binary: str) -> str:
+    try:
+        return (Path(binary).parent / SVTFG_COMMIT_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def _find_vspipe(chain: Toolchain) -> str | None:
     """vspipe on PATH, or installed beside our SvtAv1EncApp: a systemd unit's PATH
     leaves out ~/.local/bin, where the bootstrap script puts both."""
@@ -363,6 +402,11 @@ def require(chain: Toolchain, cfg: Config) -> None:
             "grav1synth not found but grain.mode != 'never' "
             "(cargo install grav1synth, or set grain.mode='never')"
         )
+    if cfg.grain.mode != "never" and cfg.grain.estimator == "svtfg" and chain.svtfg is None:
+        problems.append(
+            "SvtFgEssential not found but grain.estimator = 'svtfg' "
+            "(scripts/bootstrap.sh svtfg builds it, or set paths.svtfg)"
+        )
     if chain.svtav1encapp is not None:
         problems += _missing_svt_options(chain, cfg)
     if cfg.dolby_vision.profile5 == "tonemap-sdr" and not chain.has_dovi_tonemap:
@@ -391,6 +435,8 @@ def describe(chain: Toolchain) -> str:
         f"av1an       {chain.av1an or 'MISSING'}  ({chain.av1an_version or '-'})",
         f"svtav1      {chain.svtav1encapp or 'MISSING'}  ({chain.svtav1_version or '-'})",
         f"grav1synth  {chain.grav1synth or 'MISSING'}  ({chain.grav1synth_version or '-'})",
+        f"svtfg       {chain.svtfg or 'MISSING'}  "
+        f"({chain.svtfg_commit[:12] or 'commit not recorded'})",
         f"mkvmerge    {chain.mkvmerge or 'MISSING'}  ({chain.mkvmerge_version or '-'})",
         f"vapoursynth {chain.vspipe or 'no'}  "
         f"(R{chain.vapoursynth_version or '?'}; "
@@ -407,7 +453,7 @@ def describe(chain: Toolchain) -> str:
         f"hwaccels    {', '.join(sorted(chain.hwaccels)) or 'none'}  "
         "(this build's decoders; unused -- the encode is CPU-only)",
         f"rkmpp       {', '.join(sorted(chain.rkmpp_decoders)) or 'none'}  "
-        f"(usable decoders, for verify; needs {MPP_DEVICE})",
+        f"(usable decoders, for verify and grain; needs {MPP_DEVICE})",
         f"big cores   {chain.big_cores or 'all'}  (verify's filter passes run there)",
     ]
     return "\n".join(lines)

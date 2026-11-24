@@ -27,6 +27,7 @@ UNKNOWN_HINT = {
     "grav1synth": "unpatched, or patched before the patch gave it a --version; an "
                   "unpatched build corrupts some files",
     "lsmash": "built before bootstrap recorded the commit",
+    "svtfg": "built before bootstrap recorded the commit",
 }
 
 
@@ -143,6 +144,7 @@ def installed_versions(chain: Toolchain) -> dict[str, str | None]:
         "grav1synth": found(chain.grav1synth, chain.grav1synth_version),
         "vapoursynth": found(chain.vspipe, chain.vapoursynth_version),
         "lsmash": chain.lsmash_commit if "lsmas" in chain.vapoursynth_plugins else None,
+        "svtfg": found(chain.svtfg, chain.svtfg_commit),
         "mkvmerge": found(chain.mkvmerge, chain.mkvmerge_version),
     }
 
@@ -174,7 +176,8 @@ def describe(checks: list[Check]) -> str:
 
 def fixes(checks: list[Check]) -> str:
     """One bootstrap command for every failing pin, in the order bootstrap runs them."""
-    order = ["deps", "ffmpeg", "svtav1", "vapoursynth", "lsmash", "av1an", "grav1synth"]
+    order = ["deps", "ffmpeg", "svtav1", "vapoursynth", "lsmash", "av1an", "grav1synth",
+             "svtfg"]
     stages = {item.pin.stage for item in checks if item.failed}
     return " ".join(stage for stage in order if stage in stages)
 

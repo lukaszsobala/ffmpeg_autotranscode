@@ -34,14 +34,17 @@ from autotranscode import (
     cli,
     config,
     encode,
+    essential,
     estimate,
     grain,
     mux,
     pipeline,
     probe,
     progress,
+    regrain,
     resume,
     sample,
+    scenegrain,
     scenes,
     tools,
     update,
@@ -520,6 +523,7 @@ def make_chain(**overrides: Any) -> Toolchain:
     base: dict[str, Any] = dict(
         ffmpeg="ffmpeg", ffprobe="ffprobe", av1an="av1an",
         svtav1encapp="SvtAv1EncApp", grav1synth="grav1synth", mkvmerge="mkvmerge",
+        svtfg="SvtFgEssential",
         svt_options={"--preset", "--crf", "--mastering-display", "--content-light",
                      "--ac-bias"},
         filters={"tonemapx", "hqdn3d"},
@@ -2316,6 +2320,7 @@ def tested_chain(**overrides: Any) -> Toolchain:
         mkvmerge_version="92.0", vspipe="vspipe",
         vapoursynth_version=pins["vapoursynth"].version,
         vapoursynth_plugins={"lsmas", "std"}, lsmash_commit=pins["lsmash"].version,
+        svtfg_commit=pins["svtfg"].version,
     )
     base.update(overrides)
     return make_chain(**base)
@@ -2343,7 +2348,7 @@ class TestToolchainVersions(unittest.TestCase):
         last = next(i for i, line in enumerate(lines) if line.startswith("LSMASH_WORKS_COMMIT="))
         header = "\n".join(lines[first:last + 1])
         names = ["FFMPEG_MAJOR", "SVT_AV1_VERSION", "ZIMG_VERSION", "VAPOURSYNTH_VERSION",
-                 "AV1AN_VERSION", "GRAV1SYNTH_VERSION", "LSMASH_WORKS_COMMIT"]
+                 "AV1AN_VERSION", "GRAV1SYNTH_VERSION", "SVTFG_COMMIT", "LSMASH_WORKS_COMMIT"]
         env = {key: value for key, value in os.environ.items() if key not in names}
         env["TOOLCHAIN"] = str(versions.MANIFEST)
         with tempfile.TemporaryDirectory() as tmp:
@@ -2357,7 +2362,7 @@ class TestToolchainVersions(unittest.TestCase):
             pins["ffmpeg"].version.split(".")[0], f"v{pins['svtav1'].version}",
             f"release-{pins['zimg'].version}", f"R{pins['vapoursynth'].version}",
             pins["av1an"].version, pins["grav1synth"].version.split("+")[0],
-            pins["lsmash"].version,
+            pins["svtfg"].version, pins["lsmash"].version,
         ])
 
     def test_the_patch_names_the_build_the_manifest_expects(self):
@@ -4665,3 +4670,451 @@ class TestProgressRedraw(unittest.TestCase):
         self.assertIn("True\n", text)
         self.assertIn("12/431 chunks", text)
         self.assertNotIn("Kbps", text)
+
+
+# --- SvtFgEssential, per-frame tables, per-scene calibration, regrain --------------
+
+def entry(luma: int, seed: int = 1, apply: bool = True) -> grain.Entry:
+    body = ("p 3 8 0 11 0 1 128 192 256 128 192 256", f"sY 2 0 {luma} 255 {luma}",
+            "sCb 2 0 10 255 10", "sCr 2 0 12 255 12", "cY " + " ".join(["0"] * 24),
+            "cCb " + " ".join(["0"] * 25), "cCr " + " ".join(["0"] * 25)) if apply else ()
+    return grain.Entry(apply, seed, body)
+
+
+class TestPerFrameTables(unittest.TestCase):
+    def test_entries_read_back_as_written(self):
+        frames = [entry(40, 7), entry(40, 8), entry(0, 9, apply=False), entry(55, 10)]
+        self.assertEqual(grain.parse_entries(grain.frame_table(frames)), frames)
+
+    def test_a_segment_that_reuses_the_last_parameters_gets_them(self):
+        raw = grain.frame_table([entry(40, 7)]) + "E 1 1 1 9 0\n"
+        again = grain.parse_entries(raw)
+        self.assertEqual((again[1].body, again[1].seed), (again[0].body, 9))
+
+    def test_each_frame_falls_in_its_own_segment_whatever_the_rounding(self):
+        # 23.976 fps in Matroska's milliseconds: 0, 42, 83, 125 ms. Frame 3 at
+        # 125 ms is before 3 x 417083 = 1251250, where a frame-number table puts it.
+        stamps = [0, 420_000, 830_000, 1_250_000]
+        frames = [entry(10), entry(20), entry(30), entry(40)]
+        table = grain.retime(frames, stamps)
+        spans = [tuple(map(int, line.split()[1:3])) for line in table.splitlines()
+                 if line.startswith("E ")]
+        for number, stamp in enumerate(stamps):
+            found = next(i for i, (start, end) in enumerate(spans) if start <= stamp <= end)
+            self.assertEqual(found, number)
+
+    def test_runs_of_the_same_grain_become_one_segment(self):
+        frames = [entry(10, 1), entry(10, 2), entry(10, 3), entry(20, 4), entry(20, 5)]
+        table = grain.retime(frames, [0, 10, 20, 30, 40])
+        heads = [line.split() for line in table.splitlines() if line.startswith("E ")]
+        self.assertEqual([h[1:5] for h in heads],
+                         [["0", "29", "1", "1"], ["30", str(grain.WHOLE_VIDEO_END), "1", "4"]])
+
+    def test_frames_without_grain_get_a_segment_without_parameters(self):
+        table = grain.retime([entry(10), entry(0, apply=False)], [0, 10])
+        self.assertIn(f"E 10 {grain.WHOLE_VIDEO_END} 0 1 0\n", table)
+        self.assertTrue(table.endswith("0 1 0\n"))
+
+    def test_a_table_for_another_number_of_frames_is_refused(self):
+        with self.assertRaises(ValueError):
+            grain.retime([entry(10)], [0, 10])
+
+    def test_scaling_an_entry_scales_its_strength_only(self):
+        scaled = grain.scale_entry(entry(40), 0.5, 2.0, 1.0)
+        self.assertIn("sY 2 0 20 255 20", scaled.body)
+        self.assertIn("sCb 2 0 20 255 20", scaled.body)
+        self.assertEqual(scaled.body[4:], entry(40).body[4:])
+
+
+class TestFrameTimesRemembered(unittest.TestCase):
+    def test_the_source_is_read_once_while_it_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "film.mkv"
+            path.write_bytes(b"x")
+            listing = subprocess.CompletedProcess([], 0, "0.083,\n0.0,\n0.042,\n", "")
+            with unittest.mock.patch.object(encode, "run", return_value=listing) as run:
+                first = encode.frame_times(make_chain(), path)
+                first.append(9.0)   # a caller's change stays its own
+                self.assertEqual(encode.frame_times(make_chain(), path), [0.0, 0.042, 0.083])
+                self.assertEqual(run.call_count, 1)
+                path.write_bytes(b"xy")
+                encode.frame_times(make_chain(), path)
+                self.assertEqual(run.call_count, 2)
+
+
+class TestEssentialParts(unittest.TestCase):
+    def test_parts_are_whole_scenes_covering_every_frame_once(self):
+        starts = [0, 100, 250, 260, 600, 900]
+        parts = essential.plan_parts(starts, 1000, 3)
+        self.assertEqual(parts[0].start, 0)
+        self.assertEqual(parts[-1].end, 1000)
+        for before, after in itertools.pairwise(parts):
+            self.assertEqual(before.end, after.start)
+            self.assertIn(after.start, starts)
+        for part in parts:
+            self.assertEqual(part.cuts[0], 0)
+            self.assertEqual([part.start + c for c in part.cuts],
+                             [s for s in starts if part.start <= s < part.end])
+
+    def test_one_long_scene_is_one_part(self):
+        self.assertEqual(essential.plan_parts([0], 500, 4), [essential.Part(0, 500, (0,))])
+
+    def test_parts_shrink_so_the_processes_finish_together(self):
+        parts = essential.plan_parts(range(0, 100_000, 100), 100_000, 4, smallest=600)
+        sizes = [part.frames for part in parts]
+        self.assertEqual(sizes[0], 100_000 // (essential.GUIDED * 4))
+        self.assertEqual(sizes, sorted(sizes, reverse=True))
+        self.assertTrue(all(size >= 600 for size in sizes[:-1]))
+        self.assertLessEqual(sizes[-1], 600)
+        self.assertEqual(sum(sizes), 100_000)
+
+    def test_a_long_take_is_never_split(self):
+        starts = [0, 1000, 9000, 9500]
+        parts = essential.plan_parts(starts, 10_000, 4, smallest=100)
+        self.assertFalse([part for part in parts if 1000 < part.start < 9000])
+
+    def test_a_part_is_found_by_its_timestamps_after_a_seek_before_it(self):
+        times = [i / 24 for i in range(100)]
+        argv = essential.decode_command(make_chain(), Path("/f.mkv"), times, 0.0,
+                                        essential.Part(48, 96, (0,)), "", "yuv420p")
+        joined = " ".join(argv)
+        self.assertIn("-noaccurate_seek -ss 0.000", joined)   # 2 s in, less the margin
+        self.assertIn(f"select=gte(t\\,{(times[47] + times[48]) / 2:.6f})", joined)
+        self.assertEqual(argv[argv.index("-frames:v") + 1], "48")
+        self.assertIn("-copyts", argv)
+
+    def test_the_first_part_needs_no_seek(self):
+        argv = essential.decode_command(make_chain(), Path("/f.mkv"), [0.0, 0.04], 0.0,
+                                        essential.Part(0, 2, (0,)), "bwdif", "yuv420p")
+        self.assertNotIn("-ss", argv)
+        self.assertEqual(argv[argv.index("-vf") + 1], "bwdif")
+
+    def test_deinterlacing_comes_before_the_selection(self):
+        times = [i / 25 for i in range(400)]
+        argv = essential.decode_command(make_chain(), Path("/f.mkv"), times, 0.0,
+                                        essential.Part(300, 400, (0,)), "bwdif=x", "yuv420p")
+        self.assertTrue(argv[argv.index("-vf") + 1].startswith("bwdif=x,select="))
+
+    def test_one_process_per_big_core_unless_configured(self):
+        cfg = config.Config()
+        self.assertEqual(essential.jobs(cfg, make_chain(big_cores="4,5,6,7")), 4)
+        cfg.grain.svtfg_jobs = 6
+        self.assertEqual(essential.jobs(cfg, make_chain(big_cores="4,5,6,7")), 6)
+
+    def test_eight_bit_sources_go_as_they_are(self):
+        self.assertEqual(essential.feed_format(make_info()), "yuv420p")
+        self.assertEqual(essential.feed_format(make_info(pix_fmt="yuv420p10le")), "yuv420p10le")
+        self.assertEqual(essential.feed_format(make_info(pix_fmt="yuv422p")), "yuv420p10le")
+
+    def test_scene_cuts_go_in_a_file(self):
+        argv = essential.estimate_command(make_chain(), Path("/w/p.tbl"), Path("/w/p.cuts"))
+        self.assertEqual(argv[-2:], ["--keyframes", "@/w/p.cuts"])
+        self.assertEqual(argv[argv.index("--strength") + 1], "-1")
+        self.assertEqual(argv[argv.index("--keyint") + 1], "0")
+
+    def test_the_estimate_is_redone_when_the_scenes_change(self):
+        cfg, chain, info = config.Config(), make_chain(svtfg_commit="abc"), make_info()
+        self.assertNotEqual(essential.key(info, chain, cfg, [0, 10]),
+                            essential.key(info, chain, cfg, [0, 11]))
+        self.assertNotEqual(essential.key(info, chain, cfg, [0]),
+                            essential.key(info, make_chain(svtfg_commit="def"), cfg, [0]))
+
+
+class TestSceneCalibration(unittest.TestCase):
+    def test_windows_skip_the_keyframe_and_stay_in_their_scene(self):
+        windows = scenegrain.plan_windows([0, 100], [0, 50, 100, 150], 200, 10_000, 4)
+        self.assertEqual([(w.keyframe, w.start, w.frames) for w in windows],
+                         [(0, 1, 4), (50, 51, 4), (100, 101, 4), (150, 151, 4)])
+        self.assertEqual([w.scene for w in windows], [0, 0, 1, 1])
+
+    def test_every_scene_gets_a_window_before_any_gets_two(self):
+        windows = scenegrain.plan_windows([0, 100, 400], [0, 50, 100, 200, 300, 400],
+                                          500, 12, 4)
+        self.assertEqual(sorted(w.scene for w in windows), [0, 1, 2])
+
+    def test_with_little_budget_the_longest_scenes_come_first(self):
+        windows = scenegrain.plan_windows([0, 100, 400], [0, 100, 400], 500, 4, 4)
+        self.assertEqual([w.scene for w in windows], [1])
+
+    def test_a_window_stops_at_the_next_keyframe(self):
+        windows = scenegrain.plan_windows([0], [0, 3], 10, 100, 8)
+        self.assertEqual([(w.start, w.frames) for w in windows], [(1, 2), (4, 6)])
+
+    def test_the_spread_order_is_a_permutation_starting_mid_way(self):
+        for count in (1, 2, 3, 7, 16):
+            order = scenegrain._spread(count)
+            self.assertEqual(sorted(order), list(range(count)))
+        self.assertEqual(scenegrain._spread(8)[0], 4)
+
+    def test_a_scene_measured_on_few_frames_leans_on_the_film(self):
+        self.assertAlmostEqual(scenegrain.shrink(2.0, 1.0, 0), 1.0)
+        self.assertAlmostEqual(scenegrain.shrink(2.0, 1.0, 8, prior=8), 2 ** 0.5)
+        self.assertGreater(scenegrain.shrink(2.0, 1.0, 64, prior=8), 1.8)
+        self.assertEqual(scenegrain.shrink(None, 0.7, 64), 0.7)
+        self.assertEqual(scenegrain.shrink(10.0, 1.9, 10_000), grain.MAX_FACTOR)
+        self.assertAlmostEqual(scenegrain.shrink(0.0, 0.2, 10_000), scenegrain.LOWEST, places=3)
+
+    def energies(self, frames: int, wanted: float, under: float, added: float):
+        return scenegrain.Energies(frames, (wanted,) * 3, (under,) * 3, (under + added,) * 3)
+
+    def test_the_film_factor_weighs_every_measured_frame_alike(self):
+        found = {0: self.energies(4, 10.0, 1.0, 9.0), 1: self.energies(12, 10.0, 1.0, 36.0)}
+        calibration = present(scenegrain.calibrate(found, "auto", prior=4))
+        whole = present(scenegrain.overall(found))
+        self.assertAlmostEqual(calibration.film[0], present(grain.strength_factor(
+            whole.wanted[0], whole.underneath[0], whole.with_grain[0])))
+        self.assertGreater(calibration.for_scene(0)[0], calibration.film[0])
+        self.assertLess(calibration.for_scene(1)[0], calibration.film[0])
+        self.assertEqual(calibration.for_scene(7), calibration.film)
+
+    def test_a_clean_film_gets_no_grain(self):
+        calibration = present(scenegrain.calibrate({0: self.energies(40, 5.0, 5.0, 9.0)}, "auto"))
+        self.assertFalse(calibration.keep)
+
+    def test_nothing_measured_is_no_calibration(self):
+        self.assertIsNone(scenegrain.calibrate({}, "auto"))
+
+    def test_each_frame_takes_its_scenes_factors(self):
+        calibration = scenegrain.Calibration(True, (1.0, 1.0, 1.0), {1: (0.5, 1.0, 1.0)})
+        out = scenegrain.scaled([entry(40), entry(40), entry(40)], [0, 2], calibration)
+        self.assertEqual([e.body[1] for e in out],
+                         ["sY 2 0 40 255 40", "sY 2 0 40 255 40", "sY 2 0 20 255 20"])
+
+    def test_the_budget_shrinks_with_the_picture(self):
+        cfg = config.Config()
+        self.assertEqual(scenegrain.budget(make_info(width=1920, height=1080), cfg),
+                         cfg.grain.calibration_frames)
+        self.assertEqual(scenegrain.budget(make_info(width=3840, height=2160), cfg),
+                         cfg.grain.calibration_frames // 4)
+
+    def test_a_stream_not_counted_in_milliseconds_is_refused(self):
+        result = subprocess.CompletedProcess([], 0, stdout="1/90000\n", stderr="")
+        with unittest.mock.patch.object(scenegrain, "run", return_value=result), \
+                self.assertRaises(ValueError):
+            scenegrain.read_stream(make_chain(), Path("/x.mp4"))
+
+    def test_packets_give_timestamps_and_keyframes_in_display_order(self):
+        answers = iter([subprocess.CompletedProcess([], 0, "1/1000\n", ""),
+                        subprocess.CompletedProcess([], 0, "42,__\n0,K_\n83,K_\n", "")])
+        with unittest.mock.patch.object(scenegrain, "run", lambda *_a, **_k: next(answers)):
+            stream = scenegrain.read_stream(make_chain(), Path("/x.mkv"))
+        self.assertEqual(stream.stamps, [0, 420_000, 830_000])
+        self.assertEqual(stream.keyframes, [0, 2])
+
+    def test_a_window_reads_the_same_frames_of_all_three(self):
+        stream = scenegrain.Stream([i * 10_000 for i in range(0, 4000, 40)],
+                                   [i / 1000 for i in range(0, 4000, 40)], [0, 50])
+        window = scenegrain.Window(0, 50, 51, 4)
+        stats = [Path(f"/w/{n}.log") for n in range(3)]
+        argv = scenegrain.window_command(make_chain(), window, Path("/src.mkv"),
+                                         stream.times, 0.0, Path("/base.mkv"),
+                                         Path("/grain.mkv"), stream, 0.0, "", stats)
+        graph = argv[argv.index("-filter_complex") + 1]
+        middle = (stream.times[50] + stream.times[51]) / 2
+        self.assertEqual(graph.count(f"select=gte(t\\,{middle:.6f})"), 3)
+        self.assertEqual(graph.count("trim=end_frame=4"), 3)
+        self.assertEqual(argv.count("-export_side_data"), 1)
+        # The encodes are sought straight to the window's keyframe.
+        self.assertIn(f"{stream.times[50] + 0.0005:.4f}", argv)
+
+
+class TestSceneList(unittest.TestCase):
+    def test_scene_starts_are_the_cuts_not_the_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scenes.json"
+            path.write_text(json.dumps({
+                "frames": 300,
+                "scenes": [{"start_frame": 0, "end_frame": 200},
+                           {"start_frame": 200, "end_frame": 300}],
+                "split_scenes": [{"start_frame": 0, "end_frame": 100},
+                                 {"start_frame": 100, "end_frame": 200},
+                                 {"start_frame": 200, "end_frame": 300}]}))
+            self.assertEqual(scenes.starts(path), [0, 200])
+            self.assertIsNone(scenes.starts(Path(tmp) / "missing.json"))
+
+
+class TestSvtfgDependency(unittest.TestCase):
+    def test_it_is_the_default_estimator(self):
+        self.assertEqual(config.Config().grain.estimator, "svtfg")
+
+    def test_its_settings_are_checked(self):
+        for name, value in (("estimator", "nope"), ("svtfg_jobs", -1),
+                            ("calibration_frames", 10), ("calibration_window", 0)):
+            cfg = config.Config()
+            setattr(cfg.grain, name, value)
+            with self.assertRaises(config.ConfigError, msg=name):
+                config.validate(cfg)
+
+    def test_a_run_needs_it_only_while_it_estimates(self):
+        def problems(cfg: config.Config) -> str:
+            try:
+                tools.require(make_chain(svtfg=None), cfg)
+            except tools.ToolError as exc:
+                return str(exc)
+            return ""
+
+        cfg = config.Config()
+        self.assertIn("SvtFgEssential", problems(cfg))
+        cfg.grain.estimator = "svt"
+        self.assertNotIn("SvtFgEssential", problems(cfg))
+        cfg.grain.estimator, cfg.grain.mode = "svtfg", "never"
+        self.assertNotIn("SvtFgEssential", problems(cfg))
+
+    def test_its_commit_is_read_from_beside_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "SvtFgEssential"
+            binary.write_text("")
+            self.assertEqual(tools.read_svtfg_commit(str(binary)), "")
+            (Path(tmp) / tools.SVTFG_COMMIT_FILE).write_text("9f7ebdc5\n")
+            self.assertEqual(tools.read_svtfg_commit(str(binary)), "9f7ebdc5")
+
+    def test_it_is_found_beside_the_encoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "SvtFgEssential").write_text("")
+            chain = make_chain(svtav1encapp=str(Path(tmp) / "SvtAv1EncApp"))
+            with unittest.mock.patch.object(tools.shutil, "which", return_value=None):
+                self.assertEqual(tools._find_svtfg("SvtFgEssential", chain),
+                                 str(Path(tmp) / "SvtFgEssential"))
+
+    def test_an_unrecorded_build_is_unknown(self):
+        checks = {c.pin.name: c for c in versions.check(tested_chain(svtfg_commit=""))}
+        self.assertEqual(checks["svtfg"].status, "unknown")
+        self.assertIn("svtfg", versions.fixes(list(checks.values())))
+
+    def test_hevc_decodes_on_the_video_engine(self):
+        chain = make_chain(rkmpp_decoders={"hevc_rkmpp"})
+        with unittest.mock.patch.object(verify, "_video_codec", return_value="hevc"):
+            self.assertEqual(verify.decode_args(chain, Path("/x.mkv"), grain=True),
+                             ["-c:v", "hevc_rkmpp", "-deint", "0"])
+
+    def test_dav1d_keeps_frames_in_flight(self):
+        chain = make_chain(decoders={"libdav1d"})
+        with unittest.mock.patch.object(verify, "_video_codec", return_value="av1"):
+            self.assertEqual(verify.decode_args(chain, Path("/x.mkv"), grain=False),
+                             verify.DAV1D_FRAME_DELAY)
+        self.assertEqual(verify.software_decode_args(make_chain(), "av1"), [])
+
+
+class TestRegrain(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = config.Config()
+        self.cfg.paths.work_dir = str(self.root / "work")
+        self.cfg.paths.state_file = str(self.root / "state.json")
+        self.ledger = Ledger(self.cfg.state_path)
+        self.out = self.root / "out"
+        self.out.mkdir()
+        for name in ("A", "B"):
+            (self.out / f"{name}.av1.mkv").write_text("x")
+            self.ledger.record(Path(f"/lib/{name}.mkv"), Record(
+                source=f"/lib/{name}.mkv", status="done", output=str(self.out / f"{name}.av1.mkv")))
+        self.ledger.record(Path("/lib/C.mkv"), Record(source="/lib/C.mkv", status="failed"))
+
+    def test_folders_and_files_name_finished_films(self):
+        found, strangers = regrain.targets([self.out], self.ledger)
+        self.assertEqual([t.output.name for t in found], ["A.av1.mkv", "B.av1.mkv"])
+        found, strangers = regrain.targets([self.out / "B.av1.mkv", self.root / "x.mkv"],
+                                           self.ledger)
+        self.assertEqual(([t.source for t in found], strangers),
+                         ([Path("/lib/B.mkv")], [self.root / "x.mkv"]))
+
+    def test_no_inputs_means_every_finished_film(self):
+        found, _ = regrain.targets([], self.ledger)
+        self.assertEqual(len(found), 2)
+
+    def test_it_refuses_to_run_beside_a_run(self):
+        with pipeline.only_run(self.cfg), \
+                unittest.mock.patch.object(regrain, "_regrain_all") as work:
+            self.assertEqual(regrain.main(self.cfg, make_chain(), [self.out]), 1)
+        work.assert_not_called()
+
+    def test_it_needs_the_svtfg_estimator(self):
+        self.cfg.grain.estimator = "svt"
+        with unittest.mock.patch.object(regrain, "_regrain_all") as work:
+            self.assertEqual(regrain.main(self.cfg, make_chain(), [self.out]), 2)
+        work.assert_not_called()
+
+    def test_every_track_keeps_its_place(self):
+        found = [regrain.Track(0, "video", "av1", False), regrain.Track(1, "audio", "opus", False),
+                 regrain.Track(2, "subtitle", "subrip", False),
+                 regrain.Track(3, "attachment", "ttf", False)]
+        argv = regrain.remux_command(make_chain(), Path("/o.mkv"), found, found[0],
+                                     Path("/v.mkv"), ["default"], "", Path("/o.part"))
+        maps = [argv[i + 1] for i, a in enumerate(argv) if a == "-map"]
+        self.assertEqual(maps, ["1:0", "0:1", "0:2", "0:3"])
+        self.assertIn("-copyts", argv)
+        self.assertEqual(argv[argv.index("-disposition:0") + 1], "default")
+
+    def test_every_tracks_tags_are_mapped(self):
+        # One stream mapping turns off ffmpeg's own copying for every stream: the
+        # first regrain of Film A lost every language and the
+        # commentary's title.
+        found = [regrain.Track(0, "audio", "ac3", False), regrain.Track(1, "video", "av1", False),
+                 regrain.Track(2, "attachment", "ttf", False)]
+        argv = regrain.remux_command(make_chain(), Path("/o.mkv"), found, found[1],
+                                     Path("/v.mkv"), [], "", Path("/o.part"))
+        self.assertEqual([argv[argv.index(f"-map_metadata:s:{n}") + 1] for n in range(3)],
+                         ["0:s:0", "0:s:1", "0:s:2"])
+
+    def test_lost_tags_are_caught(self):
+        before = [regrain.Track(0, "video", "av1", False),
+                  regrain.Track(1, "audio", "ac3", False, (("language", "eng"),))]
+        after = [before[0], regrain.Track(1, "audio", "ac3", False)]
+        with unittest.mock.patch.object(regrain, "tracks", side_effect=[before, after]), \
+                self.assertRaises(ValueError):
+            regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
+
+    def test_a_film_track_after_cover_art_is_the_one_replaced(self):
+        found = [regrain.Track(0, "video", "mjpeg", True), regrain.Track(1, "video", "av1", False)]
+        film = regrain.film_track(found)
+        argv = regrain.remux_command(make_chain(), Path("/o.mkv"), found, film, Path("/v.mkv"),
+                                     [], "2.39:1", Path("/o.part"))
+        maps = [argv[i + 1] for i, a in enumerate(argv) if a == "-map"]
+        self.assertEqual(maps, ["0:0", "1:0"])
+        self.assertEqual(argv[argv.index("-aspect:1") + 1], "2.39:1")
+
+    def test_a_changed_file_is_not_put_in_place(self):
+        before = [regrain.Track(0, "video", "av1", False), regrain.Track(1, "audio", "ac3", False)]
+        with unittest.mock.patch.object(regrain, "tracks", side_effect=[before, before[:1]]), \
+                self.assertRaises(ValueError):
+            regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
+        with unittest.mock.patch.object(regrain, "tracks", side_effect=[before, before]), \
+                unittest.mock.patch.object(regrain, "_video_packets",
+                                           side_effect=[(100, "0"), (99, "0")]), \
+                self.assertRaises(ValueError):
+            regrain.check(make_chain(), Path("/old.mkv"), Path("/new.mkv"))
+
+
+class TestFilmGrainRoute(unittest.TestCase):
+    def test_frames_that_do_not_match_fall_back_to_the_samples(self):
+        cfg = config.Config()
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            listing = work / "scenes.json"
+            listing.write_text(json.dumps({"frames": 10, "scenes": [
+                {"start_frame": 0, "end_frame": 10}]}))
+            with unittest.mock.patch.object(essential, "frames_table",
+                                            side_effect=essential.Mismatch("short")), \
+                    unittest.mock.patch.object(
+                        pipeline, "_sampled_grain",
+                        return_value=(work / "g.mkv", work / "t.tbl")) as old:
+                video, table = pipeline.film_grain(make_info(), work / "e.mkv", listing,
+                                                   make_chain(), cfg, work)
+        old.assert_called_once()
+        self.assertEqual((video.name, present(table).name), ("g.mkv", "t.tbl"))
+
+    def test_a_clean_film_ships_the_plain_encode(self):
+        cfg = config.Config()
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            listing = work / "scenes.json"
+            listing.write_text(json.dumps({"frames": 10, "scenes": [
+                {"start_frame": 0, "end_frame": 10}]}))
+            with unittest.mock.patch.object(essential, "frames_table", return_value=work / "f"), \
+                    unittest.mock.patch.object(scenegrain, "apply",
+                                               return_value=scenegrain.Result(False, None, None)):
+                video, table = pipeline.film_grain(make_info(), work / "e.mkv", listing,
+                                                   make_chain(), cfg, work)
+        self.assertEqual((video.name, table), ("e.mkv", None))

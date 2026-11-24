@@ -216,7 +216,12 @@ def worst_windows(
 
 
 # Codecs whose rkmpp decode matched software on every frame; see decode_args.
-EXACT_RKMPP = frozenset({"h264"})
+EXACT_RKMPP = frozenset({"h264", "hevc"})
+
+# dav1d's frames in flight. ffmpeg leaves it at 0, which libdav1d then keeps low,
+# and a 1080p 10-bit encode decoded at 43 frames/s on an RK3588's eight cores;
+# with 8, at 200, bit for bit the same frames, with grain or without.
+DAV1D_FRAME_DELAY = ["-max_frame_delay", "8"]
 
 
 def ffmpeg_argv(chain: Toolchain) -> list[str]:
@@ -251,10 +256,14 @@ def _video_codec(ffprobe: str, path: Path) -> str:
 
 
 def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
-    """Input options that decode `path` on the Rockchip video engine when that is exact.
+    """Input options that decode `path` on the Rockchip video engine when that is
+    exact, or else as fast as the software decoder goes (DAV1D_FRAME_DELAY).
 
     Only for codecs checked frame by frame against software. H.264 was
-    bit-identical on every frame of two films. AV1 is not trusted: on
+    bit-identical on every frame of two films. HEVC on 1,920 frames of four
+    (8- and 10-bit, 1080p and 4K, HDR10 and Dolby Vision), 96 frames at each of
+    five points, decoded from a seek as the grain estimate decodes. AV1 is not
+    trusted: on
     jellyfin-ffmpeg 8.1.3-2 av1_rkmpp applies grain exactly, and matched dav1d
     on encodes 1920, 1918 and 954 wide, but on a 1202-wide one 151,522 of
     152,518 frames came out different (luma median 16.9 dB): MPP sizes its
@@ -265,13 +274,16 @@ def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
     Deinterlacing is on by default in these decoders and would alter the
     frames, so it is turned off.
     """
-    if not chain.rkmpp_decoders:
-        return []
     codec = _video_codec(chain.ffprobe, path)
     decoder = f"{codec}_rkmpp"
-    if codec not in EXACT_RKMPP or decoder not in chain.rkmpp_decoders:
-        return []
-    return ["-c:v", decoder, "-deint", "0"]
+    if codec in EXACT_RKMPP and decoder in chain.rkmpp_decoders:
+        return ["-c:v", decoder, "-deint", "0"]
+    return software_decode_args(chain, codec)
+
+
+def software_decode_args(chain: Toolchain, codec: str) -> list[str]:
+    """DAV1D_FRAME_DELAY for AV1 when ffmpeg decodes it with libdav1d, else nothing."""
+    return list(DAV1D_FRAME_DELAY) if codec == "av1" and "libdav1d" in chain.decoders else []
 
 
 def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path,

@@ -23,6 +23,7 @@ COPY scripts/bootstrap.sh scripts/grav1synth-0.2.0-grain-flag.patch \
 # One layer per stage, so that changing a pin rebuilds only what follows it.
 RUN /src/bootstrap.sh deps
 RUN /src/bootstrap.sh svtav1
+RUN /src/bootstrap.sh svtfg
 RUN /src/bootstrap.sh vapoursynth
 # VapourSynth's Python module went into the prefix, which Python does not search
 # (a native install puts it in the user site, which it does). Av1an's own check

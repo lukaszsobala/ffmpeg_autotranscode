@@ -164,6 +164,16 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path, scenes: P
              len(merged["scenes"]), len(merged["split_scenes"]))
 
 
+def starts(path: Path) -> list[int] | None:
+    """The first frame of every scene in a whole scene list, or None. The scenes
+    as detected, before Av1an splits long ones into chunks: the cuts."""
+    if not whole_list(path):
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    found = sorted({int(scene["start_frame"]) for scene in data.get("scenes") or []})
+    return found or None
+
+
 def plan(frames: int, length: int) -> list[tuple[int, int | None]]:
     """The parts of a film of `frames` frames: `length` each, the last running to
     the end, so between one and two lengths long."""

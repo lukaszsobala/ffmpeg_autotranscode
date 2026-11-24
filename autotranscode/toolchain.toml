@@ -59,6 +59,19 @@ accept = "exact"
 enforce = true
 stage = "grav1synth"
 
+[svtfg]
+# SvtFgEssential, SVT-AV1-Essential's standalone film grain estimator: the grain
+# table for grain.estimator = "svtfg", the default. Only this tool is built from
+# Essential; mainline SVT-AV1 stays the encoder, as Essential changes defaults the
+# CRF and variance-boost tuning depends on. The commit of v4.3.1-Essential, the
+# first release with automatic analysis (--strength -1). The tool's own version
+# (1.0.0) does not move with the estimator, which lives in the codec library, so
+# bootstrap records the commit beside the binary, in SvtFgEssential.commit.
+version = "9f7ebdc5ffbe3c135b223dd618d5155b43427703"
+accept = "exact"
+enforce = true
+stage = "svtfg"
+
 [vapoursynth]
 # Pinned deliberately, not lazily. R73 onward added Vulkan GPU filters whose
 # gpufilter.h does not compile against Debian 13's Vulkan headers

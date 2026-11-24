@@ -51,6 +51,9 @@ class Paths:
     av1an: str = "av1an"
     svtav1encapp: str = "SvtAv1EncApp"
     grav1synth: str = "grav1synth"
+    # SVT-AV1-Essential's grain estimator, for grain.estimator = "svtfg". Found
+    # beside SvtAv1EncApp or in ~/.local/bin when not on PATH.
+    svtfg: str = "SvtFgEssential"
     mkvmerge: str = "mkvmerge"
     work_dir: str = "~/.cache/autotranscode"
     state_file: str = "~/.cache/autotranscode/state.json"
@@ -216,16 +219,31 @@ class Grain:
     # Cheap: the table is rewritten into the finished stream in seconds, with no
     # re-encode, and the measurement reads a few seconds of video.
     calibrate: bool = True
-    # Who estimates the grain. "svt": SVT-AV1's own estimator, run on the grain
-    # samples only -- its tables looked like the source's grain on the test film.
+    # Who estimates the grain.
+    # "svtfg": SVT-AV1-Essential's SvtFgEssential on the whole film, scene by
+    # scene, one table entry per frame, then calibrated scene by scene. On To Live
+    # and Die in L.A. its grain had the source's texture (lag-1 correlation +0.36
+    # against the source's +0.33) and brightness profile; "svt"'s had neither.
+    # "svt": SVT-AV1's own estimator on the grain samples alone, one table for the
+    # whole film: its AR filter makes grain finer than film's (lag-1 -0.08).
     # "grav1synth": `grav1synth diff` against a denoised copy, whose tables drew a
-    # visibly repeating, quilted texture whatever denoiser fed it (their AR filters
-    # had a DC gain of 0.9-1.95, against SVT's 0.60-0.77). Either way the table is
-    # applied afterwards with grav1synth, so SVT's grain costs seconds of samples
-    # rather than the doubled encode time of --film-grain on the whole film.
-    estimator: str = "svt"  # svt | grav1synth
-    svt_level: int = 10  # --film-grain for the estimate, 1-50
+    # visibly repeating, quilted texture whatever denoiser fed it.
+    # Every table is applied after the encode, with grav1synth.
+    estimator: str = "svtfg"  # svtfg | svt | grav1synth
+    svt_level: int = 10  # --film-grain for the "svt" estimate, 1-50
     estimate_preset: int = 8
+    # SvtFgEssential processes for "svtfg", each on a run of whole scenes: its
+    # automatic analysis is single-threaded, and resets at every scene cut, so
+    # the parts give the same table as one pass. 0: one per big core (all cores
+    # on a CPU without big and little ones).
+    svtfg_jobs: int = 0
+    # Per-scene calibration ("svtfg"): about this many frames measured at 1080p,
+    # fewer in proportion at higher resolutions, in windows of calibration_window
+    # frames at the encode's keyframes, so each window decodes only itself. The
+    # measure (a 3x3 median) runs at about 15 frames/s at 1080p on an RK3588, so
+    # 4000 frames for each of the three streams take about 13 minutes.
+    calibration_frames: int = 4000
+    calibration_window: int = 4
 
 
 @dataclass(slots=True)
@@ -533,8 +551,14 @@ def validate(cfg: Config) -> None:
                     -1, 4, "-1 (encoder default) or 0 to 4")
     if cfg.encode.deinterlace not in {"off", "auto", "tff", "bff"}:
         raise ConfigError("encode.deinterlace must be off, auto, tff or bff")
-    if cfg.grain.estimator not in {"svt", "grav1synth"}:
-        raise ConfigError("grain.estimator must be svt or grav1synth")
+    if cfg.grain.estimator not in {"svtfg", "svt", "grav1synth"}:
+        raise ConfigError("grain.estimator must be svtfg, svt or grav1synth")
+    if cfg.grain.svtfg_jobs < 0:
+        raise ConfigError("grain.svtfg_jobs cannot be negative (0 picks by cores)")
+    if cfg.grain.calibration_frames < 100:
+        raise ConfigError("grain.calibration_frames must be at least 100")
+    if not 1 <= cfg.grain.calibration_window <= 48:
+        raise ConfigError("grain.calibration_window must be between 1 and 48 frames")
     if not 1 <= cfg.grain.svt_level <= 50:
         raise ConfigError("grain.svt_level must be between 1 and 50")
     if str(cfg.encode.variance_boost_curve) not in {"auto", "0", "1", "2"}:

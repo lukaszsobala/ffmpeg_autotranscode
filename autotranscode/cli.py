@@ -19,6 +19,7 @@ from . import (
     grain,
     pipeline,
     probe,
+    regrain,
     sample,
     tools,
     update,
@@ -150,6 +151,17 @@ def build_parser() -> argparse.ArgumentParser:
     clean_cmd.add_argument("--samples", action="store_true",
                            help="also remove `sample`'s results: reports, excerpts, encodes "
                                 "and snapshots")
+
+    regrain_cmd = sub.add_parser(
+        "regrain",
+        help="give films already encoded the grain a run makes now, estimated and "
+             "calibrated scene by scene: no new encode, each file replaced in place",
+    )
+    regrain_cmd.add_argument("inputs", nargs="*", type=Path,
+                             help="outputs, or folders of them (default: every finished "
+                                  "film in the ledger)")
+    regrain_cmd.add_argument("-n", "--dry-run", action="store_true",
+                             help="list the films and their sources, change nothing")
 
     sub.add_parser("doctor", help="check that the required tools are present and capable")
 
@@ -518,6 +530,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "plan":
         return cmd_plan(args.inputs, cfg, chain)
+
+    if args.command == "regrain":
+        if not args.dry_run:
+            try:
+                require(chain, cfg)
+            except tools.ToolError as exc:
+                log.error("%s", exc)
+                return 2
+        try:
+            return regrain.main(cfg, chain, args.inputs, dry_run=args.dry_run)
+        except KeyboardInterrupt:
+            return 130
 
     # run
     try:

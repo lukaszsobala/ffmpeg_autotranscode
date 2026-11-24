@@ -21,7 +21,7 @@ different fixes; see [Quality scales with resolution](#quality-scales-with-resol
 AV1 can carry a compact description of grain in the bitstream and re-synthesise it
 at playback, so it costs almost nothing: grain added to the test film's encode
 changed its size by under 1%. The work is in describing grain that looks like the
-source's, and that took three attempts to get right:
+source's, and that took four attempts to get right:
 
 1. **`grav1synth diff`** against a denoised copy of the source. Its tables drew a
    visibly repeating, quilted texture, whatever denoiser fed it — their AR filters
@@ -29,13 +29,17 @@ source's, and that took three attempts to get right:
    block after block. Still available as `grain.estimator = "grav1synth"`.
 2. **SVT-AV1's own estimator, in the encode** (`--film-grain`). It looked right —
    AR gains of 0.60-0.77 across 95 frames — but doubled the encode time.
-3. **SVT-AV1's estimator on a few seconds of samples**, applied afterwards. The
-   default. The samples are encoded with `--film-grain`, ffmpeg's decoder reads back
+3. **SVT-AV1's estimator on a few seconds of samples**, applied afterwards. Now
+   `grain.estimator = "svt"`. The samples are encoded with `--film-grain`, ffmpeg's decoder reads back
    every frame's parameters, the most typical frame's become the table (its medoid:
    one atypical frame drew faint stripes), and grav1synth writes it into the
    finished stream. Minutes per film, whatever its length: five on an RK3588 with
-   four 2-second samples, the old setting there. Ten 3-second samples, the default
-   now, took 1m47s for a 1080p clip on a Core Ultra 7 258V.
+   four 2-second samples, the old setting there. Ten 3-second samples took 1m47s
+   for a 1080p clip on a Core Ultra 7 258V. Its grain had the wrong texture.
+4. **SvtFgEssential over the whole film**, from
+   [SVT-AV1-Essential](https://github.com/nekotrix/SVT-AV1-Essential) 4.3.1, one
+   table entry per frame, calibrated scene by scene. The default. See
+   [The whole-film estimate](#the-whole-film-estimate).
 
 The table is then **calibrated**: the grain in the result is measured against the
 source's, plane by plane, and the table rescaled to match — in seconds, since only
@@ -58,6 +62,118 @@ Two constraints shaped the implementation:
    `ffmpeg -svtav1-params`. Anything built on `ffmpeg -c:v libsvtav1` cannot load a
    grain table at all.
 
+### The whole-film estimate
+
+SVT-AV1's estimate on samples gave grain of the wrong texture. On To Live and
+Die in L.A. (35 mm, 1080p), ten 3-second windows were encoded with the
+production settings and both tables applied to the same encode. Measured on the
+flattest 40% of 16-pixel blocks, against what the encode lost there (source minus
+encode, in 10-bit units):
+
+| | factor calibration wanted, Y / Cb / Cr | luma lag-1 correlation, horizontal / vertical | luma σ by brightness, dark to bright (calibrated) |
+|---|---|---|---|
+| the source's grain | | +0.33 / +0.33 | 7.3, 9.9, 12.5, 12.3, 4.3 |
+| SVT-AV1 on samples | 2.26 / 1.17 / 0.88 | -0.08 / -0.04 | 6.2, 6.6, 6.6, 6.6, 6.6 |
+| SvtFgEssential | 0.74 / 1.01 / 1.04 | +0.36 / +0.38 | 5.7, 8.9, 13.8, 13.3, 5.3 |
+
+SVT's AR filter had negative coefficients next to each pixel, so its grain was
+finer than film's; calibration scales strength and cannot fix texture. Its
+strength was the same at every brightness, where film grain peaks in the
+midtones; and it came out 2.3 times too weak, past calibration's limit of 2. By
+eye, on a white wall and a red sunset sky, it was an even digital speckle, and
+SvtFgEssential's the source's coarser clumps.
+
+SvtFgEssential (`--strength -1`) estimates grain from each frame's difference
+to a motion-compensated neighbour on flat blocks, fits it per brightness band,
+checks the quantised AR filter for resonance and repeating patterns, and
+shrinks it until it passes. It re-estimates every 11 frames, blending with what
+came before, starts afresh at every keyframe it is given, and writes a table
+entry for every frame. Only this tool is taken from Essential: as an encoder it
+changes many defaults the CRF and variance-boost settings here were judged with.
+
+**Speed.** Its automatic analysis is single-threaded: 20 frames/s for 1080p on
+one Cortex-A76, 25 for 8-bit input, decoding included. Since it keeps nothing
+across a keyframe, the film is split at Av1an's scene starts into runs of whole
+scenes, one SvtFgEssential per big core, and the runs' entries follow each
+other. Equal runs left cores idle at the end: Film A in 14 runs for 4
+processes spent the last 8 of its 31 minutes with half of them waiting. So each
+run takes half of what is left divided by the processes, down to 600 frames, and
+the longest go first, so a long take that cannot be split goes early. In a
+simulation of that film's shape (341 scenes, three long takes), 26.4 minutes
+against an ideal 26.2, and never above 26.8.
+
+The little cores do not pay here. They already carry the decoders at about 40%
+each, and four more SvtFgEssential processes on them made 5 frames/s each while
+slowing the four on the big cores from 25 to 21: 104 frames/s in all against
+100. Against one pass over
+720 frames with the same cuts, the parallel runs' scaling functions differed by
+0.2% on average (luma 0.01%): a few frames after each cut, where one pass still
+carries a little of the scene before. Each run is decoded from a seek and found
+by its frames' timestamps (`-copyts`, then `select` on the first frame's time),
+so whatever the seek lands on, its frames are exactly the encode's; on the
+Rockchip video engine when that is exact for the codec (see
+[Why there is no hardware acceleration](#why-there-is-no-hardware-acceleration)).
+Finished runs are kept, so a stop loses only those in flight. If the source's
+frames still do not match the encode's one for one, the film falls back to the
+estimate from samples.
+
+**Timing the table.** grav1synth (through av1-grain 0.4.1) gives each frame the
+first segment with start <= t <= end, both inclusive, where t is the packet's
+timestamp read as milliseconds times 10,000. SvtFgEssential times entry n at
+n x 417083 for 23.976 fps, but Matroska rounds timestamps to the millisecond:
+frame 3 at 125.125 ms is stored as 125, which is before 3 x 417083 = 1,251,250,
+so it took frame 2's entry, and so did about half the frames. The table is
+therefore retimed by the packets of the stream it goes into: each run of frames
+with the same parameters becomes one segment, from its first frame's timestamp
+to one before the next run's. That also covers a variable frame rate and a
+video track that starts after its audio. Runs are about ten frames long (the
+parameters change every 11 frames), which keeps grav1synth's search, linear
+for every frame, from growing with the square of the film's length. A run keeps
+its first frame's seed; grav1synth moves the seed on at every frame anyway.
+
+**Per-scene calibration.** One factor per film left scenes far apart: in the
+ten windows above, SvtFgEssential's luma wanted anything from x0.59 to x1.5. So
+calibration measures each scene and scales each scene's entries. The measure,
+verify's (a 3x3 median on 10-bit), costs about 0.4 core-seconds a 1080p frame,
+about 15 frames/s on an RK3588, and decoding the encode whole would cost more
+still, so it reads windows: a few frames just after keyframes of the encode,
+which Av1an puts at every chunk start, so the seek decodes nothing extra; the
+keyframe itself is left out, since an intra frame keeps more texture than its
+neighbours. The source's same frames are found by timestamp, as above. Every
+scene gets a window before any gets a second, longest scenes first, up to
+`grain.calibration_frames` (4,000 at 1080p, fewer in proportion above). A scene's
+factor is pulled towards the film's, in the log domain, by as many frames' worth
+as two windows; a scene without a window takes the film's. Whether to keep grain
+at all is still decided on the film's measure (`decide_strength`).
+
+**Films encoded before.** Grain is parameters in the frame headers, so
+`autotranscode regrain` gives a finished film the new grain without encoding it
+again: the video track is taken out, the table estimated and calibrated as a
+run would, written in with grav1synth, and the file remuxed with every other
+track in its place and the timestamps as they were. Applying a table over an
+earlier one gave, frame for frame, the pictures of applying it to the encode
+without grain. The new file must have the same tracks, the same video packets
+and the same length before it replaces the old one.
+
+**On a whole film.** Film A (1080p, 157,013 frames, 341 scenes) was
+regrained on the RK3588 in 1h19m: 22 minutes of scene detection (Av1an's, as a
+run makes it; detecting at 540 lines was four times slower, its downscaler
+costing more than the detection, for the same cuts), 31 for the estimate (84
+frames/s over four processes of 37 MB each), 20 for calibration (856 windows,
+every scene), and the rest taking the track out and remuxing. The per-frame
+table was 63 MB; retimed, 14,348 segments in 6 MB, which grav1synth wrote in
+seconds. Against its old grain, the "svt" estimate's single table, in 20
+windows spread over the film, measured as above:
+
+| | luma σ | luma lag-1, horizontal / vertical | luma σ by brightness, dark to bright | luma σ against the source's, by window |
+|---|---|---|---|---|
+| the source's grain | 6.26 | +0.41 / +0.48 | 4.9, 9.4, 9.7, 8.0, 8.4 | |
+| old: "svt", one table | 7.10 | +0.04 / +0.06 | 7.1, 7.3, 7.3, 7.4, 7.5 | x0.79 to x3.43 |
+| new: SvtFgEssential, per scene | 6.25 | +0.41 / +0.49 | 4.7, 9.2, 10.4, 8.4, 9.3 | x0.84 to x1.28 |
+
+The new grain's one window outside that range was the end credits, where the
+source has almost no texture (σ 1.6): x0.29, where the old was x2.53.
+
 ### The old grain detector
 
 `measure` scores each file by the mean PSNR between it and a reference-denoised
@@ -76,18 +192,17 @@ source.mkv
    │
    ├── mux rehearsal ................... the real mux on the first 5 s
    │
-   ├── grain probe ..................... is there grain worth putting back?
-   │
-   ├── grain table (if grainy)
-   │      ├── extract N short LOSSLESS excerpts
-   │      ├── SvtAv1EncApp --film-grain  estimate grain on those alone
-   │      └── medoid frame ............. one table for the whole runtime
-   │
    ├── av1an -e svt-av1
    │      └── scene-split, parallel, resumable → video-only AV1
    │
+   ├── SvtFgEssential --strength -1 .... the grain of every frame, a run of whole
+   │      │                              scenes per big core
+   │      └── retime ................... a segment per run of equal frames, timed
+   │                                     by the encode's own packets
+   │
    ├── grav1synth apply -g grain.tbl ... write grain into the bitstream
-   │      └── calibrate ................ measure against the source, rescale, rewrite
+   │      └── calibrate ................ measure windows of every scene against the
+   │                                     source, rescale each scene, rewrite
    │
    └── ffmpeg mux ...................... + audio, subtitles, chapters, metadata
           └── output.av1.mkv
@@ -262,9 +377,19 @@ probe and table build, which decode about eight seconds of video per film.
 A `machine.hwaccel_decode` option used to exist here. It was never read by
 anything, and its removal changed no behaviour.
 
-**`verify` is the exception.** It decodes a whole film and its encode several
-times over, so it decodes H.264 sources with `h264_rkmpp`, which matched
-software on every frame of two films. AV1 stays on the CPU, because
+**`verify` and the grain estimate are the exception.** `verify` decodes a whole
+film and its encode several times over, and the grain estimate the whole film
+once more, so they decode H.264 sources with `h264_rkmpp`, which matched
+software on every frame of two films, and HEVC with `hevc_rkmpp`, which matched
+it on 1,920 frames of four films (8- and 10-bit, 1080p and 4K, HDR10 and Dolby
+Vision; 96 frames at five points of each, every one decoded from a seek). One
+such decode feeding Y4M runs at about 240 frames/s at 1080p and 65-78 at 4K.
+
+AV1 decodes in software, with dav1d allowed eight frames in flight
+(`-max_frame_delay 8`): ffmpeg leaves it at 0, which libdav1d keeps low, and a
+1080p 10-bit encode decoded at 43 frames/s on the RK3588's eight cores; with 8,
+at 200, the same frames bit for bit, with grain or without. AV1 stays off the
+video engine, because
 `av1_rkmpp` gets some frame sizes wrong. On jellyfin-ffmpeg 8.1.3-2, compared
 with dav1d frame by frame (framemd5) over whole films, all with grain on every
 frame:

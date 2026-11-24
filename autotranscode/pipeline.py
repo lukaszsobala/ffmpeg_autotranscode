@@ -27,7 +27,7 @@ from collections.abc import Collection, Iterator, Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from . import encode, grain, mux, progress, resume, scenes, update, watch
+from . import encode, essential, grain, mux, progress, resume, scenegrain, scenes, update, watch
 from .config import Config
 from .probe import MediaInfo, probe
 from .state import Ledger, Record
@@ -435,6 +435,50 @@ def _calibrate_grain(
     return True
 
 
+def film_grain(read: MediaInfo, base: Path, scene_list: Path, chain: Toolchain, cfg: Config,
+               work: Path) -> tuple[Path, Path | None]:
+    """`base` (an encode, with grain or without) with the film's grain from
+    SvtFgEssential, calibrated scene by scene: the stream to mux, and its table
+    (None when the source has no grain worth putting back).
+
+    No fallback to shipping without grain when a tool fails, as for the other
+    estimators: the work stays, and a rerun carries on. Only frames that cannot
+    be matched one for one -- a source whose decoder finds other frames than
+    Av1an's did -- fall back to the estimate from samples.
+    """
+    starts = scenes.starts(scene_list)
+    if starts is None:
+        starts = scenegrain.read_stream(chain, base).keyframes
+        log.info("  no scene list; the encode's keyframes stand in for its scenes")
+    prefilter = encode.deinterlace_filter(read, cfg)
+    try:
+        frames = essential.frames_table(read, chain, cfg, work, starts)
+        result = scenegrain.apply(read, base, frames, starts, chain, cfg, work, prefilter)
+    except essential.Mismatch as exc:
+        log.warning("  grain estimate: %s; estimating it from samples instead", exc)
+        return _sampled_grain(read, base, chain, cfg, work)
+    if not result.keep or result.video is None:
+        log.info("  the encode kept all the source's fine texture; no grain added")
+        return base, None
+    log.info("  film grain applied from table")
+    return result.video, result.table
+
+
+def _sampled_grain(read: MediaInfo, base: Path, chain: Toolchain, cfg: Config,
+                   work: Path) -> tuple[Path, Path | None]:
+    """The "svt" estimator's table, from samples, applied and calibrated as one."""
+    table = grain.estimate_with_svt(read, chain, cfg, work)
+    if table is None:
+        log.warning("  no grain table; the film goes without grain")
+        return base, None
+    grainy = work / "grainy.mkv"
+    grain.apply_table(base, table, chain, grainy)
+    if cfg.grain.calibrate and not _calibrate_grain(read, base, grainy, table, chain, cfg,
+                                                     work):
+        return base, None
+    return grainy, table
+
+
 def source_digest(source: Path) -> str:
     """The name a source's work directory and staged files go by."""
     return hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:16]
@@ -738,7 +782,11 @@ def _transcode(
         except CommandError:
             log.error("  the mux fails on this file's tracks, so it is not encoded")
             raise
-    report, table = _grain_step(read, chain, cfg, work, dry_run=dry_run)
+    # SvtFgEssential's table comes after the encode: it needs the scene list, and
+    # is timed by the encode's own frames.
+    whole_film = cfg.grain.estimator == "svtfg" and cfg.grain.mode != "never"
+    report, table = (None, None) if whole_film else _grain_step(read, chain, cfg, work,
+                                                                 dry_run=dry_run)
 
     # Only ever denoise when there is a table to put the grain back with, and by
     # default not even then: see grain.denoise_before_encode.
@@ -788,7 +836,9 @@ def _transcode(
     encode.keep_source_timing(read, encoded, chain, work)
 
     video = encoded
-    if table:
+    if whole_film:
+        video, table = film_grain(read, encoded, scene_list, chain, cfg, work)
+    elif table:
         grainy = work / "grainy.mkv"
         # No fallback here on purpose. The encoder strips grain whether or not it
         # was denoised first, so shipping without this step delivers a grainless,

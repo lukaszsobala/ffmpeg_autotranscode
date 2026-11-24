@@ -24,6 +24,7 @@ Two constraints shape the implementation:
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import statistics
@@ -36,7 +37,7 @@ from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
 from .util import CommandError, child_env, human_size, log, run
-from .verify import first, grain_graph, parse_mse_log
+from .verify import decode_args, first, grain_graph, parse_mse_log
 
 # Fixed reference denoiser used only for *measurement*, so scores are comparable
 # across files. The strength actually used for encoding is chosen from the score.
@@ -381,7 +382,9 @@ def build_table(
     if not chain.grav1synth:
         log.warning("grav1synth unavailable; skipping grain table")
         return None
-    if cfg.grain.estimator == "svt":
+    if cfg.grain.estimator in {"svt", "svtfg"}:
+        # "svtfg" makes its table after the encode (pipeline.film_grain); here,
+        # only ever as the fallback from samples.
         return estimate_with_svt(info, chain, cfg, work)
     if report is None:
         raise ValueError("the grav1synth estimator needs the grain probe's report")
@@ -534,6 +537,117 @@ def scale_table(raw: str, luma: float, cb: float | None = None, cr: float | None
     return "\n".join(out) + ("\n" if raw.endswith("\n") else "")
 
 
+# --- tables with an entry per frame -------------------------------------------
+#
+# grav1synth (through av1-grain 0.4.1) reads a table as segments "E start end
+# apply seed update" followed, when apply is 1, by every parameter line; it
+# ignores `update` and skips a segment with apply 0, so frames there get no grain.
+# Each frame takes the FIRST segment with start <= t <= end, both ends inclusive,
+# where t is the packet's timestamp in ms times 10,000 -- Matroska's
+# millisecond-rounded times, not frame number / rate. A table timed by frame
+# number (SvtFgEssential's: entry n from n x 417083 at 23.976 fps) therefore gives
+# about half the frames the entry before theirs. `retime` times each entry by
+# the packets of the stream it is applied to instead.
+
+
+@dataclass(frozen=True, slots=True)
+class Entry:
+    """One frame's grain, as a table segment says it without its times."""
+
+    apply: bool
+    seed: int
+    # The parameter lines, stripped: "p ...", "sY ...", ... ("" when not applied).
+    body: tuple[str, ...]
+
+    def same_grain(self, other: Entry) -> bool:
+        return self.apply == other.apply and self.body == other.body
+
+
+def parse_entries(raw: str) -> list[Entry]:
+    """A table's segments in order, times dropped. A segment that says it reuses
+    the parameters before it (update 0) and gives none gets those parameters."""
+    lines = raw.splitlines()
+    if not lines or lines[0].strip() != GRAIN_TABLE_HEADER:
+        raise ValueError("not a film grain table (missing filmgrn1 header)")
+    entries: list[Entry] = []
+    head: list[str] | None = None
+    body: list[str] = []
+
+    def close() -> None:
+        if head is None:
+            return
+        if len(head) < 6:
+            raise ValueError(f"malformed E line: {' '.join(head)!r}")
+        apply = head[3] != "0"
+        kept = tuple(body)
+        if apply and not kept and entries:
+            kept = entries[-1].body
+        if apply and not kept:
+            raise ValueError("a grain table segment applies grain but gives no parameters")
+        entries.append(Entry(apply, int(head[4]) & 0xFFFF, kept if apply else ()))
+
+    for line in lines[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("E "):
+            close()
+            head, body = stripped.split(), []
+        elif head is not None:
+            body.append(" ".join(stripped.split()))
+    close()
+    return entries
+
+
+def scale_entry(entry: Entry, luma: float, cb: float, cr: float) -> Entry:
+    """The entry with its strength multiplied, per plane (see scale_table)."""
+    if not entry.apply:
+        return entry
+    scaled = scale_table("\n".join([GRAIN_TABLE_HEADER, *entry.body]), luma, cb, cr)
+    return replace_body(entry, tuple(scaled.splitlines()[1:]))
+
+
+def replace_body(entry: Entry, body: tuple[str, ...]) -> Entry:
+    return Entry(entry.apply, entry.seed, body)
+
+
+def frame_table(entries: list[Entry]) -> str:
+    """The entries as a table timed by frame number: segment n is frame n. For
+    keeping a per-frame estimate; `retime` makes the table a stream gets."""
+    out = [GRAIN_TABLE_HEADER]
+    for number, entry in enumerate(entries):
+        out.append(f"E {number} {number} {int(entry.apply)} {entry.seed} {int(entry.apply)}")
+        out += [f"\t{line}" for line in entry.body]
+    return "\n".join(out) + "\n"
+
+
+def retime(entries: list[Entry], stamps: list[int]) -> str:
+    """A table for a stream whose frames have packet timestamps `stamps` (in
+    grav1synth's units, ms x 10,000, in display order), one entry per frame.
+
+    Each run of frames with the same grain becomes one segment, from its first
+    frame's timestamp to just before the next run's: so every frame falls in its
+    own segment and no other, whatever the rounding. Runs keep their first frame's
+    seed; grav1synth moves the seed on at every frame it applies a segment to.
+    """
+    if len(entries) != len(stamps):
+        raise ValueError(f"{len(entries)} grain entries for a stream of {len(stamps)} frames")
+    if any(later <= earlier for earlier, later in itertools.pairwise(stamps)):
+        raise ValueError("the stream's frame timestamps are not increasing")
+    out = [GRAIN_TABLE_HEADER]
+    start = 0
+    for index in range(1, len(entries) + 1):
+        if index < len(entries) and entries[index].same_grain(entries[start]):
+            continue
+        entry = entries[start]
+        begin = 0 if start == 0 else stamps[start]
+        end = WHOLE_VIDEO_END if index == len(entries) else stamps[index] - 1
+        out.append(f"E {begin} {end} {int(entry.apply)} {entry.seed} {int(entry.apply)}")
+        out += [f"\t{line}" for line in entry.body]
+        start = index
+    return "\n".join(out) + "\n"
+
+
 PLANES = ("y", "u", "v")
 
 
@@ -553,6 +667,7 @@ def window_grain(
         run([
             chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y",
             *([] if synthesis else ["-export_side_data", "film_grain"]),
+            *decode_args(chain, path, grain=synthesis),
             "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-i", str(path),
             "-an", "-sn", "-dn",
             "-filter_complex",
@@ -586,6 +701,10 @@ def strength_factor(source: float, underneath: float, with_grain: float) -> floa
     return (wanted / synthesised) ** 0.5
 
 
+# Calibration never more than doubles a table's strength: past that, the table is
+# wrong in more than strength, and scaling it hides that.
+MAX_FACTOR = 2.0
+
 # Below this luma factor the synthesised grain would be a faint fraction of the
 # table's -- too little to see, so in "auto" the film ships without any.
 NEGLIGIBLE = 0.15
@@ -608,8 +727,8 @@ def decide_strength(
     luma, cb, cr = (1.0 if f is None else f for f in measured)
     if mode == "auto" and measured[0] is not None and luma < NEGLIGIBLE:
         return False, luma, cb, cr
-    luma = max(NEGLIGIBLE, min(2.0, luma))
-    return True, luma, min(2.0, cb), min(2.0, cr)
+    luma = max(NEGLIGIBLE, min(MAX_FACTOR, luma))
+    return True, luma, min(MAX_FACTOR, cb), min(MAX_FACTOR, cr)
 
 
 def needs_probe(cfg: Config) -> bool:

@@ -8,6 +8,7 @@ tools that already do the hard parts well:
 | [Av1an](https://github.com/rust-av/Av1an) | Scene detection, chunking, parallel workers, resume |
 | [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) 4.x | The encoder (`SvtAv1EncApp`) |
 | [grav1synth](https://github.com/rust-av/grav1synth) | Writes a film grain table into the AV1 bitstream |
+| [SvtFgEssential](https://github.com/nekotrix/SVT-AV1-Essential) | Estimates the film's grain, frame by frame (SVT-AV1-Essential's standalone estimator; only this tool, not its encoder) |
 | [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) 8 | Probing, muxing, and `tonemapx` for Dolby Vision profile 5 |
 
 This repository contributes only the policy layer: what to encode, how grainy it is,
@@ -43,12 +44,13 @@ silicon or Intel):
 | L-SMASH-Works VapourSynth plugin, for the `lsmash` chunk method | built from source into `~/.local/lib/vapoursynth` | built from source into Homebrew's plugin folder |
 | Av1an 0.6.0 | `cargo install` from its git tag | Homebrew, whichever version it has (`doctor` says whether it is 0.6.0) |
 | grav1synth 0.2.0, patched | built from the crate with `scripts/grav1synth-0.2.0-grain-flag.patch` | the same |
+| SvtFgEssential, from SVT-AV1-Essential v4.3.1 | built from source into `~/.local/bin`, its commit recorded beside it | the same |
 | mkvtoolnix, Python 3.11+ | apt | Homebrew |
 
 Every version comes from [autotranscode/toolchain.toml](autotranscode/toolchain.toml):
 one autotranscode release, one tested toolchain. `doctor` shows how the installed
 tools compare and which `bootstrap.sh` stages would bring them in line, and `run`
-refuses an untested SVT-AV1, Av1an, grav1synth or jellyfin-ffmpeg major (see
+refuses an untested SVT-AV1, Av1an, grav1synth, SvtFgEssential or jellyfin-ffmpeg major (see
 [TECHNICAL.md](TECHNICAL.md#one-version-one-toolchain); `[tools] versions =
 "warn"` runs anyway). `autotranscode update` moves both forward together; see
 [Updating](#updating). `doctor` and `run` also refuse an encoder missing an option the configured
@@ -183,6 +185,7 @@ honoured). `-c` overrides it; with neither, the built-in defaults apply.
 | `plan` | Show per-file decisions and the exact Av1an command, without encoding |
 | `run` | Transcode (`--dry-run` probes and measures but does not encode, and records nothing) |
 | `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
+| `regrain` | Give films already encoded the grain `run` makes now, estimated and calibrated scene by scene, without encoding again: each file is checked and replaced in place. Takes outputs or folders of them (none: every finished film); `--dry-run` lists them. Refuses while a run is going |
 | `clean` | Remove work directories, staged copies and half-written outputs no run will use again; keeps what can be resumed (`--dry-run` lists, `--all` removes that too, `--samples` removes `sample` results) |
 
 Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
@@ -193,9 +196,16 @@ over the profile's; the other flags win over the file.
 
 ### Film grain
 
-Nothing to set up. Every film gets a grain estimate, and calibration decides how
-much to put back. A clean source ships without grain (`grain.mode = "auto"`);
-`"always"` keeps a minimum, `"never"` skips the lot.
+Nothing to set up. After the encode, SvtFgEssential estimates the grain of every
+frame of the source, a few scenes at a time on as many cores (`grain.svtfg_jobs`),
+and calibration measures the result against the source scene by scene and scales
+each scene's grain to match. A clean source ships without grain (`grain.mode =
+"auto"`); `"always"` keeps a minimum, `"never"` skips the lot.
+
+Films encoded before this got one grain table for the whole film, from SVT-AV1's
+estimate on a few seconds of samples. `autotranscode regrain` gives them the new
+grain without encoding them again: AV1 carries grain as parameters the decoder
+synthesises, so only the frame headers are rewritten. It needs each film's source.
 
 Only with `grain.estimator = "grav1synth"` or `grain.denoise_before_encode` does
 the old detector, and so `grain.threshold_db`, come into play. `measure` prints its

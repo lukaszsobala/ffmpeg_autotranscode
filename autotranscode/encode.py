@@ -434,15 +434,30 @@ def timestamps_v2(times: list[float]) -> str:
     return "# timestamp format v2\n" + "".join(f"{t * 1000:.3f}\n" for t in times)
 
 
+_FRAME_TIMES: dict[tuple[str, int, int], list[float]] = {}
+
+
 def frame_times(chain: Toolchain, path: Path) -> list[float]:
-    """The video's presentation times in seconds, in display order."""
+    """The video's presentation times in seconds, in display order.
+
+    Remembered while the file is unchanged: listing them reads the whole file
+    (two minutes for an 18 GB Blu-ray remux on a USB disk), and a film needs
+    its source's times up to three times (encode timing, grain estimate,
+    calibration)."""
+    stat = path.stat()
+    known = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    if known in _FRAME_TIMES:
+        return list(_FRAME_TIMES[known])
     out = run([chain.ffprobe, "-v", "error", "-select_streams", "v:0",
                "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path)]).stdout
     lines = [line.strip().rstrip(",") for line in out.splitlines() if line.strip()]
     try:
-        return sorted(float(line) for line in lines)
+        times = sorted(float(line) for line in lines)
     except ValueError:
         raise ValueError(f"{path.name} has video packets without timestamps") from None
+    _FRAME_TIMES.clear()    # one film at a time; no need to keep the last one's
+    _FRAME_TIMES[known] = times
+    return list(times)
 
 
 def _duration(chain: Toolchain, path: Path) -> float:

@@ -42,6 +42,9 @@ av1an = "av1an"
 # is not always on PATH -- give the full path here if `doctor` cannot find it.
 svtav1encapp = "SvtAv1EncApp"
 grav1synth = "grav1synth"
+# SVT-AV1-Essential's grain estimator (scripts/bootstrap.sh svtfg). Found beside
+# SvtAv1EncApp or in ~/.local/bin when not on PATH.
+svtfg = "SvtFgEssential"
 mkvmerge = "mkvmerge"
 
 # Scratch space. The grain analysis writes short lossless excerpts here, which are
@@ -176,6 +179,16 @@ denoise_strength = "auto"    # "auto" picks from the measured score; or set e.g.
 threshold_db = 44.0
 
 keep_table = true            # keep the generated .tbl next to the work dir for inspection
+
+# Who estimates the grain:
+# "svtfg"      SvtFgEssential over the whole film, after the encode, one table entry
+#              per frame, calibrated scene by scene. The default.
+# "svt"        SVT-AV1's estimate on the samples above, one table for the film.
+# "grav1synth" `grav1synth diff` against a denoised copy of the samples.
+estimator = "svtfg"
+svtfg_jobs = 0               # SvtFgEssential processes; 0 = one per big core
+calibration_frames = 4000    # frames measured for per-scene calibration, at 1080p
+calibration_window = 4       # frames per window, each just after a keyframe
 
 [staging]
 # Copy each source to local storage before reading it, and work from the copy.
