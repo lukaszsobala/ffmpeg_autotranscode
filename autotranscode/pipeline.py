@@ -453,6 +453,11 @@ def film_grain(read: MediaInfo, base: Path, scene_starts: Sequence[int] | None,
     SvtFgEssential, calibrated scene by scene: the stream to mux, and its table
     (None when the source has no grain worth putting back).
 
+    Two steps (grain.py has the whole story): essential.frames_table runs the
+    estimator over every frame of the source, and scenegrain.apply writes that
+    table into the stream, measures the result against the source scene by
+    scene, and writes it again with each scene's strength corrected.
+
     No fallback to shipping without grain when a tool fails, as for the other
     estimators: the work stays, and a rerun carries on. Only frames that cannot
     be matched one for one -- a source whose decoder finds other frames than

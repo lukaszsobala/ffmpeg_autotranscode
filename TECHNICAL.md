@@ -112,7 +112,7 @@ carries a little of the scene before. Each run is decoded from a seek and found
 by its frames' timestamps (`-copyts`, then `select` on the first frame's time),
 so whatever the seek lands on, its frames are exactly the encode's; on the
 Rockchip video engine when that is exact for the codec (see
-[Why there is no hardware acceleration](#why-there-is-no-hardware-acceleration)).
+[Hardware](#hardware-the-encode-in-software-decoding-where-it-is-exact)).
 Finished runs are kept, so a stop loses only those in flight. If the source's
 frames still do not match the encode's one for one, the film falls back to the
 estimate from samples.
@@ -146,6 +146,31 @@ factor is pulled towards the film's, in the log domain, by as many frames' worth
 as two windows; a scene without a window takes the film's. Whether to keep grain
 at all is still decided on the film's measure (`decide_strength`).
 
+**What calibration adds to SvtFgEssential.** The estimator gets right what no
+rescaling could: the texture and the brightness profile (the table above). Its
+strength, on the other hand, came out differently on every film, and differently
+again from scene to scene. These are the factors calibration applied to its
+tables, encoded as a run encodes them:
+
+| film | source | luma | Cb | Cr | luma, 10th–90th percentile of scenes |
+|---|---|---|---|---|---|
+| Film B (10 windows) | 1080p | x0.74 | x1.01 | x1.04 | x0.59–x1.5 (range of windows) |
+| Film C | 1080p Blu-ray remux | x0.87 | x0.63 | x1.23 | x0.80–x1.08 |
+| Film D | 1080p HDR10 | x1.06 | x1.03 | x0.96 | x0.98–x1.14 |
+| Film A | 1080p | x1.19 | | | x1.06–x1.24 |
+| Film E (archive footage) | 1080p | x1.19 | x1.28 | x1.37 | x1.10–x1.78 |
+| Film F | 720p | x1.23 | x1.52 | x1.53 | x1.14–x1.40 |
+
+Not all of that is the estimator's error. It estimates all the grain in the
+source; the encode here keeps some fine texture of its own, and calibration
+subtracts that (`strength_factor`). But that can only lower what the table
+needs, and four of the six wanted more luma grain than it gave, and chroma
+anything from a third less to half as much again. So the two do different jobs: the estimator
+says what the grain looks like, and the source, measured against the result,
+says how much of it to put back. On Film A, the source's grain and the
+result's, measured the same way in 20 windows, then differed by x0.84 to x1.28
+(see below).
+
 **Films encoded before.** Grain is parameters in the frame headers, so
 `autotranscode regrain` gives a finished film the new grain without encoding it
 again: the video track is taken out, the table estimated and calibrated as a
@@ -155,47 +180,33 @@ earlier one gave, frame for frame, the pictures of applying it to the encode
 without grain. The new file must have the same tracks, the same video packets
 and the same length before it replaces the old one.
 
-Unstaged, a regrain kept the library's disks busy for the whole hour: the source
-read in full three times (frame times, cuts, estimate) and sought into by
-calibration, the film read three times (its frame count for the skip check, the
-track taken out, the remux), the new file written, and both read again by the
-check: some 80 GB read for a 1080p film, much of it seeking between four
-places at once, where one sequential pass over each file does. With `[staging]`
-on, regrain copies the source (`run`'s copy, reused), takes the film apart in one
-read of it (one ffmpeg, two outputs: the film track, and every other track with
-the chapters and tags), puts the new film together from the parts, and writes
-the checked file back beside the old one before renaming it over: one read of
-each and a write per film, and nothing between.
+Unstaged, a regrain reads the source in full three times (frame times, cuts,
+estimate) and seeks into it for calibration, reads the film twice (the track
+taken out, the remux), writes the new file, and reads both again for the check:
+tens of gigabytes for a 1080p film, much of it seeking between several places
+at once. With `[staging]` on, it copies the source (`run`'s copy, reused),
+takes the film apart in one read (one ffmpeg, two outputs: the film track, and
+every other track with the chapters and tags), puts the new film together from
+the parts, and writes the checked file back beside the old one before renaming
+it over: one read of each and one write. The source's copy goes once the final
+grain is written; the track taken out stays to the end, since the remux takes the
+film track's tags from it and the check counts its packets. So the peak is the
+source, both video tracks and the rest: 26 GB for Film A.
 
-A first version copied the whole film as well and took the track out of the
-copy: the video twice over for nothing, and the source kept to the end, 130 GB
-at once for Film C (42 GB source, 23 GB film). Now the copy of the
-source goes once the final grain is written; the track taken out stays to the
-end (the remux takes the film track's tags from it, and the check counts its
-packets instead of reading the film again), which costs nothing at the peak,
-since the source is gone by then. On Film A the peak was the source,
-both video tracks and 0.7 GB of the rest: 26 GB.
-
-Putting a film together from its parts showed one thing a single remux had
-hidden. Writing the rest, ffmpeg marks the first of several subtitle tracks
-default when none is (Film H's English subtitles would have come on by
-themselves); the remux in use had escaped it only because setting one track's
-disposition turns that off for the whole file. Every track's dispositions are now
-set by hand from the film, and the check compares them, with each audio and video
-track's start time and the chapters. Five films taken apart and put together
+Putting a film together from its parts needs every track's dispositions set by
+hand: writing the other tracks on their own, ffmpeg marks the first of several
+subtitle tracks default when none is (setting any one disposition turns that off
+for the whole file). The check compares dispositions, each audio and video
+track's start time and the chapters too. Five films taken apart and put together
 again (Film I's 42 tracks and 38 chapters, fonts, PGS subtitles, audio
 starting 54 ms before the video) came out with every track's packets, every
-attachment, tag and disposition as they were. Whether to leave a film is read from the
-scene list's attachment alone, at the head of the file, rather than from a count
-of its frames, which read the whole film.
+attachment, tag and disposition as they were. Whether to leave a film is read
+from the scene list's attachment alone, at the head of the file.
 
-A stopped regrain used to redo more than it said. Detection deletes its parts
-once it has joined them, and the cuts went into the film only at the end, so a
-rerun found them again (24 minutes for Film C's 340,106 frames)
-before the estimate's parts, keyed by those cuts, were any use; and the video
-track was taken out again over a complete copy. The cuts are now kept in the
-work directory as soon as found (`regrain-scenes.json`), and the track with a
-note of the film it came from (size, time, track), written once it is whole.
+A stopped regrain keeps what it has done: the cuts as soon as they are found
+(`regrain-scenes.json` in the work directory), the track taken out with a note of
+the film it came from (size, time, track), the estimate's finished parts, and
+the staged source.
 
 **On a whole film.** Film A (1080p, 157,013 frames, 341 scenes) was
 regrained on the RK3588 in 1h19m: 22 minutes of scene detection (Av1an's, as a
@@ -465,39 +476,40 @@ Both PSNRs are measured with synthesised film grain switched off in the decoder,
 so they score the encode underneath; random synthetic grain never matches the
 source pixel for pixel and would otherwise penalise the very fix for lost grain.
 
-## Why there is no hardware acceleration
+## Hardware: the encode in software, decoding where it is exact
 
-The hardware looks like it should help and does not.
+**The encoder is SVT-AV1, on the CPU.** The RK3588 this was built on has no AV1
+encoder (its video engine encodes H.264, HEVC and MJPEG). GPUs that have one are
+not used either: every quality setting here was judged on SVT-AV1 options
+(variance boost, `--ac-bias`, `--tf-strength`, the luminance bias) that hardware
+encoders do not have.
 
-**The RK3588 cannot encode AV1.** Its video engine encodes H.264, HEVC and MJPEG;
-AV1 is decode-only. The ten-hour part of this job therefore has no hardware path on
-this silicon, through any software. SVT-AV1 on the A76 cores is the only option.
+**Av1an decodes in software**, and that is no loss: at preset 4 the encoder
+spends about 151 ms on a 1080p frame against 8.7 ms for a single-threaded
+decode, and av1an-core 0.6.0 has no way to ask for hardware decoding anyway.
 
-That leaves decode, which the hardware does superbly — 60s of 1080p H.264 on a
-ROCK 5B:
+**The passes autotranscode runs itself decode on hardware where it is exact**:
+scene cuts, the grain estimate and calibration, and `verify`, which between them
+decode the source several times over. Each compares the source with its encode
+pixel by pixel, or finds a stretch of it by its frames' timestamps, so a decoder
+only close to software's frames would be wrong where it matters.
+`machine.hardware_decode = "auto"` tries, in order, Rockchip's decoders
+(`h264_rkmpp`, `hevc_rkmpp`), NVIDIA's (`-hwaccel cuda`), VA-API (Intel, AMD)
+and VideoToolbox (macOS), each only if the build has it and its device opens.
+For each film the first of them is checked: 48 frames from a seek at 30% and
+at 70% of it, decoded by it and by software and compared frame by frame
+(framemd5, in the source's own pixel format). A decoder that matches is used for
+that film; one that differs is logged and the film decoded in software. Only
+H.264 and HEVC are tried: their standards define the decoded picture exactly,
+where MPEG-2 and VC-1 allow decoders to differ.
 
-| | wall | CPU time | throughput |
-|---|---|---|---|
-| CPU, all cores | 3.45s | 20.1s | 417 fps |
-| CPU, one thread | 12.5s | 12.8s | 115 fps |
-| `rkmpp` | 1.65s | 0.37s | 876 fps |
-
-It is not worth reaching for. At preset 4 the encoder spends 151 ms per frame
-against 8.7 ms for single-threaded CPU decode, so decode is about 6% of the work,
-and Av1an offers no way to claim it: the string `hwaccel` does not appear anywhere
-in av1an-core 0.6.0. The only ffmpeg passes this project runs itself are the grain
-probe and table build, which decode about eight seconds of video per film.
-
-A `machine.hwaccel_decode` option used to exist here. It was never read by
-anything, and its removal changed no behaviour.
-
-**`verify` and the grain estimate are the exception.** `verify` decodes a whole
-film and its encode several times over, and the grain estimate the whole film
-once more, so they decode H.264 sources with `h264_rkmpp`, which matched
-software on every frame of two films, and HEVC with `hevc_rkmpp`, which matched
-it on 1,920 frames of four films (8- and 10-bit, 1080p and 4K, HDR10 and Dolby
-Vision; 96 frames at five points of each, every one decoded from a seek). One
-such decode feeding Y4M runs at about 240 frames/s at 1080p and 65-78 at 4K.
+On an RK3588 the Rockchip decoders were checked more thoroughly before this
+existed: `h264_rkmpp` matched software on every frame of two films, and
+`hevc_rkmpp` on 1,920 frames of four (8- and 10-bit, 1080p and 4K, HDR10 and
+Dolby Vision; 96 frames at five points of each, every one from a seek). There a
+decode feeding Y4M runs at about 240 frames/s at 1080p and 65-78 at 4K, against
+115 for one software thread at 1080p. VA-API, NVDEC and VideoToolbox go through
+the same per-film check; their decodes have not been measured here.
 
 AV1 decodes in software, with dav1d allowed eight frames in flight
 (`-max_frame_delay 8`): ffmpeg leaves it at 0, which libdav1d keeps low, and a

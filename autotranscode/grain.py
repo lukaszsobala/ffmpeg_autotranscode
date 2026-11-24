@@ -1,25 +1,36 @@
-"""Film grain: measure it honestly, then reproduce it with AV1 grain synthesis.
+"""Film grain: estimate the source's, put it back with AV1 grain synthesis, and
+check the result against the source.
 
-The approach, and why:
+Grain is close to incompressible, and SVT-AV1 discards it at any bitrate worth
+having. AV1 can instead describe it in the bitstream, as a film grain table the
+decoder synthesises from, at almost no cost. The work is describing grain that
+looks like the source's. With the default estimator, "svtfg", that takes three
+steps after the encode:
 
-AV1 can carry a *film grain table* describing the noise, strip the noise before
-encoding, and re-synthesise it in the decoder. Grain is nearly incompressible, so
-removing it before the encoder sees it is typically a large bitrate win while the
-result still looks like the source.
+1. **Estimate** (essential.py). SvtFgEssential, SVT-AV1-Essential's standalone
+   grain estimator, runs over every frame of the source and writes a table entry
+   per frame. The estimate is entirely the tool's; autotranscode only splits the
+   film at scene cuts so that several copies run at once, and joins their tables.
+   It gets what calibration cannot fix: the grain's texture (how neighbouring
+   pixels correlate) and how its strength follows brightness. SVT-AV1's own
+   estimator, "svt", got neither (TECHNICAL.md, "The whole-film estimate").
+2. **Time and write** (retime, apply_table). Av1an encodes in chunks that each
+   restart at timestamp zero, so the table goes into the finished stream: retimed
+   by its packets, then written into the frame headers by grav1synth. Nothing is
+   re-encoded.
+3. **Calibrate** (scenegrain.py, strength_factor). The grain in the result is
+   measured against the source's, plane by plane and scene by scene, and each
+   scene's entries are scaled to match. An estimate made from the source alone
+   cannot know how much fine texture this encode keeps by itself, and its
+   strength needed anything from x0.74 to x1.23 in luma, x0.63 to x1.53 in
+   chroma, across six films, and differed again from scene to scene. Calibration
+   is also the grain detector: a source with nothing to put back measures near
+   zero (decide_strength).
 
-To do that well you need a table derived from the actual source, which is what
-`grav1synth diff` produces: it compares the source with a denoised copy of itself
-and solves for the grain parameters. That beats guessing an ISO value.
-
-Two constraints shape the implementation:
-
-1. `diff` needs both files decodable and frame-aligned, and lossless intermediates
-   are huge, so by default we analyse a handful of short samples rather than the
-   whole film, then flatten the result into one table covering the whole runtime.
-2. Av1an splits the video into chunks that each restart at timestamp zero, so a
-   time-varying grain table cannot be handed to the encoder mid-pipeline without
-   the segments landing on the wrong frames. We therefore apply grain to the
-   *finished* stream with `grav1synth apply`, which rewrites the grain headers.
+The rest of this module serves the other estimators, kept as options: "svt"
+(estimate_with_svt: SVT-AV1 on a few seconds of samples, one table for the film)
+and "grav1synth" (grav1synth diff against a denoised copy, with the hqdn3d probe
+in `measure` choosing the denoiser), and the table handling all of them share.
 """
 
 from __future__ import annotations

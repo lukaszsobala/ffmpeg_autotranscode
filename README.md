@@ -1,558 +1,270 @@
 # autotranscode
 
-Transcodes a media library to AV1 with **source-accurate film grain**, by orchestrating
-tools that already do the hard parts well:
+Transcodes a film library to AV1 with SVT-AV1, and puts the source's film grain
+back with AV1 grain synthesis, estimated frame by frame and checked against the
+source scene by scene. It drives tools that already do the hard parts well:
 
 | Tool | What it does here |
 |---|---|
+| [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) 4.x | The encoder |
 | [Av1an](https://github.com/rust-av/Av1an) | Scene detection, chunking, parallel workers, resume |
-| [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) 4.x | The encoder (`SvtAv1EncApp`) |
-| [grav1synth](https://github.com/rust-av/grav1synth) | Writes a film grain table into the AV1 bitstream |
-| [SvtFgEssential](https://github.com/nekotrix/SVT-AV1-Essential) | Estimates the film's grain, frame by frame (SVT-AV1-Essential's standalone estimator; only this tool, not its encoder) |
-| [av-scenechange](https://github.com/rust-av/av-scenechange) | Finds scene cuts for `regrain`: the detector Av1an uses, fed by the hardware decoder where there is one |
-| [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) 8 | Probing, muxing, and `tonemapx` for Dolby Vision profile 5 |
+| [SvtFgEssential](https://github.com/nekotrix/SVT-AV1-Essential) | Estimates the film's grain, frame by frame (SVT-AV1-Essential's standalone estimator) |
+| [grav1synth](https://github.com/rust-av/grav1synth) | Writes the grain table into the finished AV1 stream |
+| [av-scenechange](https://github.com/rust-av/av-scenechange) | Finds scene cuts for `regrain` (the detector Av1an uses) |
+| [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) 8 | Probing, decoding, muxing, and `tonemapx` for Dolby Vision profile 5 |
 
-This repository contributes only the policy layer: what to encode, how grainy it is,
-which audio to keep, and what to do when a step fails. How it works, and why the
-settings are what they are, is in [TECHNICAL.md](TECHNICAL.md).
+This repository is the policy layer: what to encode and with which settings, how
+grainy a film is, which audio to keep, what to do when a step fails, and how to
+stop and resume. [TECHNICAL.md](TECHNICAL.md) explains how it works and how the
+settings were arrived at.
 
-**Watch the results in a software AV1 decoder** (dav1d: mpv, VLC, most desktop
-browsers). The RK3588's hardware decoder shows the film grain with
-jellyfin-ffmpeg 8.1.3-2 or later, which has the fix for
-[a bug in Rockchip's MPP library](https://github.com/rockchip-linux/mpp/issues/974),
-and then matched dav1d exactly on encodes 1920, 1918 and 954 pixels wide. A
-second MPP bug still decodes about one 10-bit width in five wrongly (a multiple
-of 8 is always safe): on a 1202-wide encode only the frames at keyframes came out
-right, and within about a second the picture was replaced by flat colour and
-large blocks until the next keyframe. See
-[TECHNICAL.md](TECHNICAL.md#film-grain-on-the-rk3588s-av1-decoder).
+Film grain is drawn by the player. dav1d (mpv, VLC, desktop browsers) draws it;
+a hardware AV1 decoder may not, and then shows the flatter picture the grain
+was put back to hide.
 
 ## Install
 
-The bootstrap script installs everything, on Debian or Ubuntu (arm64, RK3588
-boards included, or x86-64) and on macOS with [Homebrew](https://brew.sh) (Apple
-silicon or Intel):
+On Debian or Ubuntu (x86-64 or arm64) and on macOS with
+[Homebrew](https://brew.sh), the bootstrap script installs everything:
 
 ```bash
-./scripts/bootstrap.sh          # or just some stages: ./scripts/bootstrap.sh ffmpeg svtav1
+./scripts/bootstrap.sh          # or some stages: ./scripts/bootstrap.sh ffmpeg svtav1
+python3 -m venv .venv && .venv/bin/pip install -e .
+.venv/bin/autotranscode doctor  # what is installed, what is missing, how to fix it
 ```
 
 | | Debian / Ubuntu | macOS |
 |---|---|---|
-| jellyfin-ffmpeg 8 | Jellyfin's apt repository; its portable build where the repository has no packages | its portable build, into `~/.local/lib/jellyfin-ffmpeg` |
-| SVT-AV1 4.3.0 | built from source into `~/.local` | built from source into `~/.local` |
-| VapourSynth (Av1an will not link without it) | built from source into `~/.local` | Homebrew |
-| L-SMASH-Works VapourSynth plugin, for the `lsmash` chunk method | built from source into `~/.local/lib/vapoursynth` | built from source into Homebrew's plugin folder |
-| Av1an 0.6.0 | `cargo install` from its git tag | Homebrew, whichever version it has (`doctor` says whether it is 0.6.0) |
-| grav1synth 0.2.0, patched | built from the crate with `scripts/grav1synth-0.2.0-grain-flag.patch` | the same |
-| SvtFgEssential, from SVT-AV1-Essential v4.3.1 | built from source into `~/.local/bin`, its commit recorded beside it | the same |
-| av-scenechange 0.24.1 | `cargo install`, its version recorded beside it | the same |
+| jellyfin-ffmpeg 8 | Jellyfin's apt repository, or its portable build | its portable build |
+| SVT-AV1, VapourSynth, L-SMASH-Works | built from source into `~/.local` | SVT-AV1 and L-SMASH-Works built; VapourSynth from Homebrew |
+| Av1an, grav1synth (patched), av-scenechange | `cargo install` | Av1an from Homebrew; the others `cargo install` |
+| SvtFgEssential | built from SVT-AV1-Essential's source | the same |
 | mkvtoolnix, Python 3.11+ | apt | Homebrew |
 
 Every version comes from [autotranscode/toolchain.toml](autotranscode/toolchain.toml):
-one autotranscode release, one tested toolchain. `doctor` shows how the installed
-tools compare and which `bootstrap.sh` stages would bring them in line, and `run`
-refuses an untested SVT-AV1, Av1an, grav1synth, SvtFgEssential or jellyfin-ffmpeg major (see
-[TECHNICAL.md](TECHNICAL.md#one-version-one-toolchain); `[tools] versions =
-"warn"` runs anyway). `autotranscode update` moves both forward together; see
-[Updating](#updating). `doctor` and `run` also refuse an encoder missing an option the configured
-quality relies on. On macOS, Homebrew's
-ffmpeg brings its own SVT-AV1 onto `PATH`; the script says so, and
-`paths.svtav1encapp` should then name the pinned build.
+one release, one tested toolchain. `run` refuses tools that differ from it
+(`[tools] versions = "warn"` runs anyway), and `autotranscode update` moves both
+forward together. On macOS, Homebrew's ffmpeg puts its own SVT-AV1 on `PATH`;
+set `paths.svtav1encapp` to the pinned build.
 
 On another Linux distribution, install the build tools, mkvtoolnix and Python
-3.11+ yourself; the other stages do not use a package manager. Then:
+3.11+ yourself; the script's other stages use no package manager. The package
+has no Python dependencies; `python3 -m autotranscode` works from the repository
+root without installing it.
 
-```bash
-python3 -m venv .venv && .venv/bin/pip install -e .   # or: uv venv .venv && uv pip install -e .
-.venv/bin/autotranscode doctor                        # says what is missing and how to get it
-```
+Any ffmpeg 7.1 or newer can do the encodes. jellyfin-ffmpeg adds `tonemapx`
+(Dolby Vision profile 5 to SDR) and Rockchip's hardware decoders. Tools that
+are not on `PATH` go in `[paths]`.
 
-The package has no Python dependencies. `python3 -m autotranscode` works from the
-repository root with no install at all.
-
-`machine.profile = "auto"`, the default, picks the `rk3588` profile on an RK3588
-board and `generic` anywhere else. `workstation` is there for many fast cores.
-
-jellyfin-ffmpeg is recommended rather than required. Any ffmpeg 7.1 or newer has
-what an encode needs; Jellyfin's adds `tonemapx` (Dolby Vision profile 5 to SDR)
-and, on Rockchip, hardware decoding for `verify`.
-
-`chunk_method = "auto"` uses L-SMASH-Works when `doctor` shows the `lsmas` plugin
-(`scripts/bootstrap.sh lsmash` builds it). Without it, Av1an decodes the whole film
-on one core before the first chunk starts.
-
-If the tools live somewhere not on `PATH` — `~/.cargo/bin` and `~/.local/bin`
-usually are not — set `paths.*` in the config to absolute paths. Av1an is handed
-those locations too, so it runs the same binaries `doctor` reported on.
-
-### If a tool aborts with `_S_create_c_locale name not valid`
-
-Transcodes are immune, but the same command typed by hand will abort. `doctor`
-names the offending variables. The usual cause is `AcceptEnv LANG LC_*` in
-`sshd_config` importing the locales of whatever machine you are connecting *from*,
-so unsetting them on the client is the tidiest fix; `sudo dpkg-reconfigure locales`
-on the machine works too.
+If a tool aborts with `_S_create_c_locale name not valid`, your SSH client has
+sent locales the machine does not have; `doctor` names them.
 
 ## Docker
 
-The image holds everything above, built by the same `bootstrap.sh` stages. It is
-the easy way onto a Mac, and an alternative to a native install on Linux.
-
-| Host | Image | Notes |
-|---|---|---|
-| RK3588 and other arm64 Linux | arm64 | Built and tested on an RK3588. Add `compose.rk3588.yaml` on those boards. |
-| Apple silicon Mac | arm64 | Docker runs containers in an arm64 Linux VM. Intel Macs are not a target. |
-| x86-64 Linux | amd64 | Built and tested on an Intel Core Ultra 7 258V (Lunar Lake). |
-
-Set up once:
+The image holds the same toolchain, built by the same script: arm64 (tested on
+an RK3588; also for Apple silicon, in Docker's Linux VM) and amd64 (tested on an
+Intel Core Ultra 7).
 
 ```bash
-cp .env.example .env           # fill in CONFIG_DIR, DATA_DIR, LIBRARY, TZ (and UID/GID on Linux)
-cp config.example.toml "$CONFIG_DIR/autotranscode.toml"   # then edit, with container paths
-docker compose build           # compiles the tools: expect tens of minutes
+cp .env.example .env           # CONFIG_DIR, DATA_DIR, LIBRARY, TZ, UID/GID
+cp config.example.toml "$CONFIG_DIR/autotranscode.toml"   # paths inside the container
+docker compose build           # tens of minutes
 docker compose run --rm autotranscode doctor
+docker compose run --rm -d --name transcode autotranscode --log-file /data/logs/run.log run "$LIBRARY"
+docker stop transcode          # a checkpoint, like Ctrl-C; run again to resume
 ```
-
-The container sees three folders:
 
 | Inside | From `.env` | Holds |
 |---|---|---|
 | `/config` | `CONFIG_DIR` | `autotranscode.toml` |
-| `/data` | `DATA_DIR` | the container's home: work dir, state file, staging, logs, samples |
+| `/data` | `DATA_DIR` | the container's home: work directory, state, staging, logs |
 | the library's own path | `LIBRARY` | your films, at the same path as on the host |
 
-The config is read inside the container, so its paths are container paths. Leave
-the tool entries in `[paths]` unset: the image has them on `PATH`. Put `work_dir`,
-`state_file` and the staging directory under `/data`, or leave them out: `~` is
-`/data` inside, so the defaults land in `/data/.cache/autotranscode`. Library paths
-stay as they are. An output directory outside the library needs a mount of its
-own; add it in a `compose.override.yaml`, which Compose reads automatically.
-
-Then use it as the native command:
-
-```bash
-docker compose run --rm autotranscode sample --minutes 5 -n 1 --out /data/samples "$LIBRARY"
-docker compose run --rm -d --name transcode autotranscode --log-file /data/logs/run.log run "$LIBRARY"
-docker logs -f transcode
-docker stop transcode          # SIGTERM: a checkpoint, as Ctrl-C is natively
-```
-
-`docker stop` gives the run two minutes to wind down, and a rerun resumes it.
-Av1an draws no progress bar without a terminal, so the log gets a line an hour
-instead: how much is encoded, how fast, the time left and the projected size.
-
-**On a Mac**, install Docker Desktop, OrbStack or Colima, and set the VM's CPUs
-and memory in its settings: a 4K encode runs several SVT-AV1 workers at once, each
-with its own memory (`machine.workers` overrides the count). Keep `DATA_DIR` on the
-internal SSD; staging, on by default, then reads each film from the library only
-once. A library on an external drive under `/Volumes` is shared by default in
-Docker Desktop.
-
-**On an RK3588**, add the board's compose file:
-
-```bash
-docker compose -f compose.yaml -f compose.rk3588.yaml run --rm autotranscode doctor
-```
-
-`doctor` should show `profile rk3588` and the `rkmpp` decoders. Without that file
-the container still works, but `verify` decodes in software and the profile must
-be set by hand.
+Leave `[paths]` tool entries unset in the container. For hardware decoding, add
+`-f compose.yaml -f compose.vaapi.yaml` (Intel or AMD GPU) or
+`-f compose.yaml -f compose.rk3588.yaml` (RK3588) to each command. Without a
+terminal, the log gets a progress line an hour instead of a progress bar.
 
 ## Use
 
 ```bash
-cp config.example.toml ~/.config/autotranscode.toml
-
+cp config.example.toml ~/.config/autotranscode.toml   # optional; defaults apply without it
 autotranscode doctor
-autotranscode plan    /media/films        # see the commands without running them
-autotranscode run     /media/films
+autotranscode plan /media/films       # the decisions and commands, without encoding
+autotranscode run  /media/films       # files, folders, or a .txt list of paths
 ```
 
-`~/.config/autotranscode.toml` is picked up automatically (`$XDG_CONFIG_HOME` is
-honoured). `-c` overrides it; with neither, the built-in defaults apply.
-
-`run` accepts files, directories, or a `.txt` file listing one path per line.
-
-### Commands
-
-| Command | Purpose |
+| Command | What it does |
 |---|---|
-| `doctor` | Check tools, capabilities and versions against the tested toolchain; explain what is missing and which `bootstrap.sh` stages fix it |
-| `update` | Say whether there is a newer version and which tools it updates; queue it to install once the film in progress is finished (`--check` only says, `--cancel` unqueues) |
-| `measure` | The old grain detector's scores (only for `grain.estimator = "grav1synth"`) |
-| `estimate` | Encode a few short excerpts per file and rank a library by what is worth transcoding; `run` then follows that ranking |
-| `verify` | Score an encode against its source where the eye looks: low-pass PSNR, grain retained, worst-frame snapshots |
-| `sample` | Encode a few random minutes of a few random files per resolution band, to check the settings on the rest of a library |
-| `plan` | Show per-file decisions and the exact Av1an command, without encoding |
-| `run` | Transcode (`--dry-run` probes and measures but does not encode, and records nothing) |
-| `status` | Summarise the ledger: done / failed / skipped, space reclaimed |
-| `regrain` | Give films already encoded the grain `run` makes now, estimated and calibrated scene by scene, without encoding again: each file is checked and replaced in place. Takes outputs or folders of them (none: every finished film); `--dry-run` lists them. Films whose grain the current method made already are left, so a regrain stopped partway starts again where it was; `--force` does them again. Works on staged copies when `[staging]` is on. Refuses while a run is going |
-| `clean` | Remove work directories, staged copies and half-written outputs no run will use again; keeps what can be resumed (`--dry-run` lists, `--all` removes that too, `--samples` removes `sample` results) |
+| `doctor` | Check the tools against the tested toolchain, and say how to fix what differs |
+| `plan` | Show each file's decisions and the exact Av1an command |
+| `run` | Transcode (`--dry-run` probes without encoding or recording anything) |
+| `status` | Done, failed and skipped files, and the space saved |
+| `estimate` | Encode short excerpts of each file and rank the library by space saved per hour of encoding; `run` then goes in that order |
+| `verify SOURCE ENCODED` | Score an encode where the eye looks: low-pass PSNR, grain retained, snapshots of the worst frames |
+| `sample` | Encode a few random minutes of a few files per resolution, to check the settings on the rest of a library |
+| `regrain` | Give finished films the current grain without encoding them again |
+| `update` | Say whether a newer release exists and which tools it changes; queue it |
+| `clean` | Remove work no run will use again (`--dry-run` lists it) |
 
-Common overrides work without editing config: `--profile`, `--preset`, `--crf`,
-`-w/--workers`, `-o/--output-dir`, `--grain {auto,always,never}`,
-`--deinterlace {off,auto,tff,bff}`. `--profile`
-stands in for the file's `machine.profile`, so settings the file gives still win
-over the profile's; the other flags win over the file.
+`--profile`, `--preset`, `--crf`, `-w/--workers`, `-o/--output-dir`,
+`--grain {auto,always,never}` and `--deinterlace {off,auto,tff,bff}` override
+the config for one run. `machine.profile = "auto"` picks `rk3588` on that board
+and `generic` elsewhere; `workstation` is for many fast cores.
 
 ### Film grain
 
-Nothing to set up. After the encode, SvtFgEssential estimates the grain of every
-frame of the source, a few scenes at a time on as many cores (`grain.svtfg_jobs`),
-and calibration measures the result against the source scene by scene and scales
-each scene's grain to match. A clean source ships without grain (`grain.mode =
-"auto"`); `"always"` keeps a minimum, `"never"` skips the lot.
+Nothing to set up. After the encode, SvtFgEssential estimates the grain of
+every frame of the source, several scenes at a time, one process per core.
+Calibration then measures the grain in the result against the source's, scene
+by scene, and scales each scene's grain to match: the estimate supplies the
+grain's texture, and the source decides how much of it goes back
+([TECHNICAL.md](TECHNICAL.md#the-whole-film-estimate) has the measurements). A
+clean source ships without grain (`grain.mode = "auto"`); `"always"` keeps a
+little, `"never"` skips it.
 
-Films encoded before this got one grain table for the whole film, from SVT-AV1's
-estimate on a few seconds of samples. `autotranscode regrain` gives them the new
-grain without encoding them again: AV1 carries grain as parameters the decoder
-synthesises, so only the frame headers are rewritten. It needs each film's source.
-
-Every film keeps its scene cuts inside it, as a small attachment that nothing
-plays (`autotranscode-scenes.json`), so a regrain does not have to find them
-again. With them goes what made the film's grain, so `regrain` leaves films that
-already have the current grain: over a library it can be stopped and started
-again, and films `run` encodes from now on are left too. Films encoded before this have none; regrain finds their cuts with
-av-scenechange, decoding on the hardware decoder where there is one, and adds
-them.
-
-Only with `grain.estimator = "grav1synth"` or `grain.denoise_before_encode` does
-the old detector, and so `grain.threshold_db`, come into play. `measure` prints its
-score per file (lower means more grain):
-
-```
-file                                              PSNR dB  grainy  denoise
-------------------------------------------------------------------------------
-Old Grainy Classic (1962).mkv                       36.41  True    hqdn3d=2.0:1.5:8:8
-Modern Scope Film (2017).mkv                        41.02  True    hqdn3d=1.4:1.0:6:6
-Some Clean Film (2019).mkv                          50.44  False   -
-```
-
-It is unreliable; if you use it, set the threshold from titles you have looked at,
-not from the default.
-
-### Deciding what to transcode first
-
-```bash
-autotranscode estimate /media/films        # a file, a directory or a .txt list
-```
-
-For each file it encodes several short excerpts with the settings a real run would
-use, and compares them against the bytes the source spends on the same moments.
-
-```
-file                                 size   estimate   saving    encode   saved/h  crf
---------------------------------------------------------------------------------------
-Some Film                       764.6 MiB   48.1 MiB      94%    34m21s   1.2 GiB  32
-```
-
-Files are ranked by **saved/h**, bytes saved per hour of encoding.
-
-Each result is kept in the state file, and `run` uses it:
-
-- Estimated files go first, the most saved per hour at the top, and the rest follow
-  in their usual order. A run stopped partway has spent its hours where they bought
-  the most.
-- A file whose estimate misses `output.min_saving_percent` or `output.min_saving_mib`
-  is skipped without encoding. Nothing is recorded against it: a later estimate can
-  change its mind.
-- An estimate counts only while the settings that decide size are the ones it was
-  made with (the `encode`, `grain` and `audio` sections and the SVT-AV1 version) and
-  the file is unchanged. Change any of them and estimate again; until then those
-  files are encoded in their usual order, the early saving check still watching.
-  `grain.samples` and `grain.sample_seconds` do not count: they shape the grain
-  table, not the size, unless `grain.denoise_before_encode` is on.
-
-`plan` shows the same order and the same skips.
-
-It takes roughly a minute per file. `--samples` and `--seconds` trade accuracy for
-time. The grain table adds nothing measurable to a file's size, so the grain check
-only runs with `grain.denoise_before_encode` on, where a grainy film is sampled
-denoised; `+grain` after the CRF marks those, and `--no-grain-probe` skips the check.
-
-Rank a library with it; do not quote its numbers. On a 4K test film it predicted a
-93.7% saving against 93.1% achieved, and an encode time of 34 minutes against an
-actual 51: the time leaves out scene detection, the grain table and the mux.
+AV1 carries grain as parameters in the frame headers, so `autotranscode regrain`
+gives films already encoded the current grain by rewriting those headers. It
+needs each film's source, checks the new file (tracks, packets, tags,
+chapters, length) before it replaces the old one, and leaves films whose grain
+is already current, so a regrain of a whole library can be stopped and started
+again. Every film keeps its scene cuts inside it, as a small attachment, so a
+later regrain does not need to find them again.
 
 ### Checking quality
 
-```bash
-autotranscode verify SOURCE ENCODED --snapshots /tmp/snaps
-```
-
-Do not judge an encode by plain PSNR; [TECHNICAL.md](TECHNICAL.md#why-psnr-is-not-trusted)
-explains why. `verify` reports:
-
-- **Low-pass PSNR** — blocking, banding and lost detail, with the grain factored
-  out. Watch the **5th percentile**: visible damage lives in the bad frames.
-- **Grain retained** — how much of the source's grain the encode has, with
-  synthesised grain on. An encode with no grain left still reads well above zero
-  (38% on the test film), so read it as "floor = none, ~100% = source-like".
-- **XPSNR**, for reference only.
-- **Snapshots** of the worst frames of both files, tonemapped identically. Crop a
-  flat area and stretch its contrast to see what the numbers mean.
-
-To find settings that fix a bad encode, `scripts/quality-sweep.sh SOURCE ENCODED`
-finds the encode's worst stretches, cuts them from the source, runs the real
-pipeline over them with several candidate settings, and verifies and snapshots
-each. It runs as a user systemd unit, so it survives logging out; progress is in
-the `report.md` it rewrites after every step, with every per-frame number in
-`results.json`. Add `-- --excerpt DIR/excerpt.mkv --variant 'NAME CRF GRAIN [SVT...]'`
-for another round on the same footage, or `-- --rescore` to re-measure one.
-
-### Checking the settings on the rest of a library
-
-The per-resolution settings were each tuned on one film. `sample` tries them on
-others:
+Do not judge an encode by plain PSNR
+([why](TECHNICAL.md#why-psnr-is-not-trusted)). `verify` reports low-pass PSNR,
+which leaves the grain out (watch its 5th percentile), how much of the source's
+grain the encode has (an encode with none still reads around 40%, so read it as
+"floor = none, ~100% = like the source"), and snapshots of the worst frames of
+both files.
 
 ```bash
-autotranscode sample /media/films -n 3 --minutes 4
-scripts/library-samples.sh /media/films -n 3        # the same, detached
+autotranscode verify SOURCE ENCODED --snapshots ./snaps
+autotranscode sample /media/films -n 3 --minutes 4    # reruns finish the same draw
 ```
 
-It draws `n` files per resolution band at random, cuts `--minutes` from a random
-point in each, and runs the real pipeline over them with the live config. Each
-sample gets a directory holding the excerpt, its encode, and snapshots of the three
-frames the encode handles worst, and `report.md` puts them side by side with their
-bitrates, savings and low-pass PSNR.
+`sample` draws `n` files per resolution band, skips openings and end credits,
+encodes a few minutes of each with the live config, and writes a `report.md`
+with bitrates, savings, scores and snapshots side by side.
 
-- **Openings and end credits are skipped**: the first and last 10 minutes
-  (`--skip-start`, `--skip-end`), but never more than 15% of a file at either end.
-- **Folders take turns**, so a long series cannot fill a band on its own.
-- **Only files `run` would transcode** are candidates.
-- **Reruns resume.** Running again with the same `--out` finishes the same samples
-  rather than drawing new ones; `--seed` repeats a draw into a new directory.
-
-`--band 1080p` limits it to one band (repeatable), `--pick-only` shows the draw
-without encoding, and `--no-verify` skips the scores and snapshots. The global
-`--crf` and `--preset` apply, so the same draw can be encoded again at another
-setting into another directory.
+`estimate`'s ranking is good for ordering a library; its numbers are rough.
+Files it predicts will miss the minimum saving are skipped without encoding.
 
 ## Stopping and resuming
 
-A single film can take half a day, so stopping one is a normal thing to do.
-Completed chunks, scene detection (five minutes of film at a time), the grain
-table, the staged copy and the list of finished files are all kept, so an
-interrupted run loses at most the chunk in flight — seconds of video — or the part
-of scene detection it was on.
-
 | | |
 |---|---|
-| `Ctrl-C`, `kill <pid>`, or a hangup | Stop and checkpoint. Exit code 130; a rerun picks the file up again. A hangup is a closed SSH session or a killed `screen` window; the encoder stops with the run rather than going on alone. `sample` and `regrain` stop the same way; `regrain` leaves the film it was on as it was. |
-| `Ctrl-C` twice | Give up on a tool that is slow to wind down. Chunks already finished are still kept. |
-| `kill -STOP -<pgid>` / `kill -CONT -<pgid>` | Freeze and thaw in place, losing nothing at all. Use this for a pause measured in minutes. Av1an runs in a process group of its own, so take the pgid from `ps -o pgid= -C av1an`; under systemd, `systemctl --user kill --signal=STOP <unit>` does it for you. |
-| Power cut | Same as Ctrl-C, minus the chunk in flight. Rarely, it costs that film's progress; see [TECHNICAL.md](TECHNICAL.md#resuming-in-detail). |
+| `Ctrl-C`, `kill <pid>`, a closed SSH session | Stop and checkpoint (exit code 130). Run the same command again to resume. |
+| `Ctrl-C` twice | Give up on a tool that is slow to stop. Finished chunks are still kept. |
+| `kill -STOP` / `-CONT` on Av1an's process group | Pause in place without losing anything (`ps -o pgid= -C av1an`). |
+| Power cut | As Ctrl-C, less the chunk in flight. |
 
-To resume, run the same command again. If the source has been replaced since, the
-film starts again. If its encoder settings changed (CRF, preset, filters...), you
-are asked whether to start it again with the new ones, finish it with the ones it
-started with, or leave it for now. Without a terminal to ask on, as under Docker or
-systemd, it is left for now unless `library.on_changed_settings` gives the answer.
+Finished chunks, scene detection, the grain estimate and the staged copy are
+kept, so a stop loses seconds of encoding. If a film's encoder settings changed
+since it started, you are asked whether to start again, finish with the old
+settings, or leave it; without a terminal, `library.on_changed_settings`
+decides. A changed source starts again.
 
-A rerun counts on from the earlier ones: the files they settled are counted
-first, in one line, and the next film is `[128/397]`, not `[1/397]`. Settled
-means transcoded, skipped for what the file is (already AV1, too short, too
-efficient, Dolby Vision it cannot carry: until those settings change), or tried
-and found not to save enough (until the settings that decide size change). A film
-whose output is already where this run would write it, from another machine or
-container, counts as settled too, and is not opened. Outputs written beside their
-sources are left out of the queue.
+A second `run` on the same work directory refuses to start. Use a different
+`paths.work_dir` for each run.
 
 ### Updating
 
 ```bash
-autotranscode update            # is there a newer version? queue it
-autotranscode update --check    # only say; exit code 1 when there is one
-autotranscode update --cancel   # unqueue it
+autotranscode update            # is there a newer release? queue it
+autotranscode update --check    # only say (exit code 1 when there is one)
 ```
 
-```
-autotranscode 0.3.0 is available (this is 0.2.0).
-It updates: SVT-AV1 4.3.0 -> 4.4.0, Av1an 0.6.0 -> 0.7.0
-Queue it to install after the run (pid 4242) finishes Film (1975).mkv? [Y/n]
-```
-
-An update is a newer release (see
-[TECHNICAL.md](TECHNICAL.md#releases)); work on `main` between releases is not
-offered. Something is nearly always encoding, so an update is queued rather than installed
-under a run. The run going on, or the next `run` when the encode is stopped,
-finishes the film it is on with the tools it started it with, then pulls the new
-version, rebuilds the tools that need it (their output goes to
-`update.log` in the work directory), and starts its own command again, updated.
-It does this unattended, in a terminal, `screen` or a systemd unit alike. Only
-the tools `bootstrap.sh` builds into `~/.local` take part: jellyfin-ffmpeg and
-mkvmerge come from apt, which keeps them current. With nothing started at all,
-`update` installs straight away instead, and so it does when the installed tools
-are ones no run would encode with, since then nothing could finish first.
-
-A checkout with commits of its own or uncommitted changes is left alone, with a
-note on what to do. If a build fails, the run starts again anyway and, with tools
-other than the tested ones, refuses to encode, saying why. A version with no new
-tools needs no rebuild; `update` also offers to rebuild tools that are not the
-tested ones when there is no new version, and installs tools a new version adds.
-In Docker, update the checkout on the host and rebuild the image instead.
-
-**From 0.2.0:** 0.3.0 adds two tools, SvtFgEssential and av-scenechange, which
-0.2.0's `update` does not know to build. After it, `run` stops with
-"SvtFgEssential not found"; build both once with
-`scripts/bootstrap.sh svtfg scenechange` and start it again. Later updates
-install tools a release adds by themselves.
+A run cannot pause halfway through a film, so an update is queued. The run
+finishes its current film, installs the update, rebuilds the tools that
+changed, and carries on. With nothing running, `update` installs straight away.
+A checkout with changes of its own is left alone. jellyfin-ffmpeg and mkvmerge
+come from the system's package manager, not from `update`. In Docker, update the
+checkout and rebuild the image.
 
 ### Cleaning up
 
-A film's work directory holds its chunks, tens of gigabytes for 4K. A run removes
-it once the film is finished or rejected, but not when the film is later skipped,
-deleted, replaced, or turns out to be finished already. `clean` removes those,
-with staged copies nothing uses, half-written outputs and the scratch of
-`estimate`, `measure` and `verify`:
-
 ```bash
-autotranscode clean --dry-run /media/films   # list what would go and what stays, and why
+autotranscode clean --dry-run /media/films   # what would go, what stays, and why
 autotranscode clean /media/films
 ```
 
-It keeps work that can still be resumed, and never touches the film a running
-`run` is working on. Pass the library: work directories made before this
-version do not say which film they belong to, and an `output.directory` that
-mirrors the library needs it to find outputs. Those it still cannot place are
-kept unless you add `--unknown`; a source whose whole folder is missing is
-taken for a disk that is not mounted, and kept too. `--all` removes resumable
-work as well.
-
-`sample` runs are cleaned too, those in the work directory and any other `--out`
-directory named on the command line. Their reports, excerpts, encodes and
-snapshots are kept; the chunks beside them go once every sample is done (an
-unfinished run keeps them to resume, unless `--all`). `--samples` removes the
-sample directories whole.
+It removes work directories, staged copies and half-written outputs that no run
+will use again. It keeps work that can be resumed (`--all` removes it too) and
+never touches the film a run is working on.
 
 ## Staging
 
-An encode reads its source many times over many hours. If the library lives on a
-NAS or a spinning disk, staging lets that drive idle: each file is copied to local
-storage once, encoded from there, and the result moved to its destination only
-once it passes the `output.min_saving_percent` and `output.min_saving_mib` checks.
+If the library is on a NAS or a spinning disk, staging copies each source to
+local storage once, works from the copy, and writes the result back once it has
+passed the saving checks:
 
 ```toml
 [staging]
 enabled = true
-directory = ""          # empty => <work_dir>/staging
-min_free_multiple = 1.5 # free space needed: the copy, plus room for the output
+directory = ""          # empty: <work_dir>/staging
+min_free_multiple = 1.5 # free space needed, as a multiple of the source
 ```
 
-`regrain` stages too. The source is copied; the film is read once, taken apart
-into its video track and the rest; the new film is put together locally from
-those and written back once it has been checked. The library's disks see one
-read of each file at the start and one write at the end, instead of about an
-hour of reading and seeking for a 1080p film. The copy of the source goes as soon
-as the grain is final, so at most the source, the film's video track twice (as
-it was and with the new grain) and the rest are on local storage at once: about
-86 GB for a four-hour remux. A regrain stopped partway keeps the source's copy,
-the film's parts, the scene cuts and the grain estimate's finished parts, so the
-rerun redoes none of them.
+`regrain` stages too: one read of the source and of the film, and one write.
+At most the source and the film's video track twice are on local storage at
+once. If there is not enough room, or the copy fails, the file is processed in
+place.
 
-It never fails a file: if the directory is unusable, there is not enough free
-space, or the copy fails, it logs why and works in place instead. Leave it off when
-the library already lives on the same fast storage as `paths.work_dir`.
+## Hardware decoding
+
+The encode runs on the CPU. The passes autotranscode runs itself (scene cuts,
+the grain estimate and calibration, `verify`) decode on hardware where that
+gives exactly software's frames: Rockchip's decoders, NVIDIA (NVDEC), Intel and
+AMD (VA-API), and Apple (VideoToolbox). Each film is checked before its decoder
+is used: a stretch is decoded both ways and compared frame by frame, and a film
+that differs is decoded in software. `doctor` lists the decoders it will try;
+`machine.hardware_decode = "off"` turns this off.
 
 ## Dolby Vision
 
-The Dolby Vision metadata (RPU) is dropped and the base layer underneath is
-encoded, as Jellyfin does when it transcodes these files. HDR10 static metadata is
-kept.
-
-| Profile | Base layer | Handling |
-|---|---|---|
-| 7 (UHD Blu-ray, dual layer) | HDR10 | encoded; RPU and enhancement layer dropped |
-| 8.1 | HDR10 | encoded; RPU dropped |
-| 8.2 | SDR | encoded; RPU dropped |
-| 8.4 | HLG | encoded; RPU dropped |
-| 10.x | per compatibility id | encoded, or skipped when it signals none |
-| 5 | **none** — IPT-PQ-C2 | skipped by default |
-
-Profile 5 has no usable base layer. `dolby_vision.profile5 = "tonemap-sdr"`
-converts it to SDR with `tonemapx` instead of skipping it. Set
-`dolby_vision.mode = "skip"` to leave every DV title alone.
+The Dolby Vision metadata is dropped and the base layer encoded, as Jellyfin
+does when it transcodes; HDR10 metadata is kept. Profiles 7 and 8.x are
+encoded, and 10.x when it has a base layer. Profile 5 has none and is skipped, unless
+`dolby_vision.profile5 = "tonemap-sdr"` converts it to SDR.
+`dolby_vision.mode = "skip"` leaves every Dolby Vision file alone.
 
 ## Interlaced sources
 
-Off by default: the picture is encoded as it is, and a file flagged interlaced is
-warned about, because no player deinterlaces AV1 and the combing would stay.
-`encode.deinterlace = "auto"` deinterlaces the files ffprobe flags (`tt`, `bb`,
-`tb`, `bt`), with bwdif at one frame per frame, so 25i comes out 25p.
+Encoded as they are by default, with a warning, because no player deinterlaces
+AV1. `encode.deinterlace = "auto"` deinterlaces files flagged interlaced (bwdif,
+one frame per frame). For a file flagged wrongly, name the field order
+(`--deinterlace tff` or `bff`); `ffmpeg -i FILE -vf idet -f null -` counts it.
 
-The flags are not always right. An old capture in an AVI can be interlaced and
-flagged progressive: `auto` misses it, so name the field order and run it alone:
+## What it skips
 
-```bash
-autotranscode --deinterlace bff run "/library/capture.avi"
-```
-
-To find the order, count with idet; the larger of TFF and BFF is the one:
-
-```bash
-ffmpeg -i film.avi -map 0:v:0 -vf idet -an -f null - 2>&1 | grep 'Multi frame'
-```
-
-DVDs as `VIDEO_TS` folders are not picked up (`.VOB` is not in
-`library.extensions`); remux them to MKV first, and `auto` will find them.
-
-## What it refuses to do
-
-- **Dolby Vision profile 5**, unless you opt into SDR conversion (above).
-- Files already in AV1, clips shorter than `library.min_duration_sec`, and any result
-  that saves less than `output.min_saving_percent` or `output.min_saving_mib`
-  (100 MiB by default; the output is deleted and the file is marked skipped).
-- **Files the mux cannot take.** Before anything is encoded, the mux runs on the
-  first 5 seconds, so a track it would refuse fails the file in seconds rather
-  than after the encode.
-- **Encodes heading for too little saving.** Once `output.check_saving_after_percent`
-  of the frames are encoded (10 by default), the encode stops as soon as the
-  projected result misses either minimum. Progress lines in the log show where
-  each file is heading.
-- **Files that did not save enough before**, while the settings that decide size
-  (the `encode`, `grain` and `audio` sections, both minimum savings, the SVT-AV1
-  version) are unchanged, grain sampling aside. Change any of them, `--crf`
-  included, and the file gets another try.
-- **Sources already below `library.min_bits_per_pixel`** (bitrate / (width x height x
-  fps)). The default of 0.03 rejects only the hopeless: a 4K HDR remux measures
-  ~0.15, a 1080p web release ~0.08, a good 4K AV1 encode ~0.01. A source whose
-  bitrate cannot be read is never skipped on this rule.
-- `output.replace_source` deletes originals and is **off** by default.
-- **Overwriting an output.** A file whose output name is taken is skipped before
-  anything runs. A file that takes the name while the encode runs is left alone:
-  the encode is kept beside it as `<name>.new.mkv` and the source is reported as
-  failed, for you to keep one. With `output.directory` set, the output mirrors the
-  folders below the directory given to `run`, so films that share a file name in
-  different folders do not collide; files named one by one go to its top.
-- **A second `run` on the same work directory.** It stops at once, naming the pid
-  of the run already going there. `--dry-run` writes nothing and still works, and
-  a run with its own `paths.work_dir` is unaffected.
-
-## Testing
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-Stdlib-only, so it runs on a bare board with no extra installs.
-
-## Releasing
-
-```bash
-scripts/release.sh 0.3.0 --push
-```
-
-Sets the version, runs the tests, tags `v0.3.0` and pushes it; machines running an
-older release then see it in `autotranscode update`. Release whenever
-`toolchain.toml` changes. See [TECHNICAL.md](TECHNICAL.md#releases).
+- Files already in AV1, and files shorter than `library.min_duration_sec`.
+- Results that save less than `output.min_saving_percent` (10%) or
+  `output.min_saving_mib` (100 MiB). Once `output.check_saving_after_percent`
+  of the frames are encoded, an encode heading for less stops early. A file that
+  missed is not tried again until the settings that decide size change.
+- Sources already below `library.min_bits_per_pixel` (0.03 by default).
+- Files whose tracks the mux would refuse: the mux is tried on 5 seconds first.
+- Outputs that already exist: nothing is overwritten. A file that appears under
+  the output's name during the encode is kept, and the encode saved beside it.
+- Originals are deleted only with `output.replace_source = true`.
 
 ## Configuration
 
-See [config.example.toml](config.example.toml); every option is commented there.
+[config.example.toml](config.example.toml) lists every option, with comments.
+`~/.config/autotranscode.toml` is read automatically; `-c` names another file.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests     # stdlib only
+scripts/release.sh X.Y.Z --push           # test, tag, push; see TECHNICAL.md
+```
 
 ## License
 
-0BSD, see [LICENSE](LICENSE): do anything with it. The exception is
+0BSD, see [LICENSE](LICENSE). The exception is
 `scripts/grav1synth-0.2.0-grain-flag.patch`, a change to grav1synth, which is
 MIT-licensed by its authors.
