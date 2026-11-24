@@ -304,7 +304,9 @@ def main(cfg: Config, chain: Toolchain, inputs: list[Path], *, dry_run: bool = F
                   "estimator %r, mode %r", cfg.grain.estimator, cfg.grain.mode)
         return 2
     try:
-        with pipeline.only_run(cfg):
+        # A `kill` or a closed SSH session stops it as Ctrl-C does: the film as it
+        # was, the children killed. A second signal ends it outright.
+        with pipeline.stop_signals(), pipeline.only_run(cfg):
             return _regrain_all(found, chain, cfg, ledger, force)
     except pipeline.AlreadyRunning as exc:
         log.error("%s; regrain once it has finished", exc)

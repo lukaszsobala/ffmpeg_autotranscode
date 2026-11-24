@@ -219,6 +219,32 @@ minutes to remux, attach the cuts and check. Its factors came out as before (lum
 x1.19). A regrain of a film that carries its cuts skips the detection: about 49
 minutes.
 
+**Calibration's threads.** Each window is one ffmpeg that lives about a second:
+the source decoded on the video engine from 3 s before, the encode twice with
+dav1d, and the graph measuring all three. At ffmpeg's defaults dav1d and the
+graph each start a thread per core, so four windows at a time kept about 24
+threads waiting for the 8 cores (a load average above 20). On 200 of Children of
+Men's 856 windows, per window:
+
+| windows at a time × dav1d / graph threads | s a window | threads waiting | CPU busy |
+|---|---|---|---|
+| 4 × default (before; 4 runs) | 1.08–1.11 | 24 | 98% |
+| 4 × 2 / 2 | 0.92 | 10.5 | 92% |
+| 4 × 1 / 1 | 1.00 | 6.7 | 67% |
+| 4 × 2 / 1 | 1.02 | 7.5 | 72% |
+| **8 × 1 / 1 (3 runs)** | **0.89–0.91** | 11.5 | 99% |
+| 8 × 1 / 2 | 0.90 | 16.9 | 99% |
+| 6 × 1 / 2 | 0.89 | 12.6 | 99% |
+| 6 × 2 / 2 | 0.92 | 13.7 | 99% |
+| 12 × 1 / 1 | 0.90 | 16.0 | 99% |
+
+The graph's threads are what count (the 3x3 median and psnr on 10-bit); dav1d's
+hardly do, its frames being few. Once the cores are full the split no longer
+matters, so calibration runs a window per core, single-threaded: 18% faster,
+about 13 minutes instead of 16 on this film, with half the queue. The results
+agreed with the old setting's to 1e-9 (they differ in the last digits from run
+to run anyway: windows are summed in the order they finish).
+
 ### The old grain detector
 
 `measure` scores each file by the mean PSNR between it and a reference-denoised

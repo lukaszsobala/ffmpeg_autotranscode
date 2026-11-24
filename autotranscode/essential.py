@@ -25,7 +25,6 @@ import concurrent.futures
 import os
 import shutil
 import subprocess
-import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -35,7 +34,7 @@ from . import encode, grain, verify
 from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
-from .util import CommandError, child_env, digest, human_duration, log, run
+from .util import Children, CommandError, child_env, digest, human_duration, log, run
 
 # How the film is cut into parts (plan_parts): each part about the frames not yet
 # planned / (GUIDED x processes), but no shorter than SMALLEST_PART frames (about
@@ -158,7 +157,7 @@ def _whole(table: Path, frames: int) -> bool:
 
 def _run_part(chain: Toolchain, cfg: Config, read: MediaInfo, times: Sequence[float],
               origin: float, part: Part, prefilter: str, folder: Path,
-              stopping: threading.Event, children: set[subprocess.Popen]) -> None:
+              children: Children) -> None:
     done = _part_path(folder, part)
     written = done.with_suffix(".new")
     cuts = None
@@ -170,7 +169,7 @@ def _run_part(chain: Toolchain, cfg: Config, read: MediaInfo, times: Sequence[fl
     env = child_env(chain.bin_dirs)
     decode = decode_command(chain, read.path, times, origin, part, prefilter,
                             feed_format(read))
-    if stopping.is_set():
+    if children.stopping.is_set():
         return
     estimate = [*nice, *pin, *estimate_command(chain, written, cuts)]
     with subprocess.Popen(decode, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -178,13 +177,13 @@ def _run_part(chain: Toolchain, cfg: Config, read: MediaInfo, times: Sequence[fl
         with subprocess.Popen(estimate,
                               stdin=source.stdout, stdout=subprocess.DEVNULL,
                               stderr=subprocess.PIPE, env=env) as estimator:
-            children.update((source, estimator))
+            children.add(source, estimator)
             assert source.stdout is not None
             source.stdout.close()   # the estimator's now; a SIGPIPE reaches ffmpeg
             _, err = estimator.communicate()
         decode_err = source.stderr.read() if source.stderr else b""
-    children.difference_update((source, estimator))
-    if stopping.is_set():
+    children.discard(source, estimator)
+    if children.stopping.is_set():
         return
     if estimator.returncode or source.returncode:
         failed, argv, detail = ((estimator, estimate, err) if estimator.returncode
@@ -245,27 +244,24 @@ def frames_table(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path,
              f" ({len(parts) - len(todo)} done before)" if len(todo) < len(parts) else "")
 
     started = time.monotonic()
-    stopping = threading.Event()
-    children: set[subprocess.Popen] = set()
+    children = Children()
     estimating = sum(part.frames for part in todo)
     finished = len(times) - estimating
     reported = 10 * finished // len(times)
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
-            futures = {pool.submit(_run_part, chain, cfg, read, times, origin, part,
-                                   prefilter, folder, stopping, children): part
-                       for part in todo}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+        futures = {pool.submit(_run_part, chain, cfg, read, times, origin, part,
+                               prefilter, folder, children): part
+                   for part in todo}
+        try:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
                 finished += futures[future].frames
                 if 10 * finished // len(times) > reported:
                     reported = 10 * finished // len(times)
                     log.info("  grain estimate: %d%%", 10 * reported)
-    except BaseException:
-        stopping.set()
-        for child in list(children):
-            child.kill()
-        raise
+        except BaseException:
+            children.stop(pool)
+            raise
 
     entries: list[grain.Entry] = []
     for part in parts:

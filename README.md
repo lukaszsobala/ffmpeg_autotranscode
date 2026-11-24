@@ -339,7 +339,7 @@ of scene detection it was on.
 
 | | |
 |---|---|
-| `Ctrl-C`, `kill <pid>`, or a hangup | Stop and checkpoint. Exit code 130; a rerun picks the file up again. A hangup is a closed SSH session or a killed `screen` window; the encoder stops with the run rather than going on alone. `sample` stops the same way. |
+| `Ctrl-C`, `kill <pid>`, or a hangup | Stop and checkpoint. Exit code 130; a rerun picks the file up again. A hangup is a closed SSH session or a killed `screen` window; the encoder stops with the run rather than going on alone. `sample` and `regrain` stop the same way; `regrain` leaves the film it was on as it was. |
 | `Ctrl-C` twice | Give up on a tool that is slow to wind down. Chunks already finished are still kept. |
 | `kill -STOP -<pgid>` / `kill -CONT -<pgid>` | Freeze and thaw in place, losing nothing at all. Use this for a pause measured in minutes. Av1an runs in a process group of its own, so take the pgid from `ps -o pgid= -C av1an`; under systemd, `systemctl --user kill --signal=STOP <unit>` does it for you. |
 | Power cut | Same as Ctrl-C, minus the chunk in flight. Rarely, it costs that film's progress; see [TECHNICAL.md](TECHNICAL.md#resuming-in-detail). |

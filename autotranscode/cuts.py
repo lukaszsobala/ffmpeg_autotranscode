@@ -30,7 +30,6 @@ import os
 import queue
 import shutil
 import subprocess
-import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -40,7 +39,7 @@ from . import encode, essential, verify
 from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
-from .util import CommandError, child_env, digest, human_duration, log, run
+from .util import Children, CommandError, child_env, digest, human_duration, log, run
 
 # The attachment the cuts travel in.
 ATTACHMENT = "autotranscode-scenes.json"
@@ -104,8 +103,7 @@ def _read_part(path: Path, frames: int) -> list[int] | None:
 
 def _detect_part(chain: Toolchain, cfg: Config, read: MediaInfo, times: Sequence[float],
                  origin: float, part: essential.Part, prefilter: str, folder: Path,
-                 cores: queue.Queue[str], children: set[subprocess.Popen],
-                 stopping: threading.Event) -> None:
+                 cores: queue.Queue[str], children: Children) -> None:
     done = _part_path(folder, part)
     decode = essential.decode_command(chain, read.path, times, origin, part, prefilter,
                                       essential.feed_format(read))
@@ -113,7 +111,7 @@ def _detect_part(chain: Toolchain, cfg: Config, read: MediaInfo, times: Sequence
     env = child_env(chain.bin_dirs)
     core = cores.get()
     try:
-        if stopping.is_set():
+        if children.stopping.is_set():
             return
         # One core each: the detector is nearly single-threaded, and left to the
         # scheduler it runs on an RK3588's little cores at a third of the speed.
@@ -123,15 +121,15 @@ def _detect_part(chain: Toolchain, cfg: Config, read: MediaInfo, times: Sequence
                               env=env) as source:
             with subprocess.Popen(detect, stdin=source.stdout, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, env=env) as detector:
-                children.update((source, detector))
+                children.add(source, detector)
                 assert source.stdout is not None
                 source.stdout.close()
                 out, err = detector.communicate()
             decode_err = source.stderr.read() if source.stderr else b""
-        children.difference_update((source, detector))
+        children.discard(source, detector)
     finally:
         cores.put(core)
-    if stopping.is_set():
+    if children.stopping.is_set():
         return
     if detector.returncode or source.returncode:
         failed, argv, detail = ((detector, detect, err) if detector.returncode
@@ -184,20 +182,17 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> list[i
              f" ({len(parts) - len(todo)} done before)" if len(todo) < len(parts) else "")
 
     started = time.monotonic()
-    stopping = threading.Event()
-    children: set[subprocess.Popen] = set()
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
-            futures = [pool.submit(_detect_part, chain, cfg, read, times, origin, part,
-                                   prefilter, folder, cores, children, stopping)
-                       for part in todo]
+    children = Children()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+        futures = [pool.submit(_detect_part, chain, cfg, read, times, origin, part,
+                               prefilter, folder, cores, children)
+                   for part in todo]
+        try:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
-    except BaseException:
-        stopping.set()
-        for child in list(children):
-            child.kill()
-        raise
+        except BaseException:
+            children.stop(pool)
+            raise
 
     found: set[int] = set()
     for part in parts:

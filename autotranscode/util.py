@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import functools
 import hashlib
@@ -123,6 +124,45 @@ class CommandError(RuntimeError):
         super().__init__(
             f"command failed with exit {returncode}: {shlex.join(argv)}\n{stderr.strip()[-4000:]}"
         )
+
+
+class Children:
+    """The processes a pool of worker threads has running, stopped together.
+
+    Leaving a `with ThreadPoolExecutor` block waits for every task queued, not
+    only the running ones, so a stop has to cancel the queue and kill the
+    children from inside the block (`stop`); a worker checks `stopping` before
+    it starts anything. A Ctrl-C reaches the children on its own, but a `kill`
+    or a hangup only reaches Python.
+    """
+
+    def __init__(self) -> None:
+        self.stopping = threading.Event()
+        self._running: set[subprocess.Popen] = set()
+        self._lock = threading.Lock()
+
+    def add(self, *procs: subprocess.Popen) -> None:
+        """Note started processes; killed at once if a stop came first."""
+        with self._lock:
+            self._running.update(procs)
+            stopped = self.stopping.is_set()
+        if stopped:
+            for proc in procs:
+                proc.kill()
+
+    def discard(self, *procs: subprocess.Popen) -> None:
+        with self._lock:
+            self._running.difference_update(procs)
+
+    def stop(self, pool: concurrent.futures.Executor | None = None) -> None:
+        """Cancel what `pool` has queued and kill what is running."""
+        with self._lock:
+            self.stopping.set()
+            running = list(self._running)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        for proc in running:
+            proc.kill()
 
 
 @dataclass(slots=True)

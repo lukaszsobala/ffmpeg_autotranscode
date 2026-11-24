@@ -4935,6 +4935,57 @@ class TestSceneCalibration(unittest.TestCase):
         self.assertEqual(argv.count("-export_side_data"), 1)
         # The encodes are sought straight to the window's keyframe.
         self.assertIn(f"{stream.times[50] + 0.0005:.4f}", argv)
+        # Single-threaded: as many run at once as there are cores.
+        self.assertEqual(argv[argv.index("-filter_complex") - 1], "1")
+        self.assertEqual(argv[argv.index("-filter_complex") - 2], "-filter_complex_threads")
+        av1_inputs = [n for n, arg in enumerate(argv) if arg == "-i"][1:]
+        for at in av1_inputs:
+            self.assertEqual(argv[at - 6:at - 4], ["-threads", "1"])
+
+
+class TestStoppingWorkers(unittest.TestCase):
+    """A stop cancels what a pool has queued and kills what it has running."""
+
+    def test_a_child_started_after_the_stop_is_killed_at_once(self):
+        children = util.Children()
+        children.stop()
+        with subprocess.Popen(["sleep", "30"]) as child:
+            started = time.monotonic()
+            children.add(child)
+            child.wait(timeout=5)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(children.stopping.is_set())
+
+    def test_ctrl_c_in_calibration_starts_no_more_windows(self):
+        started: list[int] = []
+        stream = scenegrain.Stream([i * 10_000 for i in range(400)],
+                                   [i / 25 for i in range(400)], [0])
+        windows = [scenegrain.Window(0, 0, n, 4) for n in range(1, 41)]
+
+        def sleeper(*_args, **_kwargs):
+            started.append(1)
+            return ["sleep", "30"]
+
+        def interrupted(_futures):
+            time.sleep(0.5)
+            raise KeyboardInterrupt
+            yield  # pragma: no cover
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(scenegrain, "frame_times",
+                                           lambda *_a: list(stream.times)), \
+                unittest.mock.patch.object(scenegrain.essential, "start_time",
+                                           lambda *_a: 0.0), \
+                unittest.mock.patch.object(scenegrain, "window_command", sleeper), \
+                unittest.mock.patch.object(scenegrain.concurrent.futures, "as_completed",
+                                           interrupted):
+            began = time.monotonic()
+            with self.assertRaises(KeyboardInterrupt):
+                scenegrain.measure(make_chain(), windows, Path("/src.mkv"), Path("/b.mkv"),
+                                   Path("/g.mkv"), stream, "", Path(tmp), processes=2)
+            # The two running were killed, and none of the 38 queued started.
+            self.assertLess(time.monotonic() - began, 10)
+        self.assertEqual(len(started), 2)
 
 
 class TestSceneList(unittest.TestCase):

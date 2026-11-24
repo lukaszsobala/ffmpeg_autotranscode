@@ -36,7 +36,7 @@ from .config import Config
 from .encode import frame_times
 from .probe import MediaInfo
 from .tools import Toolchain
-from .util import CommandError, child_env, log, run
+from .util import Children, CommandError, child_env, log, run
 
 # Frames of measurement that count as much as the film's factor: a scene with
 # this many measured frames takes half its own factor and half the film's (in
@@ -172,12 +172,13 @@ def window_command(chain: Toolchain, window: Window, source: Path, source_times:
     graph: list[str] = []
     decode = (verify.decode_args(chain, source, grain=True) if source_decode is None
               else list(source_decode))
+    # One thread each for dav1d and the graph: several windows run at once, one
+    # per core, and ffmpeg's default of a thread per core in each made ~25 wait.
+    av1 = [*verify.software_decode_args(chain, "av1"), "-threads", "1"]
     plan = [(source, source_times, source_origin, decode, prefilter, SOURCE_SEEK),
-            (base, stream.times, stream_origin,
-             ["-export_side_data", "film_grain", *verify.software_decode_args(chain, "av1")],
+            (base, stream.times, stream_origin, ["-export_side_data", "film_grain", *av1],
              "", 0.0),
-            (grainy, stream.times, stream_origin, verify.software_decode_args(chain, "av1"),
-             "", 0.0)]
+            (grainy, stream.times, stream_origin, av1, "", 0.0)]
     for number, (path, times, origin, decode, pre, margin) in enumerate(plan):
         seek_to = times[window.keyframe] if margin == 0.0 else times[first] - margin
         seek = max(0.0, seek_to - origin + (0.0005 if margin == 0.0 else 0.0))
@@ -194,7 +195,7 @@ def window_command(chain: Toolchain, window: Window, source: Path, source_times:
     for number in range(len(plan)):
         outputs += ["-map", f"[o{number}]", "-f", "null", "-"]
     return [chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y", *inputs,
-            "-filter_complex", ";".join(graph), *outputs]
+            "-filter_complex_threads", "1", "-filter_complex", ";".join(graph), *outputs]
 
 
 # Seconds a calibration window may take; a few is usual.
@@ -234,18 +235,27 @@ def measure(chain: Toolchain, windows: Sequence[Window], source: Path, base: Pat
         decode = (verify.software_decode_args(chain, "") if software.is_set() else None)
         argv = window_command(chain, window, source, source_times, source_origin, base,
                               grainy, stream, stream_origin, prefilter, stats, decode)
+        if children.stopping.is_set():
+            raise CommandError(argv, -1, "stopped")
         log.debug("exec: %s", shlex.join(argv))
-        try:
-            done = subprocess.run(argv, capture_output=True, text=True, errors="replace",
-                                  env=child_env(chain.bin_dirs), timeout=WINDOW_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            if not software.is_set():
-                software.set()
-                log.warning("  a calibration window hung; decoding the source in software "
-                            "from now on")
-            raise CommandError(argv, -1, f"timed out after {WINDOW_TIMEOUT}s") from None
-        if done.returncode:
-            raise CommandError(argv, done.returncode, done.stderr)
+        with subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              text=True, errors="replace",
+                              env=child_env(chain.bin_dirs)) as child:
+            children.add(child)
+            try:
+                _, err = child.communicate(timeout=WINDOW_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                if not software.is_set():
+                    software.set()
+                    log.warning("  a calibration window hung; decoding the source in "
+                                "software from now on")
+                raise CommandError(argv, -1, f"timed out after {WINDOW_TIMEOUT}s") from None
+            finally:
+                children.discard(child)
+        if child.returncode:
+            raise CommandError(argv, child.returncode, err)
         planes: list[list[float]] = []
         for path in stats:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -256,24 +266,29 @@ def measure(chain: Toolchain, windows: Sequence[Window], source: Path, base: Pat
     sums: dict[int, list[float]] = {}
     counts: dict[int, int] = {}
     done = 0
+    children = Children()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, processes)) as pool:
         futures = [pool.submit(one, number, window) for number, window in enumerate(windows)]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                scene, planes = future.result()
-            except CommandError as exc:
-                log.debug("a calibration window failed: %s", exc.stderr.strip()[-200:])
-                continue
-            frames = min(len(values) for values in planes)
-            if frames == 0:
-                continue
-            totals = sums.setdefault(scene, [0.0] * 9)
-            for index, values in enumerate(planes):
-                totals[index] += sum(values[:frames])
-            counts[scene] = counts.get(scene, 0) + frames
-            done += 1
-            if done % max(1, len(windows) // 10) == 0:
-                log.info("  grain calibration: %d%%", round(100 * done / len(windows)))
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    scene, planes = future.result()
+                except CommandError as exc:
+                    log.debug("a calibration window failed: %s", exc.stderr.strip()[-200:])
+                    continue
+                frames = min(len(values) for values in planes)
+                if frames == 0:
+                    continue
+                totals = sums.setdefault(scene, [0.0] * 9)
+                for index, values in enumerate(planes):
+                    totals[index] += sum(values[:frames])
+                counts[scene] = counts.get(scene, 0) + frames
+                done += 1
+                if done % max(1, len(windows) // 10) == 0:
+                    log.info("  grain calibration: %d%%", round(100 * done / len(windows)))
+        except BaseException:
+            children.stop(pool)
+            raise
     return {scene: Energies(counts[scene],
                             (t[0] / counts[scene], t[1] / counts[scene], t[2] / counts[scene]),
                             (t[3] / counts[scene], t[4] / counts[scene], t[5] / counts[scene]),
@@ -403,10 +418,11 @@ def apply(read: MediaInfo, base: Path, table: Path, scene_starts: Sequence[int],
     log.info("  grain calibration: %d windows of up to %d frames in %d of %d scenes",
              len(windows), cfg.grain.calibration_window,
              len({w.scene for w in windows}), len(starts))
-    # Four windows at a time on an RK3588: 1.09 s a window against 1.29 with two;
-    # eight gave no more, and pinning to the big cores nothing either.
+    # A window per core, each single-threaded (window_command): 0.89 s a window on
+    # an RK3588 against 1.09 for four at ffmpeg's default threads. Twelve, or two
+    # threads in the graph, gave no more (TECHNICAL.md, "Calibration's threads").
     energies = measure(chain, windows, read.path, base, grainy, stream, prefilter, work,
-                       processes=max(1, min(4, (os.cpu_count() or 2) // 2)))
+                       processes=os.cpu_count() or 2)
     calibration = calibrate(energies, cfg.grain.mode, prior=2 * cfg.grain.calibration_window)
     if calibration is None:
         log.warning("  grain strength not calibrated: measurements inconclusive")
