@@ -29,13 +29,13 @@ source's, and that took four attempts to get right:
    block after block. Still available as `grain.estimator = "grav1synth"`.
 2. **SVT-AV1's own estimator, in the encode** (`--film-grain`). It looked right —
    AR gains of 0.60-0.77 across 95 frames — but doubled the encode time.
-3. **SVT-AV1's estimator on a few seconds of samples**, applied afterwards. Now
-   `grain.estimator = "svt"`. The samples are encoded with `--film-grain`, ffmpeg's decoder reads back
-   every frame's parameters, the most typical frame's become the table (its medoid:
+3. **SVT-AV1's estimator on a few seconds of samples**, applied afterwards. The
+   samples are encoded with `--film-grain`, ffmpeg's decoder reads back every
+   frame's parameters, the most typical frame's become the table (its medoid:
    one atypical frame drew faint stripes), and grav1synth writes it into the
-   finished stream. Minutes per film, whatever its length: five on an RK3588 with
-   four 2-second samples, the old setting there. Ten 3-second samples took 1m47s
-   for a 1080p clip on a Core Ultra 7 258V. Its grain had the wrong texture.
+   finished stream. Minutes per film, whatever its length. Its grain had the
+   wrong texture. Still available as `grain.estimator = "svt"`, and the fallback
+   when a source's frames cannot be matched to the encode's.
 4. **SvtFgEssential over the whole film**, from
    [SVT-AV1-Essential](https://github.com/nekotrix/SVT-AV1-Essential) 4.3.1, one
    table entry per frame, calibrated scene by scene. The default. See
@@ -64,11 +64,56 @@ Two constraints shaped the implementation:
 
 ### The whole-film estimate
 
-SVT-AV1's estimate on samples gave grain of the wrong texture. On To Live and
-Die in L.A. (35 mm, 1080p), ten 3-second windows were encoded with the
-production settings and both tables applied to the same encode. Measured on the
-flattest 40% of 16-pixel blocks, against what the encode lost there (source minus
-encode, in 10-bit units):
+With the default estimator, `grain.estimator = "svtfg"`, grain is made after the
+encode, on the finished AV1 stream, in five steps (`pipeline.film_grain`):
+
+1. **Scene starts.** Av1an's scene list from the encode. SvtFgEssential starts
+   its analysis afresh at each scene start, and calibration goes scene by
+   scene. (`regrain` reads the list kept inside the film, or finds it again; see
+   [Regrain](#regrain).)
+2. **Estimate** (`essential.frames_table`). The source's frame times are listed
+   (ffprobe, packet times), and the film is cut at scene starts into parts of
+   whole scenes. For each part, ffmpeg decodes the source from a seek 3 s before
+   the part's first frame, keeps the timestamps (`-copyts`), selects from that
+   frame's own time on, and pipes Y4M (8-bit 4:2:0 as it is, anything else as
+   10-bit 4:2:0) into
+   `SvtFgEssential --strength -1 --seed -1 --keyint 0 --keyframes @cuts`, which
+   writes a table entry for every frame. Several parts run at once; their
+   entries, in frame order, are the film's table (`grain_frames.tbl`). The
+   source is decoded on a hardware decoder where that gives software's frames
+   exactly (see [Hardware](#hardware-the-encode-in-software-decoding-where-it-is-exact)).
+3. **First write** (`grain.retime`, `grain.apply_table`). The table is retimed by
+   the packets of the encoded stream, and `grav1synth apply` writes it into the
+   frame headers: the encode with grain, uncalibrated.
+4. **Calibrate** (`scenegrain.measure`, `scenegrain.calibrate`). Windows of up to
+   4 frames are chosen just after keyframes of the encode, one in every scene
+   before any scene gets a second, up to `grain.calibration_frames`. For each
+   window one ffmpeg decodes the same frames three times: from the source
+   (found by timestamp, as in step 2), from the encode with the grain left off
+   (the decoder hands the grain parameters over as side data instead of
+   applying them), and from the encode with grain. A plane's grain energy is
+   the mean squared difference between the frame and its 3x3 median, at 10
+   bits. Per plane, the factor that makes the result match the source is
+   √((source − without) / (with − without)) (`grain.strength_factor`): the
+   encode keeps some fine texture of its own, and the synthesised grain adds to
+   it. The film's factors decide whether to keep grain at all (in `"auto"`, none
+   when luma would be below x0.15) and are capped at x2; each scene's factors
+   are its own, pulled towards the film's the fewer frames they rest on.
+5. **Final write.** Every frame's entry is scaled by its scene's factors,
+   retimed, and written into the encode again (`grain.tbl`): the stream that is
+   muxed. The scene list and what made the grain go into the film as an
+   attachment.
+
+Nothing is re-encoded at any step: AV1 grain is parameters in the frame headers.
+If the source's frames cannot be matched to the encode's one for one (a
+different count), the film falls back to the `"svt"` estimate from samples,
+calibrated as one.
+
+**Why SvtFgEssential.** SVT-AV1's estimate on samples gave grain of the wrong
+texture. On Film B (35 mm, 1080p), ten 3-second windows were
+encoded with the production settings and both tables applied to the same
+encode. Measured on the flattest 40% of 16-pixel blocks, against what the encode
+lost there (source minus encode, in 10-bit units):
 
 | | factor calibration wanted, Y / Cb / Cr | luma lag-1 correlation, horizontal / vertical | luma σ by brightness, dark to bright (calibrated) |
 |---|---|---|---|
@@ -91,61 +136,6 @@ came before, starts afresh at every keyframe it is given, and writes a table
 entry for every frame. Only this tool is taken from Essential: as an encoder it
 changes many defaults the CRF and variance-boost settings here were judged with.
 
-**Speed.** Its automatic analysis is single-threaded: 20 frames/s for 1080p on
-one Cortex-A76, 25 for 8-bit input, decoding included. Since it keeps nothing
-across a keyframe, the film is split at Av1an's scene starts into runs of whole
-scenes, one SvtFgEssential per big core, and the runs' entries follow each
-other. Equal runs left cores idle at the end: Film A in 14 runs for 4
-processes spent the last 8 of its 31 minutes with half of them waiting. So each
-run takes half of what is left divided by the processes, down to 600 frames, and
-the longest go first, so a long take that cannot be split goes early. In a
-simulation of that film's shape (341 scenes, three long takes), 26.4 minutes
-against an ideal 26.2, and never above 26.8.
-
-The little cores do not pay here. They already carry the decoders at about 40%
-each, and four more SvtFgEssential processes on them made 5 frames/s each while
-slowing the four on the big cores from 25 to 21: 104 frames/s in all against
-100. Against one pass over
-720 frames with the same cuts, the parallel runs' scaling functions differed by
-0.2% on average (luma 0.01%): a few frames after each cut, where one pass still
-carries a little of the scene before. Each run is decoded from a seek and found
-by its frames' timestamps (`-copyts`, then `select` on the first frame's time),
-so whatever the seek lands on, its frames are exactly the encode's; on the
-Rockchip video engine when that is exact for the codec (see
-[Hardware](#hardware-the-encode-in-software-decoding-where-it-is-exact)).
-Finished runs are kept, so a stop loses only those in flight. If the source's
-frames still do not match the encode's one for one, the film falls back to the
-estimate from samples.
-
-**Timing the table.** grav1synth (through av1-grain 0.4.1) gives each frame the
-first segment with start <= t <= end, both inclusive, where t is the packet's
-timestamp read as milliseconds times 10,000. SvtFgEssential times entry n at
-n x 417083 for 23.976 fps, but Matroska rounds timestamps to the millisecond:
-frame 3 at 125.125 ms is stored as 125, which is before 3 x 417083 = 1,251,250,
-so it took frame 2's entry, and so did about half the frames. The table is
-therefore retimed by the packets of the stream it goes into: each run of frames
-with the same parameters becomes one segment, from its first frame's timestamp
-to one before the next run's. That also covers a variable frame rate and a
-video track that starts after its audio. Runs are about ten frames long (the
-parameters change every 11 frames), which keeps grav1synth's search, linear
-for every frame, from growing with the square of the film's length. A run keeps
-its first frame's seed; grav1synth moves the seed on at every frame anyway.
-
-**Per-scene calibration.** One factor per film left scenes far apart: in the
-ten windows above, SvtFgEssential's luma wanted anything from x0.59 to x1.5. So
-calibration measures each scene and scales each scene's entries. The measure,
-verify's (a 3x3 median on 10-bit), costs about 0.4 core-seconds a 1080p frame,
-about 15 frames/s on an RK3588, and decoding the encode whole would cost more
-still, so it reads windows: a few frames just after keyframes of the encode,
-which Av1an puts at every chunk start, so the seek decodes nothing extra; the
-keyframe itself is left out, since an intra frame keeps more texture than its
-neighbours. The source's same frames are found by timestamp, as above. Every
-scene gets a window before any gets a second, longest scenes first, up to
-`grain.calibration_frames` (4,000 at 1080p, fewer in proportion above). A scene's
-factor is pulled towards the film's, in the log domain, by as many frames' worth
-as two windows; a scene without a window takes the film's. Whether to keep grain
-at all is still decided on the film's measure (`decide_strength`).
-
 **What calibration adds to SvtFgEssential.** The estimator gets right what no
 rescaling could: the texture and the brightness profile (the table above). Its
 strength, on the other hand, came out differently on every film, and differently
@@ -163,82 +153,145 @@ tables, encoded as a run encodes them:
 
 Not all of that is the estimator's error. It estimates all the grain in the
 source; the encode here keeps some fine texture of its own, and calibration
-subtracts that (`strength_factor`). But that can only lower what the table
-needs, and four of the six wanted more luma grain than it gave, and chroma
-anything from a third less to half as much again. So the two do different jobs: the estimator
-says what the grain looks like, and the source, measured against the result,
-says how much of it to put back. On Film A, the source's grain and the
-result's, measured the same way in 20 windows, then differed by x0.84 to x1.28
-(see below).
+subtracts that. But that can only lower what the table needs, and four of the
+six wanted more luma grain than it gave, and chroma anything from a third less
+to half as much again. So the two do different jobs: the estimator says what the
+grain looks like, and the source, measured against the result, says how much of
+it to put back.
 
-**Films encoded before.** Grain is parameters in the frame headers, so
-`autotranscode regrain` gives a finished film the new grain without encoding it
-again: the video track is taken out, the table estimated and calibrated as a
-run would, written in with grav1synth, and the file remuxed with every other
-track in its place and the timestamps as they were. Applying a table over an
-earlier one gave, frame for frame, the pictures of applying it to the encode
-without grain. The new file must have the same tracks, the same video packets
-and the same length before it replaces the old one.
+**The result, on a whole film.** Film A (1080p, 157,013 frames, 341
+scenes), against its earlier grain from the `"svt"` estimate's single table, in
+20 windows spread over the film, measured as above:
 
-Unstaged, a regrain reads the source in full three times (frame times, cuts,
-estimate) and seeks into it for calibration, reads the film twice (the track
-taken out, the remux), writes the new file, and reads both again for the check:
-tens of gigabytes for a 1080p film, much of it seeking between several places
-at once. With `[staging]` on, it copies the source (`run`'s copy, reused),
-takes the film apart in one read (one ffmpeg, two outputs: the film track, and
-every other track with the chapters and tags), puts the new film together from
-the parts, and writes the checked file back beside the old one before renaming
-it over: one read of each and one write. The source's copy goes once the final
-grain is written; the track taken out stays to the end, since the remux takes the
-film track's tags from it and the check counts its packets. So the peak is the
-source, both video tracks and the rest: 26 GB for Film A.
+| | luma σ | luma lag-1, horizontal / vertical | luma σ by brightness, dark to bright | luma σ against the source's, by window |
+|---|---|---|---|---|
+| the source's grain | 6.26 | +0.41 / +0.48 | 4.9, 9.4, 9.7, 8.0, 8.4 | |
+| `"svt"`, one table | 7.10 | +0.04 / +0.06 | 7.1, 7.3, 7.3, 7.4, 7.5 | x0.79 to x3.43 |
+| SvtFgEssential, calibrated per scene | 6.25 | +0.41 / +0.49 | 4.7, 9.2, 10.4, 8.4, 9.3 | x0.84 to x1.28 |
 
-Putting a film together from its parts needs every track's dispositions set by
-hand: writing the other tracks on their own, ffmpeg marks the first of several
+The new grain's one window outside that range was the end credits, where the
+source has almost no texture (σ 1.6): x0.29, where the old was x2.53.
+
+**Parts.** SvtFgEssential keeps nothing across a keyframe it is given, so parts
+of whole scenes, each started at a scene start, join into what one pass over the
+film gives. Against one pass over 720 frames with the same cuts, the parts'
+scaling functions differed by 0.2% on average (luma 0.01%): a few frames after
+each cut, where one pass still carries a little of the scene before. Each part
+is decoded from a seek and found by its frames' timestamps (`-copyts`, then
+`select` on the first frame's time), so whatever frame the seek lands on, the
+part's frames are exactly the encode's. Equal parts would leave processes idle at
+the end, so each part takes half of what is left divided by the processes, down
+to 600 frames, and the longest go first, which also starts a long take that
+cannot be split early. Finished parts are kept, so a stop loses only those in
+flight.
+
+**Timing the table.** grav1synth (through av1-grain 0.4.1) gives each frame the
+first segment with start <= t <= end, both inclusive, where t is the packet's
+timestamp read as milliseconds times 10,000. SvtFgEssential times entry n at
+n x 417083 for 23.976 fps, but Matroska rounds timestamps to the millisecond:
+frame 3 at 125.125 ms is stored as 125, which is before 3 x 417083 = 1,251,250,
+so it took frame 2's entry, and so did about half the frames. The table is
+therefore retimed by the packets of the stream it goes into: each run of frames
+with the same parameters becomes one segment, from its first frame's timestamp
+to one before the next run's. That also covers a variable frame rate and a
+video track that starts after its audio. Runs are about ten frames long (the
+parameters change every 11 frames), which keeps grav1synth's search, linear
+for every frame, from growing with the square of the film's length. A run keeps
+its first frame's seed; grav1synth moves the seed on at every frame anyway. On
+Film A the per-frame table was 63 MB; retimed, 14,348 segments in 6 MB.
+
+**Calibration's windows.** One factor per film left scenes far apart: in the ten
+windows above, SvtFgEssential's luma wanted anything from x0.59 to x1.5, hence a
+factor per scene. Measuring every frame would cost more than the estimate
+itself (the 3x3 median on 10-bit is about 0.4 core-seconds a 1080p frame, and
+the encode would be decoded whole twice), so calibration reads windows. They sit
+just after keyframes of the encode, which Av1an puts at every chunk start, so a
+seek into the encode decodes nothing extra; the keyframe itself is left out,
+since an intra frame keeps more texture than its neighbours.
+`grain.calibration_frames` is 4,000 at 1080p, fewer in proportion above. A
+scene's factor is pulled towards the film's, in the log domain, by as many
+frames' worth as two windows; a scene without a window takes the film's.
+
+### Regrain
+
+Grain is parameters in the frame headers, so `autotranscode regrain` gives a
+finished film the current grain without encoding it again: the video track is
+taken out, the table estimated and calibrated as above, written in with
+grav1synth, and the file remuxed with every other track in its place and the
+timestamps as they were. Applying a table over an earlier one gave, frame for
+frame, the pictures of applying it to the encode without grain. The new file
+must have the same tracks, the same video packets and the same length before it
+replaces the old one.
+
+**Staging.** Unstaged, a regrain reads the source in full three times (frame
+times, cuts, estimate) and seeks into it for calibration, reads the film twice
+(the track taken out, the remux), writes the new file, and reads both again for
+the check: tens of gigabytes for a 1080p film, much of it seeking between
+several places at once. With `[staging]` on, it copies the source (`run`'s copy,
+reused), takes the film apart in one read (one ffmpeg, two outputs: the film
+track, and every other track with the chapters and tags), puts the new film
+together from the parts, and writes the checked file back beside the old one
+before renaming it over: one read of each and one write. The source's copy goes
+once the final grain is written; the track taken out stays to the end, since the
+remux takes the film track's tags from it and the check counts its packets. So
+the peak is the source, both video tracks and the rest: 26 GB for Children of
+Men.
+
+**Putting the film back together.** Every track's dispositions are set by hand:
+writing the other tracks on their own, ffmpeg marks the first of several
 subtitle tracks default when none is (setting any one disposition turns that off
 for the whole file). The check compares dispositions, each audio and video
 track's start time and the chapters too. Five films taken apart and put together
 again (Film I's 42 tracks and 38 chapters, fonts, PGS subtitles, audio
 starting 54 ms before the video) came out with every track's packets, every
-attachment, tag and disposition as they were. Whether to leave a film is read
-from the scene list's attachment alone, at the head of the file.
+attachment, tag and disposition as they were.
+
+**Scene cuts.** Every film keeps its cuts inside it, as a Matroska attachment of
+a few kilobytes (`autotranscode-scenes.json`, written in place by mkvpropedit
+after the mux), which `regrain` reads if it fits the video's frame count. Without
+it, Av1an's list has gone with the work directory, so regrain finds the cuts
+itself (`cuts.py`) and attaches them. Av1an's detector is the av-scenechange
+crate (0.24.1 in Av1an 0.6.0's lock file); the crate's own command-line tool,
+given Av1an's options (`--min-scenecut 24 --speed 0`), reads Y4M, so it can be fed
+by a hardware decoder, five minutes of film a part, a part per core. Its cuts
+were Av1an's frame for frame in all six parts of Film A tried (120
+cuts). At 4K Av1an detects on frames shrunk to `encode.sc_downscale_height`
+(1080) by VapourSynth's Bicubic, whose defaults are b = c = 1/3; ffmpeg's `scale`
+with `flags=bicubic:param0=1/3:param1=1/3` stands in for it. On Film G (2160p
+10-bit HEVC) that gave the same 83 cuts as Av1an; unshrunk, it missed two.
+Without av-scenechange, regrain falls back to Av1an's detection.
+
+**What made the grain.** The attachment also names the method: `svtfg` and the
+Essential commit (`pipeline.grain_method`). `regrain` leaves a film whose grain
+the current method made, read from the attachment alone at the head of the file,
+so a library-wide regrain of several days, stopped, starts again where it was,
+and films `run` encoded since are left alone; a new Essential pin makes every
+film due again. It is kept in the film rather than in the ledger, whose older
+versions dropped an entry with a field they did not know (and so, saving, lost
+it); the ledger now leaves such fields out instead.
 
 A stopped regrain keeps what it has done: the cuts as soon as they are found
 (`regrain-scenes.json` in the work directory), the track taken out with a note of
 the film it came from (size, time, track), the estimate's finished parts, and
 the staged source.
 
-**On a whole film.** Film A (1080p, 157,013 frames, 341 scenes) was
-regrained on the RK3588 in 1h19m: 22 minutes of scene detection (Av1an's, as a
-run makes it; detecting at 540 lines was four times slower, its downscaler
-costing more than the detection, for the same cuts), 31 for the estimate (84
-frames/s over four processes of 37 MB each), 20 for calibration (856 windows,
-every scene), and the rest taking the track out and remuxing. The per-frame
-table was 63 MB; retimed, 14,348 segments in 6 MB, which grav1synth wrote in
-seconds. Against its old grain, the "svt" estimate's single table, in 20
-windows spread over the film, measured as above:
+### Speed on the RK3588
 
-| | luma σ | luma lag-1, horizontal / vertical | luma σ by brightness, dark to bright | luma σ against the source's, by window |
-|---|---|---|---|---|
-| the source's grain | 6.26 | +0.41 / +0.48 | 4.9, 9.4, 9.7, 8.0, 8.4 | |
-| old: "svt", one table | 7.10 | +0.04 / +0.06 | 7.1, 7.3, 7.3, 7.4, 7.5 | x0.79 to x3.43 |
-| new: SvtFgEssential, per scene | 6.25 | +0.41 / +0.49 | 4.7, 9.2, 10.4, 8.4, 9.3 | x0.84 to x1.28 |
+**The estimate.** SvtFgEssential's automatic analysis is single-threaded: 20
+frames/s for 1080p on one Cortex-A76, 25 for 8-bit input, decoding included, so
+one process runs per big core. Equal parts left cores idle at the end: Children
+of Men in 14 parts for 4 processes spent the last 8 of its 31 minutes with half
+of them waiting. With the shrinking parts, a simulation of that film's shape (341
+scenes, three long takes) took 26.4 minutes against an ideal 26.2, and never
+above 26.8. The little cores do not pay: they already carry the decoders at about
+40% each, and four more SvtFgEssential processes on them made 5 frames/s each
+while slowing the four on the big cores from 25 to 21: 104 frames/s in all
+against 100.
 
-The new grain's one window outside that range was the end credits, where the
-source has almost no texture (σ 1.6): x0.29, where the old was x2.53.
+**Scene cuts.** Av1an decodes in software, and the detector itself barely uses a
+second thread. Film A, 1080p H.264:
 
-**Finding the cuts again.** Those 22 minutes of scene detection were Av1an
-redoing what it did at the encode: its list goes with the work directory. So every
-film now keeps its cuts inside it, as a Matroska attachment of a few kilobytes
-(`autotranscode-scenes.json`, written in place by mkvpropedit after the mux),
-which `regrain` reads if it fits the video's frame count. For the films encoded
-before, regrain finds the cuts itself (`cuts.py`) and attaches them. Av1an's
-detector is the av-scenechange crate (0.24.1 in Av1an 0.6.0's lock file); the
-crate's own command-line tool, given Av1an's options (`--min-scenecut 24
---speed 0`), reads Y4M, so it can be fed by the video engine. Av1an decodes in
-software, and the detector itself barely uses a second thread:
-
-| Film A, 1080p H.264 | frames/s |
+| | frames/s |
 |---|---|
 | Av1an, one five-minute part (all eight cores busy) | 120 |
 | Av1an, four parts at once | 139 |
@@ -247,30 +300,20 @@ software, and the detector itself barely uses a second thread:
 | the same, on all four A76s | 170 |
 | four parts at once, one per A76 | 250 |
 
-The cuts were Av1an's frame for frame in all six parts tried (120 cuts). At 4K
-Av1an detects on frames shrunk to `encode.sc_downscale_height` (1080) by
-VapourSynth's Bicubic, whose defaults are b = c = 1/3; ffmpeg's `scale` with
-`flags=bicubic:param0=1/3:param1=1/3` stands in for it. On Film G (2160p
-10-bit HEVC), four parts of 3,600 frames: Av1an 8.4 frames/s, av-scenechange on
-hevc_rkmpp 58, the same 83 cuts. Unshrunk, it ran at 38 and missed two of them.
-Without av-scenechange, regrain falls back to Av1an's detection.
+On Film G (2160p 10-bit HEVC), four parts of 3,600 frames: Av1an 8.4 frames/s,
+av-scenechange on hevc_rkmpp 58 (38 unshrunk). Detecting at 540 lines instead of
+1080 was four times slower in Av1an, its downscaler costing more than the
+detection, for the same cuts.
 
-The attachment also says what made the film's grain: `svtfg` and the Essential
-commit (`pipeline.grain_method`). `regrain` leaves a film whose grain the current
-method made, so a library-wide regrain of several days, stopped, starts again
-where it was, and films `run` encoded since are left alone; a new Essential pin
-makes every film due again. It is kept in the film rather than in the ledger,
-whose older versions dropped an entry with a field they did not know (and so,
-saving, lost it); the ledger now leaves such fields out instead.
-
-Film A regrained again with all of that took 1h01m instead of 1h19m:
-12 minutes to find the cuts (212 frames/s; the same 341 scenes, every one on a
-keyframe of the original encode, so Av1an's own), 26 for the estimate (99
-frames/s, its parts shrinking towards the end), 16 for calibration (four windows
-at a time), the source's frame times listed once instead of twice, and three
+**A whole film.** Film A was first regrained in 1h19m: 22 minutes of
+scene detection (Av1an's, as a run makes it), 31 for the estimate (84 frames/s
+over four processes of 37 MB each), 20 for calibration (856 windows, every
+scene), and the rest taking the track out and remuxing. With the cuts found by
+av-scenechange and the other changes above, 1h01m: 12 minutes to find the cuts
+(212 frames/s; the same 341 scenes, every one on a keyframe of the original
+encode), 26 for the estimate (99 frames/s), 16 for calibration, and three
 minutes to remux, attach the cuts and check. Its factors came out as before (luma
-x1.19). A regrain of a film that carries its cuts skips the detection: about 49
-minutes.
+x1.19). A film that carries its cuts skips the detection: about 49 minutes.
 
 **Calibration's threads.** Each window is one ffmpeg that lives about a second:
 the source decoded on the video engine from 3 s before, the encode twice with
@@ -319,8 +362,8 @@ source.mkv
    ├── av1an -e svt-av1
    │      └── scene-split, parallel, resumable → video-only AV1
    │
-   ├── SvtFgEssential --strength -1 .... the grain of every frame, a run of whole
-   │      │                              scenes per big core
+   ├── SvtFgEssential --strength -1 .... the grain of every frame, parts of whole
+   │      │                              scenes, several at once
    │      └── retime ................... a segment per run of equal frames, timed
    │                                     by the encode's own packets
    │
