@@ -280,11 +280,23 @@ stage_vapoursynth() {
   # privilege-free. With PREFIX=$HOME/.local the module lands in
   # ~/.local/lib/pythonX.Y/site-packages, which is Python's user site and already
   # on sys.path -- no PYTHONPATH needed.
+  #
+  # The system's Python, whose headers stage_deps installed (python3-dev), named
+  # outright: configure otherwise takes the first of `python`, `python3.N`... on
+  # PATH, and a newer one from uv, pyenv or Homebrew has no python-3.N.pc for it
+  # ("Package 'python-3.15' not found").
+  local python=/usr/bin/python3
+  [[ -x $python ]] || python=$(command -v python3)
   local venv="$BUILD_DIR/buildenv"
-  [[ -d $venv ]] || python3 -m venv "$venv"
+  local version='import sys; print(sys.version_info[:2])'
+  # One left by a run that took another Python is made again.
+  if [[ -d $venv && $("$venv/bin/python" -c "$version" 2>/dev/null) != "$("$python" -c "$version")" ]]; then
+    rm -rf "$venv"
+  fi
+  [[ -d $venv ]] || "$python" -m venv "$venv"
   "$venv/bin/pip" install --quiet --upgrade cython
   ( cd "$vs" && ./autogen.sh \
-    && PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
+    && PYTHON="$python" PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
          --prefix="$PREFIX" --with-cython="$venv/bin/cython" \
     && make -j "$JOBS" && make install )
 
