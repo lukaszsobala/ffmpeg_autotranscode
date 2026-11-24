@@ -1,4 +1,4 @@
-"""The film's scene cuts: found on the video engine, and kept inside the film.
+"""The film's scene cuts: found by Av1an's own detector, and kept inside the film.
 
 `regrain` needs the cuts of a film encoded long ago: SvtFgEssential starts afresh
 at each, and calibration goes scene by scene. Av1an's scene list is gone with
@@ -7,10 +7,11 @@ of Film A's 79 minutes: it decodes in software, and its detector
 (av-scenechange) barely uses a second thread.
 
 So `detect` runs av-scenechange's own command-line tool -- the crate Av1an
-calls, with the options Av1an gives it -- on frames decoded by the video engine
-where that is bit-exact (verify.decode_args), five minutes of the film a part,
-one part per big core. On Film A it found Av1an's cuts frame for frame
-in every part tried, at 250 frames/s against Av1an's 120.
+calls, with the options Av1an gives it -- on frames decoded by a hardware
+decoder where that is bit-exact (verify.decode_args), five minutes of the film a
+part, one part per big core. On Film A (RK3588, h264_rkmpp) it found
+Av1an's cuts frame for frame in every part tried, at 250 frames/s against
+Av1an's 120.
 
 And the cuts are kept inside the film, as a Matroska attachment
 (ATTACHMENT, a few kilobytes of JSON), so a later regrain needs no detection at
@@ -114,8 +115,9 @@ def _detect_part(chain: Toolchain, cfg: Config, read: MediaInfo, times: Sequence
     try:
         if children.stopping.is_set():
             return
-        # One core each: the detector is nearly single-threaded, and left to the
-        # scheduler it runs on an RK3588's little cores at a third of the speed.
+        # One core each: the detector is nearly single-threaded, and where a CPU
+        # has little cores the scheduler kept it on them (an RK3588's, at a third
+        # of the speed).
         pin = ["taskset", "-c", core] if core else []
         detect = [*nice, *pin, *detect_command(chain, cfg)]
         with subprocess.Popen(decode, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -176,10 +178,9 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> list[i
         cores.put(big[number] if big else "")
     origin = essential.start_time(chain, read.path)
     prefilter = downscale_filter(read, cfg)
-    engine = any(arg.endswith("_rkmpp")
-                 for arg in verify.decode_args(chain, read.path, grain=True))
+    decoder = verify.hardware_decoder(chain, read.path)
     log.info("  detecting scenes (av-scenechange%s): %d frames in %d parts, %d at a time%s",
-             ", decoded on the video engine" if engine else "", frames, len(parts), count,
+             f", decoded with {decoder}" if decoder else "", frames, len(parts), count,
              f" ({len(parts) - len(todo)} done before)" if len(todo) < len(parts) else "")
 
     started = time.monotonic()

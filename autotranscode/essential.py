@@ -6,13 +6,19 @@ checks the AR filter for resonance, then re-estimates every 11 frames, blending
 with what came before, and starts afresh at every keyframe it is given. It
 writes one table entry per frame.
 
+That estimate is used as the tool makes it. This module only runs it fast and
+lines its frames up with the encode's; how strong the grain ends up is set
+afterwards, by measuring the result against the source (scenegrain.py). Only
+this tool is taken from Essential, not its encoder, which changes defaults the
+encoder settings here were judged with.
+
 Its analysis is single-threaded: 20 frames/s at 1080p on one Cortex-A76. But it
 keeps nothing across a scene cut, so the film is split at Av1an's scene starts
 into parts of whole scenes, each part estimated by its own process, and the
 parts' entries simply follow each other: the same table as one pass, in a
-fraction of the time. Each part is decoded from a seek, on the Rockchip video
-engine when that is bit-exact for the codec (verify.decode_args), and found by
-its frames' timestamps, so the frames are exactly the encode's.
+fraction of the time. Each part is decoded from a seek, on a hardware decoder
+where that gives software's frames exactly (verify.decode_args), and found by its
+frames' timestamps, so the frames are exactly the encode's.
 
 The parts are kept as they finish, so a stop loses only those in flight. The
 table they make is in frame order and timed by frame number; grain.retime times
@@ -138,6 +144,16 @@ def decode_command(chain: Toolchain, path: Path, times: Sequence[float], origin:
 
 
 def estimate_command(chain: Toolchain, table: Path, cuts: Path | None) -> list[str]:
+    """SvtFgEssential reading Y4M on stdin and writing a table entry per frame.
+
+    --strength -1   its automatic analysis (no denoising strength to choose)
+    --seed -1       its tested sequence of seeds, against repeating patterns
+    --keyint 0      no keyframes of its own every so many frames: only
+    --keyframes     the scene starts within this part, where the analysis
+                    starts afresh, as each part does at its first frame; so the
+                    parts join into what one pass gives, but for a few frames
+                    after each cut (0.2% apart on average; TECHNICAL.md)
+    """
     assert chain.svtfg is not None
     return [chain.svtfg, "--source", "-", "--table", str(table), "--strength", "-1",
             "--seed", "-1", "--keyint", "0",
@@ -239,8 +255,10 @@ def frames_table(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path,
     todo = sorted((part for part in parts if not _whole(_part_path(folder, part), part.frames)),
                   key=lambda part: -part.frames)
     prefilter = encode.deinterlace_filter(read, cfg)
-    log.info("  grain estimate (SvtFgEssential): %d frames in %d parts of whole scenes, "
-             "%d at a time%s", len(times), len(parts), count,
+    decoder = verify.hardware_decoder(chain, read.path)
+    log.info("  grain estimate (SvtFgEssential%s): %d frames in %d parts of whole scenes, "
+             "%d at a time%s", f", decoded with {decoder}" if decoder else "",
+             len(times), len(parts), count,
              f" ({len(parts) - len(todo)} done before)" if len(todo) < len(parts) else "")
 
     started = time.monotonic()

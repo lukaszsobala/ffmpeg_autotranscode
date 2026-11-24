@@ -1,0 +1,17 @@
+# Additions for an Intel or AMD GPU, on top of compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.vaapi.yaml run --rm autotranscode doctor
+#
+# `doctor` should then list vaapi under "hw decode". It is used for the passes
+# autotranscode runs itself (scene cuts, grain, verify), film by film where it
+# gives software's frames exactly; the encode stays on the CPU. Without this file
+# everything decodes in software, which is correct, only slower.
+
+services:
+  autotranscode:
+    devices:
+      - /dev/dri
+    # The render node's group; the number is the host's (`getent group render`),
+    # which is what the kernel checks.
+    group_add:
+      - "${RENDER_GID:-991}"

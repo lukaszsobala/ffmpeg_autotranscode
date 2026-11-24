@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import Config
+from .config import HARDWARE_DECODERS, Config
 from .util import CommandError, run
 
 # Preferred locations for jellyfin-ffmpeg, in order. Falls back to PATH.
@@ -29,6 +29,8 @@ JELLYFIN_FFMPEG_DIRS = (
 
 # The Rockchip video engine's device node; see _rockchip_video_engine.
 MPP_DEVICE = "/dev/mpp_service"
+NVIDIA_DEVICE = "/dev/nvidiactl"
+DRI_DIR = "/dev/dri"
 
 
 class ToolError(RuntimeError):
@@ -63,12 +65,17 @@ class Toolchain:
     scenechange: str | None = None
     scenechange_version: str = ""
 
-    # Reported by `doctor` to identify the ffmpeg build; nothing here consumes it.
-    # See "Why there is no hardware acceleration" in the README before wiring it up.
+    # This build's -hwaccel methods ("vaapi", "cuda"...), whether or not the
+    # machine has the hardware.
     hwaccels: set[str] = field(default_factory=set)
-    # Rockchip MPP decoders ("h264_rkmpp", "av1_rkmpp"...). verify decodes with
-    # them where they give the same frames as software; see verify.decode_args.
+    # Rockchip MPP decoders ("h264_rkmpp", "av1_rkmpp"...), when the video engine
+    # can be opened.
     rkmpp_decoders: set[str] = field(default_factory=set)
+    # The hardware decoders worth trying here, in order (config.HARDWARE_DECODERS,
+    # less those the build or the machine lacks, less what machine.hardware_decode
+    # rules out). verify.decode_args uses one for a film only where it gives
+    # software's frames exactly.
+    hardware_decode: tuple[str, ...] = ()
     # Every decoder this ffmpeg has ("libdav1d", "hevc"...).
     decoders: set[str] = field(default_factory=set)
     # The fast cores, as a taskset list ("4,5,6,7" on an RK3588), when the CPU
@@ -143,6 +150,34 @@ def _capture(argv: list[str], extra_path: list[str] | None = None) -> str:
     except (OSError, CommandError):
         return ""
     return (result.stdout or "") + (result.stderr or "")
+
+
+def _device_opens(ffmpeg: str, method: str) -> bool:
+    """Whether ffmpeg can open a `method` device: a VA-API render node with no
+    driver for it (an Arm board's GPU) fails here, once, instead of on every film."""
+    try:
+        return run([ffmpeg, "-hide_banner", "-v", "error", "-init_hw_device", f"{method}=hw",
+                    "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.04", "-frames:v", "1",
+                    "-f", "null", "-"], check=False).returncode == 0
+    except (OSError, CommandError):
+        return False
+
+
+def _hardware_decode(setting: str, chain: Toolchain) -> tuple[str, ...]:
+    """The hardware decoders to try, in order: those this ffmpeg was built with
+    whose device the machine has and can open. A build lists cuda and vaapi
+    whatever the machine; trying one without its device would fail on every film."""
+    if setting == "off":
+        return ()
+    present = {
+        "rkmpp": bool(chain.rkmpp_decoders),
+        "cuda": "cuda" in chain.hwaccels and os.path.exists(NVIDIA_DEVICE),
+        "vaapi": "vaapi" in chain.hwaccels and any(Path(DRI_DIR).glob("renderD*")),
+        "videotoolbox": "videotoolbox" in chain.hwaccels,
+    }
+    return tuple(name for name in HARDWARE_DECODERS
+                 if present[name] and setting in {"auto", name}
+                 and (name == "rkmpp" or _device_opens(chain.ffmpeg, name)))
 
 
 def _rockchip_video_engine() -> bool:
@@ -226,6 +261,7 @@ def detect(cfg: Config) -> Toolchain:
     chain.rkmpp_decoders = {
         name for name in chain.decoders if name.endswith("_rkmpp")
     } if _rockchip_video_engine() else set()
+    chain.hardware_decode = _hardware_decode(cfg.machine.hardware_decode, chain)
     chain.filters = {
         parts[1]
         for line in _capture([ffmpeg, "-hide_banner", "-filters"]).splitlines()
@@ -484,10 +520,12 @@ def describe(chain: Toolchain) -> str:
         "(--luminance-qp-bias, for 1080p)",
         f"dovi p5     {'yes' if chain.has_dovi_tonemap else 'no'}  "
         "(tonemapx, for profile 5 -> SDR)",
-        f"hwaccels    {', '.join(sorted(chain.hwaccels)) or 'none'}  "
-        "(this build's decoders; unused -- the encode is CPU-only)",
+        f"hwaccels    {', '.join(sorted(chain.hwaccels)) or 'none'}  (this ffmpeg's)",
         f"rkmpp       {', '.join(sorted(chain.rkmpp_decoders)) or 'none'}  "
-        f"(usable decoders, for verify and grain; needs {MPP_DEVICE})",
+        f"(needs {MPP_DEVICE})",
+        f"hw decode   {', '.join(chain.hardware_decode) or 'none'}  (tried in this order "
+        "for scene cuts, grain and verify, per film, kept where it gives software's "
+        "frames exactly; Av1an and the encoder decode in software)",
         f"big cores   {chain.big_cores or 'all'}  (verify's filter passes run there)",
     ]
     return "\n".join(lines)

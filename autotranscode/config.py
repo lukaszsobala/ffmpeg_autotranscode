@@ -43,6 +43,12 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
 
 CHUNK_METHODS = {"auto", "hybrid", "lsmash", "ffms2", "bestsource", "select", "segment"}
 
+# Hardware decoders for the passes autotranscode runs itself (scene cuts, the
+# grain estimate and calibration, verify), in the order they are tried: Rockchip's
+# video engine, NVIDIA's NVDEC, VA-API (Intel, AMD), Apple's VideoToolbox. Av1an
+# and the encoder decode in software whatever this says.
+HARDWARE_DECODERS = ("rkmpp", "cuda", "vaapi", "videotoolbox")
+
 
 @dataclass(slots=True)
 class Paths:
@@ -68,6 +74,10 @@ class Machine:
     profile: str = "auto"
     workers: int = 0  # 0 => by cores and available memory; see encode.workers
     nice: int = 10
+    # "auto" tries each of HARDWARE_DECODERS the machine has, and uses one for a
+    # film only once it gave software's frames exactly on a stretch of it; "off"
+    # decodes in software; or one of HARDWARE_DECODERS, tried alone.
+    hardware_decode: str = "auto"
 
 
 @dataclass(slots=True)
@@ -533,6 +543,9 @@ def _check_by_width(
 
 
 def validate(cfg: Config) -> None:
+    if cfg.machine.hardware_decode not in {"auto", "off", *HARDWARE_DECODERS}:
+        raise ConfigError("machine.hardware_decode must be auto, off or one of "
+                          + ", ".join(HARDWARE_DECODERS))
     if not -1 <= cfg.encode.preset <= 13:
         raise ConfigError("encode.preset must be between -1 and 13")
     if not 1 <= cfg.encode.crf <= 70:

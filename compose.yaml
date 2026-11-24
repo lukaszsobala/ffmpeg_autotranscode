@@ -4,10 +4,11 @@
 #   docker compose run --rm autotranscode doctor
 #   docker compose run --rm autotranscode run /path/to/library
 #
-# On an RK3588 board add the Rockchip file, for hardware decoding in `verify` and
-# for `machine.profile = "auto"` to see the board:
+# For hardware decoding (scene cuts, grain, verify), add the file for your machine:
 #
-#   docker compose -f compose.yaml -f compose.rk3588.yaml run --rm autotranscode doctor
+#   docker compose -f compose.yaml -f compose.vaapi.yaml ...    Intel or AMD GPU
+#   docker compose -f compose.yaml -f compose.rk3588.yaml ...   RK3588 board (this
+#                                     also lets machine.profile = "auto" see it)
 #
 # See "Docker" in the README.
 

@@ -50,13 +50,16 @@ and grain retention is measured with it on.
 from __future__ import annotations
 
 import functools
+import json
 import re
 import statistics
+import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .tools import Toolchain
-from .util import PROGRESS_ARGS, CommandError, log, run, run_progress
+from .util import PROGRESS_ARGS, CommandError, human_duration, log, run, run_progress
 
 # Separates grain from structure for the retention measure; see the docstring.
 GRAIN_FILTER = "median=radius=1"
@@ -215,8 +218,18 @@ def worst_windows(
     return sorted(picked)
 
 
-# Codecs whose rkmpp decode matched software on every frame; see decode_args.
-EXACT_RKMPP = frozenset({"h264", "hevc"})
+# Codecs tried on a hardware decoder: their standards define the decoded picture
+# exactly, so a correct decoder gives software's frames bit for bit. AV1 is left
+# out: av1_rkmpp decodes some widths wrongly (TECHNICAL.md), and a decoder's grain
+# is not a measurement's. MPEG-2 and VC-1 allow decoders to differ.
+HARDWARE_CODECS = frozenset({"h264", "hevc"})
+
+# How a film is checked on a hardware decoder before it is used: this many frames
+# decoded from a seek at each of these shares of its length, compared with
+# software's frame by frame. A decoder that is wrong at all was wrong within
+# frames of a keyframe (av1_rkmpp's broken widths from the first inter frame).
+CHECK_FRAMES = 48
+CHECK_AT = (0.3, 0.7)
 
 # dav1d's frames in flight. ffmpeg leaves it at 0, which libdav1d then keeps low,
 # and a 1080p 10-bit encode decoded at 43 frames/s on an RK3588's eight cores;
@@ -245,40 +258,133 @@ def measure_argv(chain: Toolchain) -> list[str]:
             *PROGRESS_ARGS]
 
 
+@dataclass(frozen=True, slots=True)
+class _Video:
+    codec: str
+    pix_fmt: str
+    duration: float
+
+
 @functools.cache
-def _video_codec(ffprobe: str, path: Path) -> str:
+def _video(ffprobe: str, path: Path) -> _Video:
     try:
-        return run([ffprobe, "-v", "error", "-select_streams", "v:0",
-                    "-show_entries", "stream=codec_name", "-of", "csv=p=0",
-                    str(path)]).stdout.strip()
-    except CommandError:
+        out = run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                   "-show_entries", "stream=codec_name,pix_fmt:format=duration",
+                   "-of", "json", str(path)]).stdout
+        data = json.loads(out or "{}")
+    except (CommandError, ValueError):
+        return _Video("", "", 0.0)
+    stream = (data.get("streams") or [{}])[0]
+    try:
+        duration = float(data.get("format", {}).get("duration", 0.0))
+    except (TypeError, ValueError):
+        duration = 0.0
+    return _Video(stream.get("codec_name", ""), stream.get("pix_fmt", ""), duration)
+
+
+def hardware_args(method: str, codec: str) -> list[str]:
+    """Input options decoding `codec` with `method` (config.HARDWARE_DECODERS).
+
+    -hwaccel without -hwaccel_output_format hands each frame back in memory
+    (nv12 or p010), so everything after the decoder is the same as for software;
+    -pix_fmt's conversion from those to planar 4:2:0 only moves samples.
+    Rockchip's decoders are decoders of their own, and deinterlace unless told
+    not to, which would alter the frames.
+    """
+    if method == "rkmpp":
+        return ["-c:v", f"{codec}_rkmpp", "-deint", "0"]
+    return ["-hwaccel", method]
+
+
+def _frame_sums(chain: Toolchain, path: Path, decode: Sequence[str], start: float,
+                pix_fmt: str) -> list[str]:
+    out = run([chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", *decode,
+               "-noaccurate_seek", "-ss", f"{start:.3f}", "-i", str(path),
+               "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", str(CHECK_FRAMES),
+               "-fps_mode", "passthrough", "-pix_fmt", pix_fmt, "-f", "framemd5",
+               "-"]).stdout
+    return [line for line in out.splitlines() if line and not line.startswith("#")]
+
+
+def _same_as_software(chain: Toolchain, path: Path, method: str, video: _Video) -> str:
+    """"" when `method` decodes CHECK_FRAMES frames at each of CHECK_AT exactly
+    as software does, else why not. Both are compared in the source's own pixel
+    format, so that nothing but moving samples stands between them."""
+    hardware = hardware_args(method, video.codec)
+    for share in CHECK_AT:
+        start = video.duration * share
+        try:
+            ours = _frame_sums(chain, path, hardware, start, video.pix_fmt)
+        except CommandError as exc:
+            # ffmpeg's first line says why ("Failed to initialise VAAPI
+            # connection"); the last only that the output could not be opened.
+            said = [re.sub(r"^(\[[^]]*\] *)+", "", line)
+                    for line in exc.stderr.strip().splitlines()]
+            return f"failed: {said[0][:160] if said else f'exit {exc.returncode}'}"
+        theirs = _frame_sums(chain, path, [], start, video.pix_fmt)
+        if not theirs:
+            return "software decoded no frames to compare with"
+        if ours != theirs:
+            differing = sum(a != b for a, b in zip(ours, theirs, strict=False))
+            differing += abs(len(ours) - len(theirs))
+            return (f"{differing} of {len(theirs)} frames from {human_duration(start)} "
+                    "came out different from software")
+    return ""
+
+
+_decoders: dict[tuple[str, Path], str] = {}
+_decoders_lock = threading.Lock()
+
+
+def hardware_decoder(chain: Toolchain, path: Path) -> str:
+    """The hardware decoder `path` is decoded with, or "" for software.
+
+    The first of chain.hardware_decode that decodes a stretch of the film exactly
+    as software does (_same_as_software); tried once per film and remembered.
+    The passes this serves compare the source with its encode pixel by pixel,
+    and find a stretch of it by its frames' timestamps, so a decoder only close
+    to software would be wrong where it matters. On an RK3588 h264_rkmpp matched
+    software on every frame of two films, and hevc_rkmpp on 1,920 frames of four
+    (8- and 10-bit, 1080p and 4K, HDR10 and Dolby Vision), each from a seek.
+    """
+    video = _video(chain.ffprobe, path)
+    if video.codec not in HARDWARE_CODECS or not video.pix_fmt:
         return ""
+    candidates = [method for method in chain.hardware_decode
+                  if method != "rkmpp" or f"{video.codec}_rkmpp" in chain.rkmpp_decoders]
+    if not candidates:
+        return ""
+    key = (chain.ffmpeg, path)
+    with _decoders_lock:    # the passes ask from several threads at once
+        if key not in _decoders:
+            _decoders[key] = ""
+            for method in candidates:
+                why = _same_as_software(chain, path, method, video)
+                if not why:
+                    log.debug("  %s: decoded with %s, which matched software", path.name,
+                              method)
+                    _decoders[key] = method
+                    break
+                # A decoder that cannot open the film is routine (a driver without
+                # 10-bit HEVC); one that gives other frames is worth knowing.
+                (log.info if why.startswith("failed") else log.warning)(
+                    "  not decoding %s with %s: %s", path.name, method, why)
+        return _decoders[key]
 
 
 def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
-    """Input options that decode `path` on the Rockchip video engine when that is
-    exact, or else as fast as the software decoder goes (DAV1D_FRAME_DELAY).
+    """Input options that decode `path` on a hardware decoder where that gives
+    software's frames exactly (hardware_decoder), or else as fast as the software
+    decoder goes (DAV1D_FRAME_DELAY).
 
-    Only for codecs checked frame by frame against software. H.264 was
-    bit-identical on every frame of two films. HEVC on 1,920 frames of four
-    (8- and 10-bit, 1080p and 4K, HDR10 and Dolby Vision), 96 frames at each of
-    five points, decoded from a seek as the grain estimate decodes. AV1 is not
-    trusted: on
-    jellyfin-ffmpeg 8.1.3-2 av1_rkmpp applies grain exactly, and matched dav1d
-    on encodes 1920, 1918 and 954 wide, but on a 1202-wide one 151,522 of
-    152,518 frames came out different (luma median 16.9 dB): MPP sizes its
-    reference buffers from the unpadded width, which overflows at about one
-    10-bit width in five (TECHNICAL.md has the formula). `grain` is kept
-    for the day AV1 qualifies: av1_rkmpp cannot leave grain off, so only the
-    grain=True decode could move.
-    Deinterlacing is on by default in these decoders and would alter the
-    frames, so it is turned off.
+    `grain` is whether AV1 film grain is to be applied: no hardware decoder takes
+    AV1 here (HARDWARE_CODECS), and if one ever does, only the grain=True decode
+    could move, since none can leave grain off.
     """
-    codec = _video_codec(chain.ffprobe, path)
-    decoder = f"{codec}_rkmpp"
-    if codec in EXACT_RKMPP and decoder in chain.rkmpp_decoders:
-        return ["-c:v", decoder, "-deint", "0"]
-    return software_decode_args(chain, codec)
+    del grain
+    method = hardware_decoder(chain, path)
+    codec = _video(chain.ffprobe, path).codec
+    return hardware_args(method, codec) if method else software_decode_args(chain, codec)
 
 
 def software_decode_args(chain: Toolchain, codec: str) -> list[str]:

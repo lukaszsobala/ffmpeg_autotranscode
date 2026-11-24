@@ -568,6 +568,23 @@ if __name__ == "__main__":
     unittest.main()
 
 
+def decode_with(chain: Toolchain, codec: str, *, grain: bool = True, times: int = 1,
+                matching: bool = True) -> list[str]:
+    """verify.decode_args for a film in `codec`, asked `times` times, every
+    hardware decoder's earlier answer forgotten first. `matching`: every decoder
+    gives software's frames; else the caller fakes verify._frame_sums."""
+    verify._decoders.clear()
+    video = verify._Video(codec, "yuv420p", 600.0)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(unittest.mock.patch.object(verify, "_video", return_value=video))
+        if matching:
+            stack.enter_context(unittest.mock.patch.object(
+                verify, "_frame_sums", return_value=["0, 0, 0, 1, 100, same"]))
+        for _ in range(times):
+            argv = verify.decode_args(chain, Path("/x.mkv"), grain=grain)
+    return argv
+
+
 def make_chain(**overrides: Any) -> Toolchain:
     base: dict[str, Any] = dict(
         ffmpeg="ffmpeg", ffprobe="ffprobe", av1an="av1an",
@@ -2053,9 +2070,9 @@ class TestGrainRetention(unittest.TestCase):
         self.assertAlmostEqual(verify.retention([4.0, 4.0], [1.0, 1.0]), 0.5)
 
     def decoder(self, codec: str, *, grain: bool, rkmpp: set[str] | None = None) -> list[str]:
-        chain = make_chain(rkmpp_decoders={"h264_rkmpp", "av1_rkmpp"} if rkmpp is None else rkmpp)
-        with unittest.mock.patch.object(verify, "_video_codec", return_value=codec):
-            return verify.decode_args(chain, Path("/x.mkv"), grain=grain)
+        rkmpp = {"h264_rkmpp", "av1_rkmpp"} if rkmpp is None else rkmpp
+        chain = make_chain(rkmpp_decoders=rkmpp, hardware_decode=("rkmpp",) if rkmpp else ())
+        return decode_with(chain, codec, grain=grain)
 
     def test_hardware_decodes_what_it_decodes_exactly(self):
         self.assertEqual(self.decoder("h264", grain=True), ["-c:v", "h264_rkmpp", "-deint", "0"])
@@ -5126,17 +5143,117 @@ class TestSvtfgDependency(unittest.TestCase):
         self.assertIn("svtfg", versions.fixes(list(checks.values())))
 
     def test_hevc_decodes_on_the_video_engine(self):
-        chain = make_chain(rkmpp_decoders={"hevc_rkmpp"})
-        with unittest.mock.patch.object(verify, "_video_codec", return_value="hevc"):
-            self.assertEqual(verify.decode_args(chain, Path("/x.mkv"), grain=True),
-                             ["-c:v", "hevc_rkmpp", "-deint", "0"])
+        chain = make_chain(rkmpp_decoders={"hevc_rkmpp"}, hardware_decode=("rkmpp",))
+        self.assertEqual(decode_with(chain, "hevc"), ["-c:v", "hevc_rkmpp", "-deint", "0"])
 
     def test_dav1d_keeps_frames_in_flight(self):
         chain = make_chain(decoders={"libdav1d"})
-        with unittest.mock.patch.object(verify, "_video_codec", return_value="av1"):
-            self.assertEqual(verify.decode_args(chain, Path("/x.mkv"), grain=False),
-                             verify.DAV1D_FRAME_DELAY)
+        self.assertEqual(decode_with(chain, "av1", grain=False), verify.DAV1D_FRAME_DELAY)
         self.assertEqual(verify.software_decode_args(make_chain(), "av1"), [])
+
+
+class TestHardwareDecode(unittest.TestCase):
+    """Hardware decoders beyond Rockchip's, each kept only where it matches software."""
+
+    def sums(self, wrong: set[str] = frozenset(), broken: set[str] = frozenset()):
+        calls: list[list[str]] = []
+
+        def fake(chain, path, decode, start, pix_fmt):
+            calls.append(list(decode))
+            method = (decode[decode.index("-hwaccel") + 1] if "-hwaccel" in decode
+                      else "rkmpp" if decode else "")
+            if method in broken:
+                raise CommandError(["ffmpeg"], 1, "[AVHWDeviceContext @ 0x5] Device creation "
+                                   "failed: -5.\nError opening output files: I/O error")
+            return ["0, 0, 0, 1, 100, other" if method in wrong else "0, 0, 0, 1, 100, same"]
+        return calls, unittest.mock.patch.object(verify, "_frame_sums", side_effect=fake)
+
+    def test_vaapi_on_a_pc(self):
+        calls, patch = self.sums()
+        with patch:
+            argv = decode_with(make_chain(hardware_decode=("vaapi",)), "hevc", matching=False)
+        self.assertEqual(argv, ["-hwaccel", "vaapi"])
+        # Two stretches, each decoded both ways.
+        self.assertEqual(calls, [["-hwaccel", "vaapi"], [], ["-hwaccel", "vaapi"], []])
+
+    def test_other_frames_mean_software(self):
+        _, patch = self.sums(wrong={"cuda"})
+        with patch, self.assertLogs(util.log, "WARNING") as logged:
+            argv = decode_with(make_chain(hardware_decode=("cuda",)), "h264", matching=False)
+        self.assertEqual(argv, [])
+        self.assertIn("came out different from software", logged.output[0])
+
+    def test_a_decoder_that_fails_gives_way_to_the_next(self):
+        _, patch = self.sums(broken={"cuda"})
+        with patch, self.assertLogs(util.log, "INFO") as logged:
+            argv = decode_with(make_chain(hardware_decode=("cuda", "vaapi")), "h264",
+                               matching=False)
+        self.assertEqual(argv, ["-hwaccel", "vaapi"])
+        self.assertIn("with cuda: failed: Device creation failed: -5.", "\n".join(logged.output))
+
+    def test_each_film_is_checked_once(self):
+        calls, patch = self.sums()
+        chain = make_chain(hardware_decode=("vaapi",))
+        with patch:
+            decode_with(chain, "h264", times=3, matching=False)
+        self.assertEqual(len(calls), 4)
+
+    def test_rkmpp_only_for_the_codecs_it_has(self):
+        _, patch = self.sums()
+        chain = make_chain(rkmpp_decoders={"h264_rkmpp"}, hardware_decode=("rkmpp", "vaapi"))
+        with patch:
+            self.assertEqual(decode_with(chain, "hevc", matching=False), ["-hwaccel", "vaapi"])
+
+    def test_codecs_decoders_may_differ_on_stay_in_software(self):
+        calls, patch = self.sums()
+        with patch:
+            for codec in ("mpeg2video", "vc1", "av1"):
+                self.assertEqual(decode_with(make_chain(hardware_decode=("vaapi",)), codec,
+                                             matching=False), [])
+        self.assertEqual(calls, [])
+
+    def chain_with(self, setting: str, hwaccels: set[str], devices: set[str] = frozenset(),
+                   rkmpp: set[str] = frozenset(),
+                   opens: set[str] = frozenset(config.HARDWARE_DECODERS)) -> tuple[str, ...]:
+        chain = make_chain(hwaccels=hwaccels, rkmpp_decoders=set(rkmpp))
+        with tempfile.TemporaryDirectory() as tmp:
+            dri = Path(tmp) / "dri"
+            dri.mkdir()
+            if "dri" in devices:
+                (dri / "renderD128").touch()
+            nvidia = Path(tmp) / "nvidiactl"
+            if "nvidia" in devices:
+                nvidia.touch()
+            with unittest.mock.patch.multiple(tools, DRI_DIR=str(dri),
+                                              NVIDIA_DEVICE=str(nvidia)), \
+                    unittest.mock.patch.object(tools, "_device_opens",
+                                               side_effect=lambda _, name: name in opens):
+                return tools._hardware_decode(setting, chain)
+
+    def test_a_build_lists_methods_the_machine_lacks(self):
+        # jellyfin-ffmpeg's x86 build lists cuda and vaapi on every machine.
+        self.assertEqual(self.chain_with("auto", {"cuda", "vaapi", "qsv"}, {"dri"}), ("vaapi",))
+        self.assertEqual(self.chain_with("auto", {"cuda", "vaapi"}, {"dri", "nvidia"}),
+                         ("cuda", "vaapi"))
+        self.assertEqual(self.chain_with("auto", {"videotoolbox"}), ("videotoolbox",))
+        self.assertEqual(self.chain_with("auto", set(), rkmpp={"h264_rkmpp"}), ("rkmpp",))
+
+    def test_a_device_that_will_not_open_is_left_out(self):
+        # An RK3588 has render nodes and jellyfin-ffmpeg lists vaapi, but no VA driver.
+        self.assertEqual(self.chain_with("auto", {"vaapi"}, {"dri"}, rkmpp={"h264_rkmpp"},
+                                         opens=set()), ("rkmpp",))
+
+    def test_the_setting_narrows_or_turns_it_off(self):
+        both = {"cuda", "vaapi"}
+        self.assertEqual(self.chain_with("vaapi", both, {"dri", "nvidia"}), ("vaapi",))
+        self.assertEqual(self.chain_with("off", both, {"dri", "nvidia"}), ())
+        self.assertEqual(self.chain_with("cuda", both, {"dri"}), ())
+
+    def test_the_setting_is_checked(self):
+        cfg = config.Config()
+        cfg.machine.hardware_decode = "nvenc"
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
 
 
 class TestRegrain(unittest.TestCase):

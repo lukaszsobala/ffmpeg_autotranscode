@@ -267,7 +267,7 @@ def check(chain: Toolchain, old: Path, new: Path, old_video: Path | None = None)
 
 
 def find_scenes(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> list[int] | None:
-    """The source's scene cuts: by av-scenechange on the video engine (cuts.detect),
+    """The source's scene cuts: by av-scenechange (cuts.detect),
     else by Av1an as `run` finds them. None when neither finds any; the encode's
     keyframes then stand in."""
     if chain.scenechange:
