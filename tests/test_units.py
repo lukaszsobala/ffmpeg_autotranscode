@@ -3915,6 +3915,67 @@ class TestGrainStepResumes(unittest.TestCase):
         self._step()
         self.assertEqual(self.built, 1)
 
+    def test_the_probe_alone_makes_no_table_and_is_kept(self):
+        self.cfg.grain.denoise_before_encode = True
+        first = pipeline._grain_step(self.info, self.chain, self.cfg, self.work,
+                                     dry_run=False, with_table=False)
+        again = pipeline._grain_step(self.info, self.chain, self.cfg, self.work,
+                                     dry_run=False, with_table=False)
+        self.assertEqual((self.built, self.measured), (0, 1))
+        self.assertEqual(first, again)
+        self.assertEqual(first[1], None)
+        self.assertEqual(present(first[0]).denoise_filter, "hqdn3d")
+
+
+class TestDenoiseBeforeSvtfg(unittest.TestCase):
+    """grain.denoise_before_encode did nothing with the default estimator: the
+    SvtFgEssential path skipped the probe, so there was never a filter to use,
+    while `estimate` projected the denoised size."""
+
+    class Stop(Exception):
+        pass
+
+    def _encode_argv(self, denoise: bool, report: GrainReport | None = None) -> list[str]:
+        cfg = config.Config()
+        cfg.grain.estimator = "svtfg"
+        cfg.grain.denoise_before_encode = denoise
+        report = report or GrainReport(38.0, [38.0], [1.0], grainy=True,
+                                       denoise_filter="hqdn3d=1.4:1.0:6:6")
+        seen: list[list[str]] = []
+
+        def run_encode(argv, *_args, **_kwargs):
+            seen.append(argv)
+            raise self.Stop
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(pipeline.mux, "rehearse"), \
+                unittest.mock.patch.object(grain, "measure", return_value=report) as measure, \
+                unittest.mock.patch.object(grain, "build_table") as build, \
+                unittest.mock.patch.object(pipeline.resume, "check",
+                                           side_effect=lambda argv, *a, **k: (argv, None)), \
+                unittest.mock.patch.object(pipeline.scenes, "detect"), \
+                unittest.mock.patch.object(pipeline.encode, "run_encode", run_encode), \
+                self.assertRaises(self.Stop):
+            pipeline._transcode(Path("/library/F.mkv"), make_info(), make_info(),
+                                Path(tmp) / "F.av1.mkv", None, Path(tmp), make_chain(), cfg,
+                                0.0, dry_run=False)
+        self.assertEqual(build.call_count, 0, "SvtFgEssential makes its table after")
+        self.assertEqual(measure.call_count, 1 if denoise else 0)
+        return seen[0]
+
+    def test_the_encode_is_denoised_when_asked(self):
+        argv = self._encode_argv(denoise=True)
+        self.assertIn("-vf hqdn3d=1.4:1.0:6:6", argv[argv.index("-f") + 1])
+
+    def test_by_default_no_probe_runs_and_nothing_is_denoised(self):
+        argv = self._encode_argv(denoise=False)
+        self.assertNotIn("-f", argv)
+
+    def test_a_source_the_probe_finds_clean_is_not_denoised(self):
+        clean = GrainReport(48.0, [48.0], [1.0], grainy=False, denoise_filter="")
+        argv = self._encode_argv(denoise=True, report=clean)
+        self.assertNotIn("-f", argv)
+
 
 class TestScenesResume(unittest.TestCase):
     """Scene detection takes hours on a 4K film. Av1an only resumes once it has

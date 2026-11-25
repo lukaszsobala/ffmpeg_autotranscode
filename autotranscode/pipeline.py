@@ -744,8 +744,11 @@ def _grain_key(read: MediaInfo, chain: Toolchain, cfg: Config) -> str:
 
 def _grain_step(
     read: MediaInfo, chain: Toolchain, cfg: Config, work: Path, *, dry_run: bool,
+    with_table: bool = True,
 ) -> tuple[grain.GrainReport | None, Path | None]:
     """The grain probe and table, or the ones an interrupted run left in `work`.
+    Without `with_table`, the probe alone: SvtFgEssential makes its table after
+    the encode, but a denoise before it needs the probe's choice of filter.
 
     Av1an resumes from its finished chunks, and the grain step before it should not
     be paid for again on every restart either. It is redone only when a setting it
@@ -775,7 +778,7 @@ def _grain_step(
         grainy = report.grainy
     if dry_run:
         return report, None
-    if grainy:
+    if grainy and with_table:
         table = grain.build_table(read, chain, cfg, report, work)
         if table is None:
             # Not saved: a missing tool or a failed run may well be fixed by the next.
@@ -826,15 +829,26 @@ def _transcode(
             log.error("  the mux fails on this file's tracks, so it is not encoded")
             raise
     # SvtFgEssential's table comes after the encode: it needs the scene list, and
-    # is timed by the encode's own frames.
+    # is timed by the encode's own frames. Before the encode it needs only the
+    # probe, and that only to pick a denoiser.
     whole_film = cfg.grain.estimator == "svtfg" and cfg.grain.mode != "never"
-    report, table = (None, None) if whole_film else _grain_step(read, chain, cfg, work,
-                                                                 dry_run=dry_run)
+    if whole_film:
+        report, table = ((_grain_step(read, chain, cfg, work, dry_run=dry_run,
+                                      with_table=False)[0], None)
+                         if cfg.grain.denoise_before_encode else (None, None))
+    else:
+        report, table = _grain_step(read, chain, cfg, work, dry_run=dry_run)
 
-    # Only ever denoise when there is a table to put the grain back with, and by
-    # default not even then: see grain.denoise_before_encode.
+    # Only ever denoise when the grain will be put back -- with the table made
+    # already, or by SvtFgEssential, which estimates from the source as it is --
+    # and by default not even then: see grain.denoise_before_encode.
     denoise = (report.denoise_filter
-               if (report and table and cfg.grain.denoise_before_encode) else "")
+               if (report and (table or whole_film) and cfg.grain.denoise_before_encode)
+               else "")
+    # For the grain steps after the encode. Calibration may otherwise judge that
+    # the encode kept enough texture and add no grain, which a denoised encode
+    # never has. Only there: the ledger's settings key comes from `cfg`.
+    grain_cfg = replace(cfg, grain=replace(cfg.grain, mode="always")) if denoise else cfg
 
     encoded = work / "encoded.mkv"
     encoded.unlink(missing_ok=True)
@@ -880,7 +894,8 @@ def _transcode(
 
     video = encoded
     if whole_film:
-        video, table = film_grain(read, encoded, scenes.starts(scene_list), chain, cfg, work)
+        video, table = film_grain(read, encoded, scenes.starts(scene_list), chain, grain_cfg,
+                                  work)
     elif table:
         grainy = work / "grainy.mkv"
         # No fallback here on purpose. The encoder strips grain whether or not it
@@ -890,7 +905,7 @@ def _transcode(
         grain.apply_table(encoded, table, chain, grainy)
         keep = True
         if cfg.grain.calibrate:
-            keep = _calibrate_grain(read, encoded, grainy, table, chain, cfg, work)
+            keep = _calibrate_grain(read, encoded, grainy, table, chain, grain_cfg, work)
         if keep:
             video = grainy
             log.info("  film grain applied from table")
