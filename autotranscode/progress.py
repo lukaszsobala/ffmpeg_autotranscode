@@ -75,9 +75,11 @@ QUIET = re.compile(r"(?:INFO\b|Scene detection$|Creating lwi index file\b)")
 
 PARTIAL_BLOCKS = " ▏▎▍▌▋▊▉"
 
-# What the bars drawn now are about, and which step of it; see `showing`, `noting`.
+# What the bars drawn now are about, which step of it, and what part of a longer
+# whole they show; see `showing`, `noting`, `spanning`.
 _title = ""
 _note = ""
+_span: Span | None = None
 
 
 @contextlib.contextmanager
@@ -100,6 +102,29 @@ def noting(note: str) -> Iterator[None]:
         yield
     finally:
         _note = before
+
+
+@contextlib.contextmanager
+def spanning(span: Span) -> Iterator[None]:
+    """Draw every bar inside the block as progress through `span`'s whole."""
+    global _span
+    before, _span = _span, span
+    try:
+        yield
+    finally:
+        _span = before
+
+
+@dataclass(frozen=True, slots=True)
+class Span:
+    """Frames from `start` of a whole `total` frames long, begun at `started`
+    (time.monotonic()). Scene detection runs Av1an once per part of the film, and
+    each run's bar counts that part alone: from 0% to 100% every few minutes, with
+    the time left for the part. Spanned, it shows the whole film."""
+
+    start: int
+    total: int
+    started: float
 
 
 @dataclass(slots=True)
@@ -139,6 +164,50 @@ def parse(text: str) -> tuple[Status | None, str]:
         text = pattern.sub("", text)
         break
     return status, text.strip()
+
+
+# Av1an's speed, as indicatif shows it: frames a second, or seconds a frame below one.
+RATE = re.compile(r"(?P<value>[\d.]+) *(?P<unit>fps|s/fr)")
+
+
+def frames_per_second(rate: str) -> float | None:
+    found = RATE.search(rate)
+    try:
+        value = float(found["value"]) if found else 0.0
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value if found["unit"] == "fps" else 1 / value
+
+
+def clock(seconds: float) -> str:
+    """As Av1an shows the time taken: 1:02:03."""
+    hours, rest = divmod(max(0, int(seconds)), 3600)
+    return f"{hours}:{rest // 60:02d}:{rest % 60:02d}"
+
+
+def short_duration(seconds: float) -> str:
+    """As Av1an shows the time left, a little finer: 35h, 2h10m, 12m, 40s."""
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    if hours >= 10:
+        return f"{hours}h"
+    if hours:
+        return f"{hours}h{rest // 60:02d}m"
+    return f"{rest // 60}m" if rest >= 60 else f"{rest}s"
+
+
+def whole(status: Status, span: Span, now: float) -> Status:
+    """`status`, of one run over part of `span`, as progress through all of it.
+    The time left is at the part's speed, the time taken since the span began."""
+    pos = min(span.start + status.pos, span.total)
+    fps = frames_per_second(status.rate)
+    return Status(
+        elapsed=clock(now - span.started), pos=pos, rate=status.rate,
+        percent=100 * pos // span.total, length=span.total,
+        eta=short_duration((span.total - pos) / fps) if fps else status.eta,
+        chunks=status.chunks, kbps=status.kbps, size=status.size)
 
 
 def bar(fraction: float, width: int) -> str:
@@ -226,11 +295,12 @@ class Screen:
     whatever else is written going above them. Safe to call from any thread."""
 
     def __init__(self, out: TextIO, width: TextIO | int | None = None, title: str = "",
-                 note: str = ""):
+                 note: str = "", span: Span | None = None):
         self.out = out
         self._width = width
         self.title = title   # drawn on a line above the bar
         self.note = note     # and this after it
+        self.span = span     # what the bar's figures are part of
         self.lock = threading.RLock()
         self.status: Status | None = None
         self._drawn = 0           # lines of the bar on the screen
@@ -245,6 +315,8 @@ class Screen:
         return terminal_width(self._width or self.out)
 
     def update(self, status: Status, *, now: bool = False) -> None:
+        if self.span is not None and self.span.total > 0:
+            status = whole(status, self.span, time.monotonic())
         with self.lock:
             self.status = status
             if now or time.monotonic() - self._last_draw >= REDRAW_SECONDS:
@@ -393,7 +465,7 @@ class Relay:
         import termios
 
         self.out = out or sys.stderr
-        self.screen = Screen(self.out, title=_title, note=_note)
+        self.screen = Screen(self.out, title=_title, note=_note, span=_span)
         self.quiet = quiet
         self.master, self.child_fd = pty.openpty()
         fcntl.ioctl(self.child_fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLUMNS, 0, 0))

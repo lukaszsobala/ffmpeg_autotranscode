@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,11 +27,14 @@ from . import encode, progress
 from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
-from .util import CommandError, digest, log, run_watched
+from .util import CommandError, digest, human_duration, log, run_watched
 
 # How much of the film each part of the scene detection covers. A stop loses at
 # most one part's detection; each part adds one keyframe.
 PART_SECONDS = 300
+# The share of the film, in percent, between the lines logged on how far scene
+# detection has got.
+LOG_EVERY = 10
 
 # The index Av1an makes in its temp directory for each VapourSynth chunk method,
 # under split/ (av1an-core 0.5.2 and 0.6.0, generate_loadscript_text). The parts load the
@@ -113,6 +117,10 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path, scenes: P
     down how many frames the decoder finds in the whole film, and the parts are
     planned on that from then on: a container that claims minutes more than its
     video holds would otherwise plan parts past the end.
+
+    Each part's bar is drawn as progress through the whole film, and a line is
+    logged at every LOG_EVERY percent of it: on a slow machine the step takes a
+    day, and with no terminal, the log said nothing of it.
     """
     method = encode.chunk_method(cfg, chain)
     if whole_list(scenes) or method not in INDEX_NAMES or not chain.av1an:
@@ -125,6 +133,9 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path, scenes: P
     _rename_numbered_parts(folder, length)
     index_file = (work / "av1an" / "split" / INDEX_NAMES[method]).absolute()
     announced = False
+    started = time.monotonic()
+    before: int | None = None   # frames detected in earlier runs
+    logged = 0                  # the last share of the film logged, in percent
     try:
         while True:
             ranges = plan(known_frames(folder) or estimate, length)
@@ -141,13 +152,23 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path, scenes: P
                 log.info("  detecting scenes in %d parts of %d minutes, each kept as it "
                          "finishes%s", len(ranges), PART_SECONDS // 60,
                          f" ({done} done before)" if done else "")
+            total = known_frames(folder) or estimate
+            done = total - sum(_length(bounds, total) for bounds in todo)
+            if before is None:
+                before = done
+            elif (share := 100 * done // total) >= logged + LOG_EVERY and todo:
+                logged = share - share % LOG_EVERY
+                log.info("  %s", _progress_line(done, total, len(ranges) - len(todo),
+                                                len(ranges), done - before,
+                                                time.monotonic() - started))
             if not todo:
                 break
             folder.mkdir(parents=True, exist_ok=True)
             index_file.parent.mkdir(parents=True, exist_ok=True)
             number = ranges.index(todo[0]) + 1
             log.debug("scene detection, part %d of %d", number, len(ranges))
-            with progress.noting(f"scenes, part {number} of {len(ranges)}"):
+            with (progress.noting(f"scenes, part {number} of {len(ranges)}"),
+                  progress.spanning(progress.Span(todo[0][0], total, started))):
                 _detect_part(read, chain, cfg, method, index_file, *todo[0], folder)
         parts = [json.loads(part_path(folder, *bounds).read_text(encoding="utf-8"))
                  for bounds in ranges]
@@ -160,8 +181,25 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path, scenes: P
     written.write_text(json.dumps(merged), encoding="utf-8")
     os.replace(written, scenes)
     shutil.rmtree(folder, ignore_errors=True)
-    log.info("  scene list complete: %d scenes, %d chunks",
-             len(merged["scenes"]), len(merged["split_scenes"]))
+    log.info("  scene list complete: %d scenes, %d chunks, in %s",
+             len(merged["scenes"]), len(merged["split_scenes"]),
+             human_duration(time.monotonic() - started))
+
+
+def _length(bounds: tuple[int, int | None], total: int) -> int:
+    start, end = bounds
+    return max(0, (total if end is None else end) - start)
+
+
+def _progress_line(done: int, total: int, parts_done: int, parts: int, detected: int,
+                   seconds: float) -> str:
+    """How far scene detection has got. The time left is at this run's speed:
+    parts kept from an earlier run count as done, not as frames it detected."""
+    line = (f"scenes: {100 * done // total}% ({parts_done} of {parts} parts), "
+            f"{human_duration(seconds)} so far")
+    if detected > 0 and seconds > 0:
+        line += f", about {human_duration((total - done) * seconds / detected)} left"
+    return line
 
 
 def starts(path: Path) -> list[int] | None:

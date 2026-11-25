@@ -841,7 +841,10 @@ starts is given a locale verified to exist, so transcodes are immune.
   fails leaves detection to Av1an in one go, as before. The probe's frame count
   plans only the first part: each part's script writes down the frames the decoder
   finds in the whole film, and the rest are planned on that, so a container that
-  overstates its length cannot plan parts past the end.
+  overstates its length cannot plan parts past the end. Each part's progress bar
+  is drawn as progress through the whole film, with the time left for all of it,
+  and a line is logged at every 10% of the film (parts kept from an earlier run
+  count as done, not toward the speed).
 - **The keyframe scan** of the `hybrid` method (`ffprobe -show_frames` over the
   whole film) is kept the same way, by an `ffprobe` wrapper on Av1an's PATH that
   saves the scan once it completes and replays it on a rerun.

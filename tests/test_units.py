@@ -4059,6 +4059,38 @@ class TestScenesInParts(unittest.TestCase):
         self._detect()
         self.assertEqual(self.ran, [(14400, 21600), (21600, None)])
 
+    def test_progress_is_logged_through_the_film(self):
+        with self.assertLogs("autotranscode", level="INFO") as logs:
+            self._detect()
+        lines = [line for line in logs.output if "scenes: " in line]
+        # 30,000 frames in parts of 7,200: 24%, 48% and 72% done before the next part.
+        self.assertEqual([line.split("scenes: ")[1].split(",")[0] for line in lines],
+                         ["24% (1 of 4 parts)", "48% (2 of 4 parts)", "72% (3 of 4 parts)"])
+        self.assertTrue(all("so far" in line for line in lines))
+
+    def test_parts_from_an_earlier_run_are_not_logged_as_progress(self):
+        self.fail_at = 21600
+        with self.assertRaises(KeyboardInterrupt):
+            self._detect()
+        self.fail_at = None
+        with self.assertLogs("autotranscode", level="INFO") as logs:
+            self._detect()
+        self.assertFalse([line for line in logs.output if "scenes: " in line])
+        self.assertTrue(any("3 done before" in line for line in logs.output))
+
+    def test_the_bar_of_each_part_spans_the_whole_film(self):
+        spans: list[progress.Span | None] = []
+        original = self._fake_av1an
+
+        def watching(argv, check, **kwargs):
+            spans.append(progress._span)
+            original(argv, check, **kwargs)
+        with unittest.mock.patch.object(scenes, "run_watched", watching):
+            self._detect()
+        self.assertEqual([(span.start, span.total) for span in spans if span],
+                         [(0, 28_800), (7200, 30_000), (14400, 30_000), (21600, 30_000)])
+        self.assertIsNone(progress._span)
+
     def test_parts_named_by_number_are_kept(self):
         # As the first version named them: 0000.json, 0001.json...
         scene_list = scenes.prepare(self.info, self.chain, self.cfg, self.work)
@@ -4579,6 +4611,36 @@ class TestProgressRedraw(unittest.TestCase):
         self.assertIn("INFO encode_file: scenecut: found 33 scene(s)", lines)
         self.assertFalse([line for line in lines if "fps, eta" in line or "something" in line])
         self.assertIn("6,107/7,333 frames", lines[-1])
+
+    def test_a_part_of_the_scene_detection_is_drawn_as_the_whole_film(self):
+        # Part 3 of 4, frames 14,400 to 21,600 of 28,800, a quarter of the way in.
+        span = progress.Span(start=14_400, total=28_800, started=1000.0)
+        status, _ = progress.parse("00:01:00 ▐██  ▌  25% 1800/7200 (24 fps, eta 3m)")
+        assert status is not None
+        whole = progress.whole(status, span, now=1000.0 + 3725)
+        self.assertEqual((whole.pos, whole.length, whole.percent), (16_200, 28_800, 56))
+        self.assertEqual(whole.eta, "8m")            # 12,600 frames left at 24 fps
+        self.assertEqual(whole.elapsed, "1:02:05")   # since the first part began
+        slow, _ = progress.parse("00:00:53 ▐ ▌   0% 91/7200 (0.5 s/fr, eta 59m)")
+        assert slow is not None
+        self.assertEqual(progress.whole(slow, span, now=1000.0).eta, "1h59m")
+
+    def test_a_spanned_screen_draws_the_whole(self):
+        out = io.StringIO()
+        screen = progress.Screen(out, width=120, span=progress.Span(7200, 28_800, 0.0))
+        feed = progress.Feed(screen)
+        feed.feed("\r\x1b[2K00:01:21 ▐████▌  50% 3600/7200 (76.06 fps, eta 47s)".encode())
+        feed.end()
+        screen.finish()
+        last = progress.ESCAPE.sub("", out.getvalue()).replace("\r", "\n").splitlines()[-1]
+        self.assertIn(" 37%", last)
+        self.assertIn("10,800/28,800 frames", last)
+
+    def test_av1an_speeds_are_read(self):
+        self.assertEqual(progress.frames_per_second("26.63 fps"), 26.63)
+        self.assertEqual(progress.frames_per_second("0.25 s/fr"), 4.0)
+        self.assertIsNone(progress.frames_per_second("0.00 fps"))
+        self.assertIsNone(progress.frames_per_second("fast"))
 
     def test_every_width_fits(self):
         status, _ = progress.parse(progress.ESCAPE.sub("", BAR_LINE))
