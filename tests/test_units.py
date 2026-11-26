@@ -5579,6 +5579,41 @@ class TestSceneCuts(unittest.TestCase):
         cfg.encode.sc_method = "fast"
         self.assertIn("1", cuts.detect_command(make_chain(scenechange="/bin/asc"), cfg))
 
+    def _detect_with_parts_done(self, tmp: str, kept: int = 0) -> list[str]:
+        """Run cuts.detect over 100,000 frames in parts of 10,000, the work of each
+        part faked; the first `kept` parts are there from an earlier run."""
+        info = make_info(fps=100000 / 3000)
+        done = [cuts.essential.Part(index * 10_000, (index + 1) * 10_000, (0,))
+                for index in range(10)]
+
+        def fake_part(chain, cfg, read, times, origin, part, prefilter, folder, cores, children):
+            return None
+        reads = iter([[0]] * kept + [None] * (10 - kept))
+        chain = make_chain(big_cores="", scenechange="/bin/asc")
+        with unittest.mock.patch.object(cuts.encode, "frame_times",
+                                        return_value=list(range(100_000))), \
+                unittest.mock.patch.object(cuts, "plan", return_value=done), \
+                unittest.mock.patch.object(cuts.essential, "start_time", return_value=0.0), \
+                unittest.mock.patch.object(cuts.verify, "hardware_decoder", return_value=None), \
+                unittest.mock.patch.object(cuts, "_read_part",
+                                           side_effect=lambda *_: next(reads, [0])), \
+                unittest.mock.patch.object(cuts, "_detect_part", fake_part), \
+                self.assertLogs("autotranscode", level="INFO") as logs:
+            cuts.detect(info, chain, config.Config(), Path(tmp))
+        return [line for line in logs.output if "scene detection: " in line]
+
+    def test_scene_detection_logs_every_tenth_of_the_film(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = self._detect_with_parts_done(tmp)
+        self.assertEqual([line.split("scene detection: ")[1] for line in lines],
+                         [f"{share}%" for share in range(10, 101, 10)])
+
+    def test_scene_detection_does_not_report_parts_kept_from_an_earlier_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = self._detect_with_parts_done(tmp, kept=5)
+        self.assertEqual([line.split("scene detection: ")[1] for line in lines],
+                         [f"{share}%" for share in range(60, 101, 10)])
+
     def test_a_kept_list_is_used_only_for_the_film_it_fits(self):
         text = cuts.attachment_text([0, 58, 125], 200)
         self.assertEqual(cuts.parse(text, 200), cuts.Kept([0, 58, 125], ""))
