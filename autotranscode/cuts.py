@@ -185,13 +185,21 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> list[i
 
     started = time.monotonic()
     children = Children()
+    # A line at every tenth of the film, as the grain estimate gives. Parts kept
+    # from an earlier run count as done.
+    finished = frames - sum(part.frames for part in todo)
+    reported = 10 * finished // frames
     with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
-        futures = [pool.submit(_detect_part, chain, cfg, read, times, origin, part,
-                               prefilter, folder, cores, children)
-                   for part in todo]
+        futures = {pool.submit(_detect_part, chain, cfg, read, times, origin, part,
+                               prefilter, folder, cores, children): part
+                   for part in todo}
         try:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+                finished += futures[future].frames
+                if 10 * finished // frames > reported:
+                    reported = 10 * finished // frames
+                    log.info("  scene detection: %d%%", 10 * reported)
         except BaseException:
             children.stop(pool)
             raise
