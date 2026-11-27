@@ -366,11 +366,20 @@ def _frame_sums(chain: Toolchain, path: Path, decode: Sequence[str], start: floa
 def _reason(exc: Exception) -> str:
     """Why a decode failed, in a line. ffmpeg's first says why ("Failed to
     initialise VAAPI connection"); the last only that an output could not be
-    opened. libva's banner, which QSV prints before anything, is passed over."""
+    opened. libva's banner, which QSV prints before anything, is passed over.
+
+    Frames out of timestamp order reach -xerror as the muxer's "Non-monotonic
+    DTS", which reads like a fault in the file: said as what it is. h264_rkmpp
+    does it at the start of a stream counting picture order in steps of 1
+    (TECHNICAL.md, "Rockchip's H.264 output order")."""
     if not isinstance(exc, CommandError):
         return str(exc)[:160]
     said = [re.sub(r"^(\[[^]]*\] *)+", "", line) for line in exc.stderr.strip().splitlines()
             if not line.startswith("libva info:")]
+    for line in said:
+        if match := re.match(r"Non-monotonic DTS; previous: (-?\d+), current: (-?\d+)", line):
+            return (f"frames came out of timestamp order ({match[1]} before {match[2]}, "
+                    "in the output's ticks)")
     return said[0][:160] if said else f"exit {exc.returncode}"
 
 

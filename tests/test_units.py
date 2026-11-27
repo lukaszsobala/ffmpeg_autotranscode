@@ -5480,6 +5480,12 @@ class TestHardwareDecode(unittest.TestCase):
                             "Trying to open /usr/lib/dri/iHD_drv_video.so\n[h264_qsv @ 0x5] "
                             "video_get_buffer: image parameters invalid\n")
         self.assertEqual(verify._reason(said), "video_get_buffer: image parameters invalid")
+        # What h264_rkmpp's early output looks like under -xerror: said plainly.
+        said = CommandError(["ffmpeg"], 234, "[vost#0:0/rawvideo @ 0x5] Non-monotonic DTS; "
+                            "previous: 2, current: 1; Error submitting a packet to the muxer: "
+                            "Invalid argument\n[out#0/framemd5 @ 0x6] Error muxing a packet\n")
+        self.assertEqual(verify._reason(said), "frames came out of timestamp order "
+                                               "(2 before 1, in the output's ticks)")
         # The rest of the run takes the next decoder that passes the check.
         self.assertEqual(self.later, self.VAAPI)
 

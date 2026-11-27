@@ -605,6 +605,25 @@ decode feeding Y4M runs at about 240 frames/s at 1080p and 65-78 at 4K, against
 through the same per-film check; they have not been measured here. The Rockchip
 figures predate the check comparing the file's own timestamps.
 
+**Rockchip's H.264 output order.** MPP's H.264 decoder (jellyfin-ffmpeg 8.1.3,
+MPP `jellyfin-mpp-next` 848b885) hands a frame out as soon as its picture order
+count is at most the last one out plus `poc_interval`, which starts at 2 and
+drops to 1 only once it has seen an odd step (`output_dpb_normal` in
+`mpp/codec/dec/h264/h264d_dpb.c`). Most encoders count in steps of 2. One that
+counts in steps of 1 and opens with I 0, P 2, B 1 gets the P out before the B
+is decoded: frames 0, 2, 1, then the right order from there, `poc_interval`
+being 1. ffmpeg's muxer then sees timestamps going back, and under -xerror the
+decode fails with "Non-monotonic DTS; previous: 2, current: 1"; without it,
+ffmpeg exits 0 with the two frames swapped. Some Blu-ray H.264 counts in steps
+of 1 and opens that way. From 30 seeks into such a film none came out of
+order, and the regrain's passes start 3 s before the frames they take, so a
+swap there would fall in what they drop. At the start of the file the per-film
+check fails (`CHECK_AT` starts at 0), so these films decode in software. Before
+0.4.0 the check began at 30%, with no -xerror, so a swap at the start went
+unseen; on a film opening with identical black frames it changes nothing.
+HEVC is not affected: MPP's H.265 decoder bumps by `num_reorder_pics` and hands
+out early only the frame whose count is the next one.
+
 **On Intel, QSV comes first** because it copies frames back faster than VA-API,
 and a hardware decode there is not necessarily faster than software's. On a Core
 Ultra 7 258V (Lunar Lake, Linux 7.4.0-rc4, `xe` driver, jellyfin-ffmpeg 8.1.3)
