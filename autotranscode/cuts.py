@@ -190,9 +190,12 @@ def detect(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path) -> list[i
     finished = frames - sum(part.frames for part in todo)
     reported = 10 * finished // frames
     with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
-        futures = {pool.submit(_detect_part, chain, cfg, read, times, origin, part,
-                               prefilter, folder, cores, children): part
-                   for part in todo}
+        def one(part: essential.Part) -> None:
+            verify.with_fallback(chain, [(read.path, True)], lambda: _detect_part(
+                chain, cfg, read, times, origin, part, prefilter, folder, cores, children),
+                children.stopping)
+
+        futures = {pool.submit(one, part): part for part in todo}
         try:
             for future in concurrent.futures.as_completed(futures):
                 future.result()

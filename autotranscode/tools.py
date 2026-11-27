@@ -192,6 +192,8 @@ def _hardware_decode(setting: str, chain: Toolchain) -> tuple[str, ...]:
     present = {
         "rkmpp": bool(chain.rkmpp_decoders),
         "cuda": "cuda" in chain.hwaccels and os.path.exists(NVIDIA_DEVICE),
+        # QSV's device opens only on Intel.
+        "qsv": "qsv" in chain.hwaccels and any(Path(DRI_DIR).glob("renderD*")),
         "vaapi": "vaapi" in chain.hwaccels and any(Path(DRI_DIR).glob("renderD*")),
         "videotoolbox": "videotoolbox" in chain.hwaccels,
     }

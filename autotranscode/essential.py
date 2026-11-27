@@ -267,9 +267,12 @@ def frames_table(read: MediaInfo, chain: Toolchain, cfg: Config, work: Path,
     finished = len(times) - estimating
     reported = 10 * finished // len(times)
     with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
-        futures = {pool.submit(_run_part, chain, cfg, read, times, origin, part,
-                               prefilter, folder, children): part
-                   for part in todo}
+        def one(part: Part) -> None:
+            verify.with_fallback(chain, [(read.path, True)], lambda: _run_part(
+                chain, cfg, read, times, origin, part, prefilter, folder, children),
+                children.stopping)
+
+        futures = {pool.submit(one, part): part for part in todo}
         try:
             for future in concurrent.futures.as_completed(futures):
                 future.result()

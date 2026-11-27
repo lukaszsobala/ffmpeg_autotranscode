@@ -45,9 +45,10 @@ CHUNK_METHODS = {"auto", "hybrid", "lsmash", "ffms2", "bestsource", "select", "s
 
 # Hardware decoders for the passes autotranscode runs itself (scene cuts, the
 # grain estimate and calibration, verify), in the order they are tried: Rockchip's
-# video engine, NVIDIA's NVDEC, VA-API (Intel, AMD), Apple's VideoToolbox. Av1an
+# video engine, NVIDIA's NVDEC, Intel's Quick Sync, VA-API (AMD, and Intel again:
+# it copies frames back more slowly than QSV does), Apple's VideoToolbox. Av1an
 # and the encoder decode in software whatever this says.
-HARDWARE_DECODERS = ("rkmpp", "cuda", "vaapi", "videotoolbox")
+HARDWARE_DECODERS = ("rkmpp", "cuda", "qsv", "vaapi", "videotoolbox")
 
 
 @dataclass(slots=True)

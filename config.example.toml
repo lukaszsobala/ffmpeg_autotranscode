@@ -32,10 +32,11 @@ nice = 10
 
 # Hardware decoding for the passes autotranscode runs itself (scene cuts, the
 # grain estimate and calibration, verify); Av1an and the encoder always decode in
-# software. "auto" tries rkmpp (Rockchip), cuda (NVIDIA), vaapi (Intel, AMD) and
-# videotoolbox (macOS), whichever this ffmpeg has and whose device opens, in that
-# order, and uses one for a film only after a stretch of it decoded exactly as
-# software decodes it. "off" decodes in software; a name tries only that one.
+# software. "auto" tries rkmpp (Rockchip), cuda (NVIDIA), qsv (Intel), vaapi (AMD,
+# and Intel where qsv will not do) and videotoolbox (macOS), whichever this ffmpeg
+# has and whose device opens, in that order, and uses one for a film only after a
+# stretch of it decoded exactly as software decodes it. "off" decodes in software;
+# a name tries only that one.
 hardware_decode = "auto"
 
 [paths]
