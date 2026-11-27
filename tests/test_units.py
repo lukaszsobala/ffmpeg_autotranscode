@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -569,12 +570,14 @@ if __name__ == "__main__":
 
 
 def decode_with(chain: Toolchain, codec: str, *, grain: bool = True, times: int = 1,
-                matching: bool = True) -> list[str]:
+                matching: bool = True, width: int = 1920,
+                pix_fmt: str = "yuv420p") -> list[str]:
     """verify.decode_args for a film in `codec`, asked `times` times, every
     hardware decoder's earlier answer forgotten first. `matching`: every decoder
     gives software's frames; else the caller fakes verify._frame_sums."""
     verify._decoders.clear()
-    video = verify._Video(codec, "yuv420p", 600.0)
+    verify._passed_over.clear()
+    video = verify._Video(codec, pix_fmt, 600.0, width)
     with contextlib.ExitStack() as stack:
         stack.enter_context(unittest.mock.patch.object(verify, "_video", return_value=video))
         if matching:
@@ -2075,7 +2078,8 @@ class TestGrainRetention(unittest.TestCase):
         return decode_with(chain, codec, grain=grain)
 
     def test_hardware_decodes_what_it_decodes_exactly(self):
-        self.assertEqual(self.decoder("h264", grain=True), ["-c:v", "h264_rkmpp", "-deint", "0"])
+        self.assertEqual(self.decoder("h264", grain=True),
+                         ["-xerror", "-c:v", "h264_rkmpp", "-deint", "0"])
 
     def test_measurements_run_on_the_big_cores(self):
         argv = verify.ffmpeg_argv(make_chain(big_cores="4,5,6,7"))
@@ -2085,9 +2089,10 @@ class TestGrainRetention(unittest.TestCase):
     def test_a_uniform_cpu_runs_plain_ffmpeg(self):
         self.assertEqual(verify.ffmpeg_argv(make_chain()), ["ffmpeg"])
 
-    def test_av1_stays_on_the_cpu(self):
-        # av1_rkmpp decoded a 1202-wide encode wrongly (jellyfin-ffmpeg 8.1.3-2).
-        self.assertEqual(self.decoder("av1", grain=True), [])
+    def test_av1_goes_to_the_video_engine_only_with_its_grain(self):
+        self.assertEqual(self.decoder("av1", grain=True),
+                         ["-xerror", "-c:v", "av1_rkmpp", "-deint", "0"])
+        # av1_rkmpp has no way to leave film grain off.
         self.assertEqual(self.decoder("av1", grain=False), [])
 
     def test_no_rkmpp_build_means_software(self):
@@ -5117,9 +5122,9 @@ class TestSceneCalibration(unittest.TestCase):
         # Single-threaded: as many run at once as there are cores.
         self.assertEqual(argv[argv.index("-filter_complex") - 1], "1")
         self.assertEqual(argv[argv.index("-filter_complex") - 2], "-filter_complex_threads")
-        av1_inputs = [n for n, arg in enumerate(argv) if arg == "-i"][1:]
-        for at in av1_inputs:
-            self.assertEqual(argv[at - 6:at - 4], ["-threads", "1"])
+        inputs = [n for n, arg in enumerate(argv) if arg == "-i"]
+        for before, at in itertools.pairwise(inputs):
+            self.assertIn("-threads", argv[before:at])
 
 
 class TestStoppingWorkers(unittest.TestCase):
@@ -5286,7 +5291,8 @@ class TestSvtfgDependency(unittest.TestCase):
 
     def test_hevc_decodes_on_the_video_engine(self):
         chain = make_chain(rkmpp_decoders={"hevc_rkmpp"}, hardware_decode=("rkmpp",))
-        self.assertEqual(decode_with(chain, "hevc"), ["-c:v", "hevc_rkmpp", "-deint", "0"])
+        self.assertEqual(decode_with(chain, "hevc"),
+                         ["-xerror", "-c:v", "hevc_rkmpp", "-deint", "0"])
 
     def test_dav1d_keeps_frames_in_flight(self):
         chain = make_chain(decoders={"libdav1d"})
@@ -5303,7 +5309,8 @@ class TestHardwareDecode(unittest.TestCase):
         def fake(chain, path, decode, start, pix_fmt):
             calls.append(list(decode))
             method = (decode[decode.index("-hwaccel") + 1] if "-hwaccel" in decode
-                      else "rkmpp" if decode else "")
+                      else decode[decode.index("-c:v") + 1].rpartition("_")[2]
+                      if "-c:v" in decode else "")
             if method in broken:
                 raise CommandError(["ffmpeg"], 1, "[AVHWDeviceContext @ 0x5] Device creation "
                                    "failed: -5.\nError opening output files: I/O error")
@@ -5314,9 +5321,10 @@ class TestHardwareDecode(unittest.TestCase):
         calls, patch = self.sums()
         with patch:
             argv = decode_with(make_chain(hardware_decode=("vaapi",)), "hevc", matching=False)
-        self.assertEqual(argv, ["-hwaccel", "vaapi"])
-        # Two stretches, each decoded both ways.
-        self.assertEqual(calls, [["-hwaccel", "vaapi"], [], ["-hwaccel", "vaapi"], []])
+        self.assertEqual(argv, ["-xerror", "-hwaccel", "vaapi"])
+        # Three stretches, each decoded both ways.
+        hardware = ["-xerror", "-hwaccel", "vaapi"]
+        self.assertEqual(calls, [hardware, [], hardware, [], hardware, []])
 
     def test_other_frames_mean_software(self):
         _, patch = self.sums(wrong={"cuda"})
@@ -5330,7 +5338,7 @@ class TestHardwareDecode(unittest.TestCase):
         with patch, self.assertLogs(util.log, "INFO") as logged:
             argv = decode_with(make_chain(hardware_decode=("cuda", "vaapi")), "h264",
                                matching=False)
-        self.assertEqual(argv, ["-hwaccel", "vaapi"])
+        self.assertEqual(argv, ["-xerror", "-hwaccel", "vaapi"])
         self.assertIn("with cuda: failed: Device creation failed: -5.", "\n".join(logged.output))
 
     def test_each_film_is_checked_once(self):
@@ -5338,21 +5346,226 @@ class TestHardwareDecode(unittest.TestCase):
         chain = make_chain(hardware_decode=("vaapi",))
         with patch:
             decode_with(chain, "h264", times=3, matching=False)
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 2 * len(verify.CHECK_AT))
 
     def test_rkmpp_only_for_the_codecs_it_has(self):
         _, patch = self.sums()
         chain = make_chain(rkmpp_decoders={"h264_rkmpp"}, hardware_decode=("rkmpp", "vaapi"))
         with patch:
-            self.assertEqual(decode_with(chain, "hevc", matching=False), ["-hwaccel", "vaapi"])
+            self.assertEqual(decode_with(chain, "hevc", matching=False),
+                             ["-xerror", "-hwaccel", "vaapi"])
 
     def test_codecs_decoders_may_differ_on_stay_in_software(self):
         calls, patch = self.sums()
         with patch:
-            for codec in ("mpeg2video", "vc1", "av1"):
+            for codec in ("mpeg2video", "vc1", "vp9"):
                 self.assertEqual(decode_with(make_chain(hardware_decode=("vaapi",)), codec,
                                              matching=False), [])
         self.assertEqual(calls, [])
+
+    def test_av1_is_checked_with_its_grain_on_and_off(self):
+        for on, extra in ((True, []), (False, verify.GRAIN_OFF)):
+            calls, patch = self.sums()
+            with patch:
+                argv = decode_with(make_chain(hardware_decode=("cuda",)), "av1", grain=on,
+                                   matching=False)
+            self.assertEqual(argv, ["-xerror", "-hwaccel", "cuda"])
+            # Software leaves the grain off too, or nothing would match.
+            self.assertEqual(calls[:2], [["-xerror", "-hwaccel", "cuda", *extra], extra])
+
+    def test_av1_rkmpp_skips_the_sizes_it_gets_wrong(self):
+        chain = make_chain(rkmpp_decoders={"av1_rkmpp"}, hardware_decode=("rkmpp",))
+        used = ["-xerror", "-c:v", "av1_rkmpp", "-deint", "0"]
+        for width, pix_fmt, expected in ((1202, "yuv420p10le", []),
+                                         (1202, "yuv420p", used),
+                                         (1920, "yuv420p10le", used),
+                                         (1918, "yuv420p10le", used),
+                                         (954, "yuv420p10le", used)):
+            calls, patch = self.sums()
+            with patch, unittest.mock.patch.object(verify, "RKMPP_AV1_WIDTH_BUG", True):
+                argv = decode_with(chain, "av1", width=width, pix_fmt=pix_fmt, matching=False)
+            self.assertEqual(argv, expected, (width, pix_fmt))
+            # A size it breaks is not even tried.
+            self.assertEqual(bool(calls), bool(expected))
+
+    def test_with_the_width_workaround_off_the_check_still_guards(self):
+        chain = make_chain(rkmpp_decoders={"av1_rkmpp"}, hardware_decode=("rkmpp",))
+        used = ["-xerror", "-c:v", "av1_rkmpp", "-deint", "0"]
+        # A fixed MPP matches software; one still broken does not.
+        for wrong, expected in ((set(), used), ({"rkmpp"}, [])):
+            _, patch = self.sums(wrong=wrong)
+            quiet = self.assertLogs(util.log, "WARNING") if wrong else contextlib.nullcontext()
+            with patch, quiet, \
+                    unittest.mock.patch.object(verify, "RKMPP_AV1_WIDTH_BUG", False):
+                argv = decode_with(chain, "av1", width=1202, pix_fmt="yuv420p10le",
+                                   matching=False)
+            self.assertEqual(argv, expected)
+        # Grain off stays in software: that is not the bug.
+        with unittest.mock.patch.object(verify, "RKMPP_AV1_WIDTH_BUG", False):
+            self.assertEqual(decode_with(chain, "av1", grain=False), [])
+
+    def test_the_broken_widths_are_those_documented(self):
+        for width in range(626, 4098, 2):
+            self.assertEqual(verify.rkmpp_breaks_av1(width, 10),
+                             width % 64 in {10, 12, 34, 36, 38, 50}, width)
+            self.assertFalse(verify.rkmpp_breaks_av1(width, 8), width)
+        self.assertEqual(verify._bit_depth("yuv420p10le"), 10)
+        self.assertEqual(verify._bit_depth("yuv420p"), 8)
+
+    def fall_back(self, *failures: Exception | None, hardware: tuple[str, ...] = ("cuda", "vaapi"),
+                  stopped: bool = False, stop_during: int = 0) -> list[list[str]]:
+        """What each attempt at a pass decoded with, attempt n raising failures[n]
+        (None: succeeding). `stop_during`: the stop comes during that attempt."""
+        chain = make_chain(hardware_decode=hardware)
+        path = Path("/x.mkv")
+        tried: list[list[str]] = []
+        stopping = threading.Event()
+        if stopped:
+            stopping.set()
+
+        def attempt():
+            tried.append(verify.decode_args(chain, path, grain=True))
+            if len(tried) == stop_during:
+                stopping.set()
+            failure = failures[len(tried) - 1] if len(tried) <= len(failures) else None
+            if failure is not None:
+                raise failure
+
+        verify._decoders.clear()
+        verify._passed_over.clear()
+        video = verify._Video("hevc", "yuv420p10le", 600.0, 1920)
+        _, patch = self.sums()
+        with patch, unittest.mock.patch.object(verify, "_video", return_value=video):
+            try:
+                verify.with_fallback(chain, [(path, True)], attempt, stopping)
+            finally:
+                self.later = verify.decode_args(chain, path, grain=True)
+                self.tried = tried
+        return tried
+
+    CUDA: ClassVar[list[str]] = ["-xerror", "-hwaccel", "cuda"]
+    VAAPI: ClassVar[list[str]] = ["-xerror", "-hwaccel", "vaapi"]
+
+    def test_a_decoder_that_fails_where_software_does_not_is_passed_over(self):
+        # h264_qsv seeking into an open GOP, say, past the check's stretches.
+        failure = CommandError(["ffmpeg"], 1, "[h264_qsv @ 0x5] get_buffer() failed")
+        with self.assertLogs(util.log, "WARNING") as logged:
+            tried = self.fall_back(failure)
+        # Run again in software, still stopping at a decoding error.
+        self.assertEqual(tried, [self.CUDA, ["-xerror"]])
+        self.assertIn("failed where software did not (get_buffer() failed)", logged.output[0])
+        # What QSV printed on this machine; libva's banner is no reason.
+        said = CommandError(["ffmpeg"], 234, "libva info: VA-API version 1.24.0\nlibva info: "
+                            "Trying to open /usr/lib/dri/iHD_drv_video.so\n[h264_qsv @ 0x5] "
+                            "video_get_buffer: image parameters invalid\n")
+        self.assertEqual(verify._reason(said), "video_get_buffer: image parameters invalid")
+        # The rest of the run takes the next decoder that passes the check.
+        self.assertEqual(self.later, self.VAAPI)
+
+    def test_with_no_decoder_left_the_file_goes_to_software(self):
+        with self.assertLogs(util.log, "WARNING"):
+            self.fall_back(CommandError(["ffmpeg"], 1, "Failed to end picture"),
+                           hardware=("vaapi",))
+        self.assertEqual(self.later, [])
+
+    def test_errors_software_has_too_are_the_files_own(self):
+        broken = CommandError(["ffmpeg"], 1, "[mpeg2video @ 0x5] corrupt decoded frame")
+        with self.assertLogs(util.log, "INFO") as logged:
+            tried = self.fall_back(broken, broken)
+        # A third time in software as a run without hardware decodes, past them.
+        self.assertEqual(tried, [self.CUDA, ["-xerror"], []])
+        self.assertEqual(self.later, [])
+        self.assertIn("failed in software too", "\n".join(logged.output))
+        self.assertNotIn("WARNING", "\n".join(logged.output))
+
+    def test_a_frame_count_software_misses_too_is_raised(self):
+        missed = essential.Mismatch("the estimate did not cover 100 frames")
+        with self.assertRaises(essential.Mismatch):
+            self.fall_back(missed, missed)
+        self.assertEqual(len(self.tried), 2)
+        # The source's timestamps, not the decoder: it is kept.
+        self.assertEqual(self.later, self.CUDA)
+
+    def test_a_failure_in_software_or_during_a_stop_is_not_retried(self):
+        failure = CommandError(["ffmpeg"], 1, "No space left on device")
+        for kwargs in ({"hardware": ()}, {"stopped": True}):
+            with self.assertRaises(CommandError):
+                self.fall_back(failure, **kwargs)
+            self.assertEqual(len(self.tried), 1, kwargs)
+
+    def test_a_stop_during_the_retry_blames_nothing(self):
+        # A Ctrl-C reaches ffmpeg before Python marks the stop; the retry then
+        # returns as a stopped part does, without a result.
+        failure = CommandError(["ffmpeg"], 255, "Exiting normally, received signal 2.")
+        with self.assertNoLogs(util.log, "WARNING"):
+            self.fall_back(failure, stop_during=2)
+        self.assertEqual(self.later, self.CUDA)
+        with self.assertRaises(CommandError):
+            self.fall_back(failure, failure, stop_during=2)
+        self.assertEqual(len(self.tried), 2)
+        self.assertEqual(self.later, self.CUDA)
+
+    def test_the_check_decodes_the_start_without_seeking(self):
+        with unittest.mock.patch.object(verify, "run") as ran:
+            ran.return_value = util.Completed([], 0, "", "", 0.0)
+            verify._frame_sums(make_chain(), Path("/x.mkv"), [], 0.0, "yuv420p")
+            verify._frame_sums(make_chain(), Path("/x.mkv"), [], 180.0, "yuv420p")
+        start, middle = (call.args[0] for call in ran.call_args_list)
+        self.assertNotIn("-ss", start)
+        self.assertEqual(middle[middle.index("-ss") + 1], "180.000")
+        self.assertEqual(verify.CHECK_AT[0], 0.0)
+
+    def test_qsv_comes_before_vaapi_which_stands_in_for_it(self):
+        chain = make_chain(decoders={"h264_qsv", "hevc_qsv", "av1_qsv"},
+                           hardware_decode=("qsv", "vaapi"))
+        for codec in ("h264", "hevc", "av1"):
+            _, patch = self.sums()
+            with patch:
+                self.assertEqual(decode_with(chain, codec, matching=False),
+                                 ["-xerror", "-c:v", f"{codec}_qsv"])
+        _, patch = self.sums(broken={"qsv"})
+        with patch, self.assertLogs(util.log, "INFO"):
+            self.assertEqual(decode_with(chain, "hevc", matching=False),
+                             ["-xerror", "-hwaccel", "vaapi"])
+
+    def test_qsv_only_for_the_codecs_it_has(self):
+        calls, patch = self.sums()
+        chain = make_chain(decoders={"h264_qsv"}, hardware_decode=("qsv",))
+        with patch:
+            self.assertEqual(decode_with(chain, "av1", matching=False), [])
+        self.assertEqual(calls, [])
+
+    def test_the_check_compares_the_files_own_timestamps(self):
+        with unittest.mock.patch.object(verify, "run") as ran:
+            ran.return_value = util.Completed([], 0, "", "", 0.0)
+            verify._frame_sums(make_chain(), Path("/x.mkv"), [], 10.0, "yuv420p")
+        argv = ran.call_args.args[0]
+        self.assertLess(argv.index("-copyts"), argv.index("-i"))
+
+    def test_a_grain_probe_that_seeks_keeps_the_sources_timestamps(self):
+        # QSV gave one frame too many after a seek counted from zero.
+        ran: list[list[str]] = []
+
+        def fake(argv):
+            ran.append(argv)
+            stats = re.search(r"stats_file=([^\[ ,;]+)", argv[argv.index("-filter_complex") + 1])
+            assert stats is not None
+            Path(stats.group(1)).write_text("n:1 mse_y:1.0 mse_u:1.0 mse_v:1.0\n")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(grain, "run", fake):
+            grain.window_grain(Path("/x.mkv"), make_chain(), [10.0], 4.0, Path(tmp))
+        argv = ran[0]
+        self.assertLess(argv.index("-ss"), argv.index("-copyts"))
+        self.assertLess(argv.index("-copyts"), argv.index("-i"))
+
+    def test_qsv_is_tried_where_its_device_opens(self):
+        both = {"qsv", "vaapi"}
+        self.assertEqual(self.chain_with("auto", both, {"dri"}), ("qsv", "vaapi"))
+        # AMD: the build lists qsv, but no device opens for it.
+        self.assertEqual(self.chain_with("auto", both, {"dri"}, opens={"vaapi"}), ("vaapi",))
+        self.assertEqual(self.chain_with("auto", both), ())
+        self.assertEqual(self.chain_with("qsv", both, {"dri"}), ("qsv",))
 
     def chain_with(self, setting: str, hwaccels: set[str], devices: set[str] = frozenset(),
                    rkmpp: set[str] = frozenset(),
@@ -5374,7 +5587,8 @@ class TestHardwareDecode(unittest.TestCase):
 
     def test_a_build_lists_methods_the_machine_lacks(self):
         # jellyfin-ffmpeg's x86 build lists cuda and vaapi on every machine.
-        self.assertEqual(self.chain_with("auto", {"cuda", "vaapi", "qsv"}, {"dri"}), ("vaapi",))
+        self.assertEqual(self.chain_with("auto", {"cuda", "vaapi", "qsv"}, {"dri"},
+                                         opens={"vaapi"}), ("vaapi",))
         self.assertEqual(self.chain_with("auto", {"cuda", "vaapi"}, {"dri", "nvidia"}),
                          ("cuda", "vaapi"))
         self.assertEqual(self.chain_with("auto", {"videotoolbox"}), ("videotoolbox",))

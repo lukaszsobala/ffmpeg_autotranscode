@@ -537,31 +537,120 @@ decode the source several times over. Each compares the source with its encode
 pixel by pixel, or finds a stretch of it by its frames' timestamps, so a decoder
 only close to software's frames would be wrong where it matters.
 `machine.hardware_decode = "auto"` tries, in order, Rockchip's decoders
-(`h264_rkmpp`, `hevc_rkmpp`), NVIDIA's (`-hwaccel cuda`), VA-API (Intel, AMD)
-and VideoToolbox (macOS), each only if the build has it and its device opens.
-For each film the first of them is checked: 48 frames from a seek at 30% and
-at 70% of it, decoded by it and by software and compared frame by frame
-(framemd5, in the source's own pixel format). A decoder that matches is used for
-that film; one that differs is logged and the film decoded in software. Only
-H.264 and HEVC are tried: their standards define the decoded picture exactly,
-where MPEG-2 and VC-1 allow decoders to differ.
+(`h264_rkmpp`, `hevc_rkmpp`, `av1_rkmpp`), NVIDIA's (`-hwaccel cuda`), Intel's
+Quick Sync (`h264_qsv` and the rest), VA-API (AMD, and Intel after QSV) and
+VideoToolbox (macOS), each only if the build has it and its device opens. H.264,
+HEVC and AV1 are tried: their standards define the decoded picture exactly,
+where MPEG-2 and VC-1 allow decoders to differ. AV1 is decoded two ways, with
+its film grain and without it (the XPSNR and low-pass passes, and calibration's
+grainless stream), and a decoder is checked in each way it is used.
+
+**The check.** 48 frames from the start of the film and from a seek at 30% and
+at 70% of it, decoded by the decoder and by software and compared frame by
+frame (framemd5, in the source's own pixel format, with the file's own
+timestamps). The start is decoded without a seek, as XPSNR, low-pass PSNR and
+grain retention decode it: they pair frames by their place in the film, so a
+decoder giving one frame too many or too few there would put every pair out of
+step without failing. The first decoder
+that matches is used for that film; one that differs, or fails, is logged and
+the next tried, and with none left the film is decoded in software. Every
+hardware decode that seeks keeps the file's timestamps (`-copyts`), as the check
+does: counted from the seek instead, `hevc_qsv` and `h264_qsv` gave one frame
+too many at the start, which put the grain probe's windows a frame off
+software's. ffmpeg's own H.264 decoder goes to software by itself where
+`-hwaccel` cannot take a file (10-bit H.264 on Intel VA-API), so such a file
+passes the check and the log names a decoder it is not using; the frames are
+software's.
+
+**A decode that fails later runs again in software.** The check covers three
+stretches, and a decoder can still fail past them: a seek it cannot take, a
+frame it cannot decode, no memory left, a device lost. Left to itself ffmpeg
+drops a frame that fails to decode, goes on and exits 0, and a part that takes
+a set number of frames then takes a later one in its place. So hardware decodes
+run with `-xerror`, which makes any such error fail the command. When a pass, a
+part or a calibration window fails while it decodes on hardware, it is run
+again in software, still with `-xerror`, which tells whose failure it was:
+
+- The retry succeeds: the decoder was to blame. The retry's result is used, and
+  the file goes on to the next decoder that passes the check, or to software
+  when none is left. Where a command decodes several files on hardware, all of
+  their decoders are passed over, since which one failed cannot be told.
+- ffmpeg fails again: the files have decoding errors of their own (a broken
+  recording), or something else is wrong, such as a full disk. `-xerror` is one
+  option for the whole command, so a software-decoded source with errors fails
+  it as well. The files are decoded in software for the rest of the run, without
+  `-xerror`, which goes past such errors as a run without hardware does, and the
+  work is done a third time that way.
+- A frame count comes out wrong again: the source's timestamps, not the decoder.
+  The failure stands and the decoders are kept.
+
+A stop (Ctrl-C) during the retry blames nothing. A decode that hangs is caught
+only in calibration, where each window has a time limit.
+
+`h264_qsv` cannot seek into an open GOP: on iHD 26.3.5 it fails with
+"video_get_buffer: image parameters invalid" when the decode starts at a
+non-IDR keyframe with no IDR frame since the start of the stream, which Blu-ray
+H.264 often has. From the start of the file it decodes those frames exactly. A
+film that is all open GOPs fails the check, and goes to VA-API, which seeks
+there correctly. One whose IDR frames happen to fall where the check seeks
+passes it, and moves to VA-API at the first part that fails. HEVC open GOPs
+(CRA frames) decoded exactly on QSV and VA-API from every seek tried.
 
 On an RK3588 the Rockchip decoders were checked more thoroughly before this
 existed: `h264_rkmpp` matched software on every frame of two films, and
 `hevc_rkmpp` on 1,920 frames of four (8- and 10-bit, 1080p and 4K, HDR10 and
 Dolby Vision; 96 frames at five points of each, every one from a seek). There a
 decode feeding Y4M runs at about 240 frames/s at 1080p and 65-78 at 4K, against
-115 for one software thread at 1080p. VA-API, NVDEC and VideoToolbox go through
-the same per-film check; their decodes have not been measured here.
+115 for one software thread at 1080p. NVDEC, VideoToolbox and VA-API on AMD go
+through the same per-film check; they have not been measured here. The Rockchip
+figures predate the check comparing the file's own timestamps.
 
-AV1 decodes in software, with dav1d allowed eight frames in flight
+**On Intel, QSV comes first** because it copies frames back faster than VA-API,
+and a hardware decode there is not necessarily faster than software's. On a Core
+Ultra 7 258V (Lunar Lake, Linux 7.4.0-rc4, `xe` driver, jellyfin-ffmpeg 8.1.3)
+the video engine decodes 4K 10-bit HEVC or AV1 at about 420 frames/s while the
+frames stay on the GPU. The passes need them in system memory, and copied there
+VA-API gave 46 frames/s for HEVC and 30 for AV1, QSV 76 and 72, software 162
+and 192. What that costs depends on the pass. Seconds taken by each:
+
+| pass | software | VA-API, AV1 on dav1d | VA-API, AV1 too | QSV, AV1 too |
+|---|---|---|---|---|
+| scene detection, 120 s of 4K HEVC | 33 | 26 | 26 | 21 |
+| scene detection, 120 s of 1080p H.264 | 8.3 | 6.2 | 6.1 | 5.8 |
+| calibration, 48 windows at 4K | 80-84 | 68 | 69 | 64 |
+| XPSNR, 30 s at 4K | 19 | 19 | 30 | 19 |
+| XPSNR, 60 s at 1080p | 7.5-8.1 | 7.5 | 18 | 7.6 |
+| grain retention, 4K AV1 | 72-77 | 76-77 | 75-78 | 77 |
+| grain retention, 1080p AV1 | 39 | 40 | 41 | 40 |
+
+(Scene detection in 15-second parts, so that eight ran at once; times without
+the per-film check, which takes about 9 s at 4K for each file and way of decoding
+it, 1.6 s at 1080p; these runs checked two stretches, 6 s at 4K.) All
+gave the same results, but for sums that differ in their last digit with the
+order calibration's windows finish in. QSV's frames matched software's in the
+per-film check on the two films, the AV1 encode of one and the eight grainy AV1
+clips below; the frames it fed SvtFgEssential and av-scenechange were the same
+byte for byte from the start, middle and end of an 8-bit H.264 film, a 10-bit
+HEVC one and interlaced clips of both field orders through bwdif. Only the Y4M
+header of 8-bit video names its chroma siting otherwise, as VA-API's
+does, and SvtFgEssential's table came out the same. QSV does not decode 10-bit
+H.264, which goes on to VA-API and so to software.
+
+Where AV1 decodes in software, dav1d is allowed eight frames in flight
 (`-max_frame_delay 8`): ffmpeg leaves it at 0, which libdav1d keeps low, and a
 1080p 10-bit encode decoded at 43 frames/s on the RK3588's eight cores; with 8,
-at 200, the same frames bit for bit, with grain or without. AV1 stays off the
-video engine, because
-`av1_rkmpp` gets some frame sizes wrong. On jellyfin-ffmpeg 8.1.3-2, compared
-with dav1d frame by frame (framemd5) over whole films, all with grain on every
-frame:
+at 200, the same frames bit for bit, with grain or without.
+
+On Intel's VA-API (Lunar Lake, jellyfin-ffmpeg 8.1.3, iHD 26.3.5), AV1 matched
+dav1d with grain on and off: on 48 frames at two points of a 4K 10-bit encode,
+and on all 120 frames of eight grainy clips from 626x352 to 3838x1600, 8- and
+10-bit, among them widths `av1_rkmpp` breaks. NVDEC, and VA-API on AMD, take
+the same per-file check; neither has been run here.
+
+`av1_rkmpp` is used only with the grain on, which it has no way to leave off,
+and only at frame sizes it decodes correctly. On jellyfin-ffmpeg 8.1.3-2,
+compared with dav1d frame by frame (framemd5) over whole films, all with grain
+on every frame:
 
 | encode | frames | differing |
 |---|---|---|
@@ -597,9 +686,13 @@ out the broken widths exactly: 9 of 26 test clips from 626 to 1912 wide, and of
 31 film encodes (first 2,000 frames each) only the one 1202 wide. Padding the width
 to 8 before sizing the planes, a one-line change, made MPP's own `mpi_dec_test`
 match dav1d on every frame of five broken test clips and of the 1202-wide film,
-grain included. Until a jellyfin-ffmpeg carries that fix, AV1 stays on dav1d.
-The XPSNR and low-pass passes would stay on dav1d regardless: they need
-the grain off, and `av1_rkmpp` has no way to leave it off.
+grain included. Until a jellyfin-ffmpeg carries that fix, a file of one of those
+sizes is not tried on `av1_rkmpp` at all, and the per-file check stands behind
+the formula. `RKMPP_AV1_WIDTH_BUG = False` in
+[autotranscode/verify.py](autotranscode/verify.py) turns the rule off once the
+pinned jellyfin-ffmpeg has the fix. The XPSNR and low-pass passes stay on
+dav1d on this board at any size, since they need the grain off. An older MPP,
+without the film grain fix below, fails the check and leaves AV1 on dav1d.
 
 Decoding was never the bottleneck anyway. The blur and PSNR filters are, and the
 kernel keeps their threads on the A55 cores. Pinned to the A76s with a thread

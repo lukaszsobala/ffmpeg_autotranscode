@@ -48,7 +48,14 @@ from .config import Config
 from .probe import MediaInfo
 from .tools import Toolchain
 from .util import CommandError, child_env, human_size, log, run
-from .verify import decode_args, first, grain_graph, parse_mse_log
+from .verify import (
+    GRAIN_OFF,
+    decode_args,
+    first,
+    grain_graph,
+    parse_mse_log,
+    with_fallback,
+)
 
 # Fixed reference denoiser used only for *measurement*, so scores are comparable
 # across files. The strength actually used for encoding is chosen from the score.
@@ -676,16 +683,19 @@ def window_grain(
     values: dict[str, list[float]] = {plane: [] for plane in PLANES}
     for index, start in enumerate(times):
         stats = work / f"grain_{path.stem}_{index}_{int(synthesis)}.log"
-        run([
+        with_fallback(chain, [(path, synthesis)], lambda start=start, stats=stats: run([
             chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-y",
-            *([] if synthesis else ["-export_side_data", "film_grain"]),
+            *([] if synthesis else GRAIN_OFF),
             *decode_args(chain, path, grain=synthesis),
-            "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-i", str(path),
+            # -copyts, as every seek decoded on hardware has (verify._frame_sums):
+            # without it QSV gave a frame too many at the start, and the window
+            # was one frame off software's.
+            "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-copyts", "-i", str(path),
             "-an", "-sn", "-dn",
             "-filter_complex",
             f"{grain_graph(prefilter)}psnr=stats_file={stats.as_posix()}",
             "-f", "null", "-",
-        ])
+        ]))
         text = stats.read_text(encoding="utf-8", errors="replace")
         for plane in PLANES:
             values[plane] += parse_mse_log(text, plane)

@@ -54,9 +54,10 @@ import json
 import re
 import statistics
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 
 from .tools import Toolchain
 from .util import PROGRESS_ARGS, CommandError, human_duration, log, run, run_progress
@@ -219,17 +220,27 @@ def worst_windows(
 
 
 # Codecs tried on a hardware decoder: their standards define the decoded picture
-# exactly, so a correct decoder gives software's frames bit for bit. AV1 is left
-# out: av1_rkmpp decodes some widths wrongly (TECHNICAL.md), and a decoder's grain
-# is not a measurement's. MPEG-2 and VC-1 allow decoders to differ.
-HARDWARE_CODECS = frozenset({"h264", "hevc"})
+# exactly, so a correct decoder gives software's frames bit for bit -- AV1's with
+# its film grain too, which each film is checked for. MPEG-2 and VC-1 allow
+# decoders to differ.
+HARDWARE_CODECS = frozenset({"h264", "hevc", "av1"})
+
+_Result = TypeVar("_Result")
+
+# Input option leaving AV1 film grain off: the decoder hands the grain parameters
+# over as side data instead of adding the grain to the picture.
+GRAIN_OFF = ["-export_side_data", "film_grain"]
 
 # How a film is checked on a hardware decoder before it is used: this many frames
-# decoded from a seek at each of these shares of its length, compared with
-# software's frame by frame. A decoder that is wrong at all was wrong within
-# frames of a keyframe (av1_rkmpp's broken widths from the first inter frame).
+# decoded at each of these shares of its length, compared with software's frame
+# by frame. A decoder that is wrong at all was wrong within frames of a keyframe
+# (av1_rkmpp's broken widths from the first inter frame). 0 decodes from the
+# start without a seek, as XPSNR, low-pass PSNR and grain retention do: they pair
+# frames by their place in the film, so one frame too many or too few at its
+# start would put every pair out of step. The others seek, as the passes that
+# take part of the film do.
 CHECK_FRAMES = 48
-CHECK_AT = (0.3, 0.7)
+CHECK_AT = (0.0, 0.3, 0.7)
 
 # dav1d's frames in flight. ffmpeg leaves it at 0, which libdav1d then keeps low,
 # and a 1080p 10-bit encode decoded at 43 frames/s on an RK3588's eight cores;
@@ -263,13 +274,14 @@ class _Video:
     codec: str
     pix_fmt: str
     duration: float
+    width: int = 0
 
 
 @functools.cache
 def _video(ffprobe: str, path: Path) -> _Video:
     try:
         out = run([ffprobe, "-v", "error", "-select_streams", "v:0",
-                   "-show_entries", "stream=codec_name,pix_fmt:format=duration",
+                   "-show_entries", "stream=codec_name,pix_fmt,width:format=duration",
                    "-of", "json", str(path)]).stdout
         data = json.loads(out or "{}")
     except (CommandError, ValueError):
@@ -279,7 +291,41 @@ def _video(ffprobe: str, path: Path) -> _Video:
         duration = float(data.get("format", {}).get("duration", 0.0))
     except (TypeError, ValueError):
         duration = 0.0
-    return _Video(stream.get("codec_name", ""), stream.get("pix_fmt", ""), duration)
+    return _Video(stream.get("codec_name", ""), stream.get("pix_fmt", ""), duration,
+                  int(stream.get("width") or 0))
+
+
+# --- workaround: av1_rkmpp's broken widths -----------------------------------
+#
+# An MPP bug (hal_av1d_vdpu.c; TECHNICAL.md) damages the reference frames at some
+# 10-bit widths, so av1_rkmpp is not tried on files of those sizes. Waiting for
+# MPP to fix it. Once the jellyfin-ffmpeg that autotranscode pins has the fix,
+# set this to False, or delete this block and its one use in _has_decoder. A
+# switch, because ffmpeg's version does not say which MPP it was built with.
+# Films are checked against software either way, so a size that is still broken
+# ends up on dav1d with a warning.
+RKMPP_AV1_WIDTH_BUG = True
+
+
+def _bit_depth(pix_fmt: str) -> int:
+    """10 of "yuv420p10le"; 8 where the name gives none."""
+    match = re.search(r"(\d+)(?:le|be)$", pix_fmt)
+    return int(match.group(1)) if match else 8
+
+
+def rkmpp_breaks_av1(width: int, depth: int) -> bool:
+    """Whether av1_rkmpp gets every frame after a keyframe wrong at this size.
+
+    MPP stores reference frames over the width padded to 8 pixels, but sizes them
+    from the unpadded width rounded up to 128 bits (TECHNICAL.md). At 10 bits
+    about one even width in five comes up short; 8-bit never does.
+    """
+    def up(value: int, step: int) -> int:
+        return (value + step - 1) // step * step
+    return up(width, 8) * depth > up(width * depth, 128)
+
+
+# --- end of workaround -------------------------------------------------------
 
 
 def hardware_args(method: str, codec: str) -> list[str]:
@@ -288,40 +334,65 @@ def hardware_args(method: str, codec: str) -> list[str]:
     -hwaccel without -hwaccel_output_format hands each frame back in memory
     (nv12 or p010), so everything after the decoder is the same as for software;
     -pix_fmt's conversion from those to planar 4:2:0 only moves samples.
-    Rockchip's decoders are decoders of their own, and deinterlace unless told
-    not to, which would alter the frames.
+    Rockchip's and Intel's QSV are decoders of their own; Rockchip's deinterlace
+    unless told not to, which would alter the frames. (QSV does not work as a
+    -hwaccel that hands frames back in memory.)
+
+    -xerror, because ffmpeg otherwise drops a frame that fails to decode, goes
+    on and exits 0: a pass taking a set number of frames would take a later one
+    in its place. Failing instead, it is run again in software (with_fallback).
     """
     if method == "rkmpp":
-        return ["-c:v", f"{codec}_rkmpp", "-deint", "0"]
-    return ["-hwaccel", method]
+        return ["-xerror", "-c:v", f"{codec}_rkmpp", "-deint", "0"]
+    if method == "qsv":
+        return ["-xerror", "-c:v", f"{codec}_qsv"]
+    return ["-xerror", "-hwaccel", method]
 
 
 def _frame_sums(chain: Toolchain, path: Path, decode: Sequence[str], start: float,
                 pix_fmt: str) -> list[str]:
+    # -copyts compares the file's own timestamps, which the passes that seek go by.
+    # Counted from the seek instead, QSV's came out a tick of the output's clock
+    # away from software's on frames that match to the millisecond with it.
+    seek = ["-noaccurate_seek", "-ss", f"{start:.3f}"] if start > 0 else []
     out = run([chain.ffmpeg, "-hide_banner", "-nostats", "-v", "error", *decode,
-               "-noaccurate_seek", "-ss", f"{start:.3f}", "-i", str(path),
+               *seek, "-copyts", "-i", str(path),
                "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", str(CHECK_FRAMES),
                "-fps_mode", "passthrough", "-pix_fmt", pix_fmt, "-f", "framemd5",
                "-"]).stdout
     return [line for line in out.splitlines() if line and not line.startswith("#")]
 
 
-def _same_as_software(chain: Toolchain, path: Path, method: str, video: _Video) -> str:
+def _reason(exc: Exception) -> str:
+    """Why a decode failed, in a line. ffmpeg's first says why ("Failed to
+    initialise VAAPI connection"); the last only that an output could not be
+    opened. libva's banner, which QSV prints before anything, is passed over."""
+    if not isinstance(exc, CommandError):
+        return str(exc)[:160]
+    said = [re.sub(r"^(\[[^]]*\] *)+", "", line) for line in exc.stderr.strip().splitlines()
+            if not line.startswith("libva info:")]
+    return said[0][:160] if said else f"exit {exc.returncode}"
+
+
+def _same_as_software(chain: Toolchain, path: Path, method: str, video: _Video,
+                      grain: bool) -> str:
     """"" when `method` decodes CHECK_FRAMES frames at each of CHECK_AT exactly
     as software does, else why not. Both are compared in the source's own pixel
-    format, so that nothing but moving samples stands between them."""
-    hardware = hardware_args(method, video.codec)
+    format, so that nothing but moving samples stands between them, and both
+    leave AV1 film grain off when `grain` is false."""
+    off = [] if grain else GRAIN_OFF
+    hardware = [*hardware_args(method, video.codec), *off]
+    software = [*software_decode_args(chain, video.codec), *off]
     for share in CHECK_AT:
         start = video.duration * share
         try:
             ours = _frame_sums(chain, path, hardware, start, video.pix_fmt)
         except CommandError as exc:
-            # ffmpeg's first line says why ("Failed to initialise VAAPI
-            # connection"); the last only that the output could not be opened.
-            said = [re.sub(r"^(\[[^]]*\] *)+", "", line)
-                    for line in exc.stderr.strip().splitlines()]
-            return f"failed: {said[0][:160] if said else f'exit {exc.returncode}'}"
-        theirs = _frame_sums(chain, path, [], start, video.pix_fmt)
+            return f"failed: {_reason(exc)}"
+        try:
+            theirs = _frame_sums(chain, path, software, start, video.pix_fmt)
+        except CommandError:
+            theirs = []
         if not theirs:
             return "software decoded no frames to compare with"
         if ours != theirs:
@@ -332,37 +403,71 @@ def _same_as_software(chain: Toolchain, path: Path, method: str, video: _Video) 
     return ""
 
 
-_decoders: dict[tuple[str, Path], str] = {}
+_decoders: dict[tuple[str, Path, bool], str] = {}
+# Decoders that failed a pass on a file where software then did not
+# (with_fallback): passed over for that file for the rest of the run.
+_passed_over: dict[tuple[str, Path, bool], set[str]] = {}
 _decoders_lock = threading.Lock()
 
+# with_fallback's retry, in the thread running it: decode_args then decodes every
+# file in software, with these options before it. None the rest of the time.
+_retry = threading.local()
 
-def hardware_decoder(chain: Toolchain, path: Path) -> str:
-    """The hardware decoder `path` is decoded with, or "" for software.
 
-    The first of chain.hardware_decode that decodes a stretch of the film exactly
-    as software does (_same_as_software); tried once per film and remembered.
+def _has_decoder(chain: Toolchain, method: str, video: _Video, grain: bool) -> bool:
+    """Whether `method` is worth checking on this video at all. VA-API, NVDEC and
+    VideoToolbox are asked whatever the film, and the check answers."""
+    if method == "qsv":
+        return f"{video.codec}_qsv" in chain.decoders
+    if method != "rkmpp":
+        return True
+    if f"{video.codec}_rkmpp" not in chain.rkmpp_decoders:
+        return False
+    if video.codec != "av1":
+        return True
+    if not grain:   # av1_rkmpp has no way to leave film grain off: not the bug
+        return False
+    return not (RKMPP_AV1_WIDTH_BUG
+                and rkmpp_breaks_av1(video.width, _bit_depth(video.pix_fmt)))
+
+
+def _decoder_key(chain: Toolchain, path: Path, grain: bool) -> tuple[str, Path, bool]:
+    """What a choice of decoder is remembered by. Only AV1 has grain to leave off."""
+    return (chain.ffmpeg, path, grain or _video(chain.ffprobe, path).codec != "av1")
+
+
+def hardware_decoder(chain: Toolchain, path: Path, *, grain: bool = True) -> str:
+    """The hardware decoder `path` is decoded with, or "" for software. With
+    `grain` false, AV1 film grain is to be left off (GRAIN_OFF, which the caller
+    passes), and the decoder is checked doing that.
+
+    The first of chain.hardware_decode that decodes three stretches of the film
+    exactly as software does (_same_as_software); tried once per film and
+    remembered, and again without a decoder that later failed it (with_fallback).
     The passes this serves compare the source with its encode pixel by pixel,
     and find a stretch of it by its frames' timestamps, so a decoder only close
     to software would be wrong where it matters. On an RK3588 h264_rkmpp matched
     software on every frame of two films, and hevc_rkmpp on 1,920 frames of four
     (8- and 10-bit, 1080p and 4K, HDR10 and Dolby Vision), each from a seek.
     """
+    if not chain.hardware_decode:
+        return ""
     video = _video(chain.ffprobe, path)
     if video.codec not in HARDWARE_CODECS or not video.pix_fmt:
         return ""
-    candidates = [method for method in chain.hardware_decode
-                  if method != "rkmpp" or f"{video.codec}_rkmpp" in chain.rkmpp_decoders]
-    if not candidates:
-        return ""
-    key = (chain.ffmpeg, path)
+    key = _decoder_key(chain, path, grain)
+    grain = key[2]
     with _decoders_lock:    # the passes ask from several threads at once
         if key not in _decoders:
             _decoders[key] = ""
-            for method in candidates:
-                why = _same_as_software(chain, path, method, video)
+            passed_over = _passed_over.get(key, set())
+            for method in chain.hardware_decode:
+                if method in passed_over or not _has_decoder(chain, method, video, grain):
+                    continue
+                why = _same_as_software(chain, path, method, video, grain)
                 if not why:
-                    log.debug("  %s: decoded with %s, which matched software", path.name,
-                              method)
+                    log.debug("  %s: decoded with %s%s, which matched software", path.name,
+                              method, "" if grain else " (grain off)")
                     _decoders[key] = method
                     break
                 # A decoder that cannot open the film is routine (a driver without
@@ -377,14 +482,97 @@ def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
     software's frames exactly (hardware_decoder), or else as fast as the software
     decoder goes (DAV1D_FRAME_DELAY).
 
-    `grain` is whether AV1 film grain is to be applied: no hardware decoder takes
-    AV1 here (HARDWARE_CODECS), and if one ever does, only the grain=True decode
-    could move, since none can leave grain off.
+    `grain` is whether AV1 film grain is to be applied. With it false the caller
+    adds GRAIN_OFF as well.
     """
-    del grain
-    method = hardware_decoder(chain, path)
     codec = _video(chain.ffprobe, path).codec
+    retry = getattr(_retry, "options", None)
+    if retry is not None:
+        return [*retry, *software_decode_args(chain, codec)]
+    method = hardware_decoder(chain, path, grain=grain)
     return hardware_args(method, codec) if method else software_decode_args(chain, codec)
+
+
+def _in_software(options: list[str], attempt: Callable[[], _Result]) -> _Result:
+    """attempt() with every decode_args in this thread in software, after `options`."""
+    _retry.options = options
+    try:
+        return attempt()
+    finally:
+        _retry.options = None
+
+
+def with_fallback(chain: Toolchain, decodes: Sequence[tuple[Path, bool]],
+                  attempt: Callable[[], _Result],
+                  stopping: threading.Event | None = None) -> _Result:
+    """attempt(), run again in software if it fails while decoding on hardware.
+
+    `decodes` are the (path, grain) it decodes, as it gives them to decode_args,
+    and it must build its commands afresh each time, through decode_args and in
+    this thread. The check before a film is decoded on hardware covers three
+    stretches of it, and a decoder can still fail past them: a seek it cannot
+    take (h264_qsv into an open GOP), a frame it cannot decode, no memory left, a
+    device lost.
+
+    The retry decodes in software but keeps -xerror, so that it fails where the
+    first attempt did unless the decoder was to blame:
+
+    - It succeeds: the decoder was to blame (which, of several, cannot be told
+      apart, so all of them). Its result is returned, and each file goes on to
+      the next decoder that passes the check, or to software.
+    - It fails on a frame count (ValueError): the source's timestamps, nothing
+      the decoder did. Raised, the decoders kept.
+    - ffmpeg fails: the files have decoding errors of their own, or something
+      else is wrong (a full disk). They are decoded in software from now on,
+      which goes past such errors as a run without hardware does, and attempt()
+      runs a third time so; what that raises is raised.
+
+    The first failure is raised when no hardware was used or `stopping` is set,
+    and a stop during the retry blames nothing.
+    """
+    def stopped() -> bool:
+        return stopping is not None and stopping.is_set()
+
+    used = [(path, grain, method) for path, grain in decodes
+            if (method := hardware_decoder(chain, path, grain=grain))]
+    try:
+        return attempt()
+    except (CommandError, ValueError) as exc:   # ValueError: frames missed
+        if not used or stopped():
+            raise
+        failure = exc
+    try:
+        result = _in_software(["-xerror"], attempt)
+    except CommandError as exc:
+        if stopped():
+            raise
+        with _decoders_lock:
+            for path, grain in decodes:
+                _decoders[_decoder_key(chain, path, grain)] = ""
+        log.info("  decoding %s failed in software too (%s): not the hardware decoder's "
+                 "doing; decoding in software from now on, past such errors",
+                 " and ".join(sorted({path.name for path, _ in decodes})), _reason(exc))
+        return attempt()
+    if not stopped():
+        for path, grain, method in used:
+            _pass_over(chain, path, grain, method, failure)
+    return result
+
+
+def _pass_over(chain: Toolchain, path: Path, grain: bool, method: str,
+               failure: Exception) -> None:
+    """Leave `method` out for `path` from now on, and have hardware_decoder choose
+    again among the rest."""
+    key = _decoder_key(chain, path, grain)
+    with _decoders_lock:
+        passed_over = _passed_over.setdefault(key, set())
+        if method in passed_over:
+            return      # another part failed the same way first
+        passed_over.add(method)
+        if _decoders.get(key) == method:
+            del _decoders[key]
+    log.warning("  decoding %s with %s failed where software did not (%s); trying the "
+                "next decoder for it from now on", path.name, method, _reason(failure))
 
 
 def software_decode_args(chain: Toolchain, codec: str) -> list[str]:
@@ -408,19 +596,21 @@ def xpsnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path,
     plain PSNR the same way. Index pairing is right because the pipeline's
     output is frame-exact; `ALIGN` renumbers both inputs 0, 1, 2...
     """
-    argv = [
-        *measure_argv(chain),
-        *decode_args(chain, reference, grain=True), "-i", str(reference),
-        *decode_args(chain, distorted, grain=False),
-        "-export_side_data", "film_grain", "-i", str(distorted),
-        "-lavfi",
-        f"[0:v]{first(reference_filter)}{ALIGN},format={XPSNR_FORMAT}[ref];"
-        f"[1:v]{ALIGN},format={XPSNR_FORMAT}[dist];"
-        f"[ref][dist]xpsnr=stats_file={stats.as_posix()}",
-        "-f", "null", "-",
-    ]
-    run_progress(argv, "measuring XPSNR", frames=frames)
-    return parse_xpsnr_log(stats.read_text(encoding="utf-8", errors="replace"))
+    def attempt() -> list[float]:
+        argv = [
+            *measure_argv(chain),
+            *decode_args(chain, reference, grain=True), "-i", str(reference),
+            *decode_args(chain, distorted, grain=False), *GRAIN_OFF, "-i", str(distorted),
+            "-lavfi",
+            f"[0:v]{first(reference_filter)}{ALIGN},format={XPSNR_FORMAT}[ref];"
+            f"[1:v]{ALIGN},format={XPSNR_FORMAT}[dist];"
+            f"[ref][dist]xpsnr=stats_file={stats.as_posix()}",
+            "-f", "null", "-",
+        ]
+        run_progress(argv, "measuring XPSNR", frames=frames)
+        return parse_xpsnr_log(stats.read_text(encoding="utf-8", errors="replace"))
+
+    return with_fallback(chain, [(reference, True), (distorted, False)], attempt)
 
 
 def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path,
@@ -441,34 +631,39 @@ def lowpass_psnr(chain: Toolchain, reference: Path, distorted: Path, stats: Path
     grain separately. Run at 10-bit, since the steps in question are below one
     8-bit code value, and paired by index for the reason given in xpsnr().
     """
-    argv = [
-        *measure_argv(chain),
-        *decode_args(chain, reference, grain=True), "-i", str(reference),
-        *decode_args(chain, distorted, grain=False),
-        "-export_side_data", "film_grain", "-i", str(distorted),
-        "-lavfi",
-        f"[0:v]{first(reference_filter)}{ALIGN},format=yuv420p10le,{LOWPASS}[ref];"
-        f"[1:v]{ALIGN},format=yuv420p10le,{LOWPASS}[dist];"
-        f"[ref][dist]psnr=stats_file={stats.as_posix()}",
-        "-f", "null", "-",
-    ]
-    run_progress(argv, "measuring low-pass PSNR", frames=frames)
-    return parse_psnr_log(stats.read_text(encoding="utf-8", errors="replace"))
+    def attempt() -> list[float]:
+        argv = [
+            *measure_argv(chain),
+            *decode_args(chain, reference, grain=True), "-i", str(reference),
+            *decode_args(chain, distorted, grain=False), *GRAIN_OFF, "-i", str(distorted),
+            "-lavfi",
+            f"[0:v]{first(reference_filter)}{ALIGN},format=yuv420p10le,{LOWPASS}[ref];"
+            f"[1:v]{ALIGN},format=yuv420p10le,{LOWPASS}[dist];"
+            f"[ref][dist]psnr=stats_file={stats.as_posix()}",
+            "-f", "null", "-",
+        ]
+        run_progress(argv, "measuring low-pass PSNR", frames=frames)
+        return parse_psnr_log(stats.read_text(encoding="utf-8", errors="replace"))
+
+    return with_fallback(chain, [(reference, True), (distorted, False)], attempt)
 
 
 def noise_mse(chain: Toolchain, path: Path, stats: Path, label: str = "measuring grain",
               frames: int = 0, prefilter: str = "") -> list[float]:
     """Per-frame luma MSE between `path` and its median-filtered self: its grain."""
-    argv = [
-        *measure_argv(chain),
-        *decode_args(chain, path, grain=True), "-i", str(path),
-        "-an", "-sn", "-dn",
-        "-filter_complex",
-        f"{grain_graph(prefilter)}psnr=stats_file={stats.as_posix()}",
-        "-f", "null", "-",
-    ]
-    run_progress(argv, label, frames=frames)
-    return parse_mse_log(stats.read_text(encoding="utf-8", errors="replace"))
+    def attempt() -> list[float]:
+        argv = [
+            *measure_argv(chain),
+            *decode_args(chain, path, grain=True), "-i", str(path),
+            "-an", "-sn", "-dn",
+            "-filter_complex",
+            f"{grain_graph(prefilter)}psnr=stats_file={stats.as_posix()}",
+            "-f", "null", "-",
+        ]
+        run_progress(argv, label, frames=frames)
+        return parse_mse_log(stats.read_text(encoding="utf-8", errors="replace"))
+
+    return with_fallback(chain, [(path, True)], attempt)
 
 
 def retention(source: list[float], encoded: list[float]) -> float:

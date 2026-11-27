@@ -216,11 +216,16 @@ place.
 ## Hardware decoding
 
 The encode runs on the CPU. The passes autotranscode runs itself (scene cuts,
-the grain estimate and calibration, `verify`) decode on hardware where that
-gives exactly software's frames: Rockchip's decoders, NVIDIA (NVDEC), Intel and
-AMD (VA-API), and Apple (VideoToolbox). Each film is checked before its decoder
-is used: a stretch is decoded both ways and compared frame by frame, and a film
-that differs is decoded in software. `doctor` lists the decoders it will try;
+the grain estimate and calibration, `verify`) decode H.264, HEVC and AV1 on
+hardware where that gives exactly software's frames: Rockchip's decoders, NVIDIA
+(NVDEC), Intel (Quick Sync, then VA-API), AMD (VA-API), and Apple
+(VideoToolbox). Each film is checked before its decoder is used: three
+stretches are decoded both ways and compared frame by frame. A film that
+differs, or that the hardware cannot decode, goes to the next decoder, or to
+software. So does one whose hardware decode fails part way where software's
+does not, and the failed work is done again in software.
+Rockchip's AV1 decoder is used only with film grain on, and not at the frame
+widths it gets wrong. `doctor` lists the decoders it will try;
 `machine.hardware_decode = "off"` turns this off.
 
 ## Dolby Vision

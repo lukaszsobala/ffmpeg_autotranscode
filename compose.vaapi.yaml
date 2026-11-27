@@ -2,10 +2,11 @@
 #
 #   docker compose -f compose.yaml -f compose.vaapi.yaml run --rm autotranscode doctor
 #
-# `doctor` should then list vaapi under "hw decode". It is used for the passes
-# autotranscode runs itself (scene cuts, grain, verify), film by film where it
-# gives software's frames exactly; the encode stays on the CPU. Without this file
-# everything decodes in software, which is correct, only slower.
+# `doctor` should then list vaapi under "hw decode", with qsv before it on Intel.
+# They are used for the passes autotranscode runs itself (scene cuts, grain,
+# verify), film by film where one gives software's frames exactly; the encode
+# stays on the CPU. Without this file everything decodes in software, which is
+# correct, only slower.
 
 services:
   autotranscode:

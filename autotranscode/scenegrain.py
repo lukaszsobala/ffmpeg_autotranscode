@@ -163,22 +163,28 @@ class Energies:
 def window_command(chain: Toolchain, window: Window, source: Path, source_times: Sequence[float],
                    source_origin: float, base: Path, grainy: Path, stream: Stream,
                    stream_origin: float, prefilter: str, stats: Sequence[Path],
-                   source_decode: Sequence[str] | None = None) -> list[str]:
+                   software: bool = False) -> list[str]:
     """One ffmpeg measuring a window in the source, the encode without grain and
     the encode with it, each into its own psnr stats file (verify's grain measure).
-    `source_decode` replaces verify.decode_args for the source."""
+    `software` decodes all three in software, whatever hardware matched."""
     first = window.start
     inputs: list[str] = []
     graph: list[str] = []
-    decode = (verify.decode_args(chain, source, grain=True) if source_decode is None
-              else list(source_decode))
+
+    def decoder(path: Path, codec: str, grain: bool) -> list[str]:
+        if software:
+            return verify.software_decode_args(chain, codec)
+        return verify.decode_args(chain, path, grain=grain)
+
     # One thread each for dav1d and the graph: several windows run at once, one
     # per core, and ffmpeg's default of a thread per core in each made ~25 wait.
-    av1 = [*verify.software_decode_args(chain, "av1"), "-threads", "1"]
-    plan = [(source, source_times, source_origin, decode, prefilter, SOURCE_SEEK),
-            (base, stream.times, stream_origin, ["-export_side_data", "film_grain", *av1],
-             "", 0.0),
-            (grainy, stream.times, stream_origin, av1, "", 0.0)]
+    single = ["-threads", "1"]
+    plan = [(source, source_times, source_origin, decoder(source, "", True), prefilter,
+             SOURCE_SEEK),
+            (base, stream.times, stream_origin,
+             [*decoder(base, "av1", False), *single, *verify.GRAIN_OFF], "", 0.0),
+            (grainy, stream.times, stream_origin,
+             [*decoder(grainy, "av1", True), *single], "", 0.0)]
     for number, (path, times, origin, decode, pre, margin) in enumerate(plan):
         seek_to = times[window.keyframe] if margin == 0.0 else times[first] - margin
         seek = max(0.0, seek_to - origin + (0.0005 if margin == 0.0 else 0.0))
@@ -227,14 +233,21 @@ def measure(chain: Toolchain, windows: Sequence[Window], source: Path, base: Pat
     # One graph decoding the source on h264_rkmpp and the encode twice once hung
     # for hours on jellyfin-ffmpeg 8.1.3-2 (TECHNICAL.md, "Why verify decodes each
     # file three times"). A window takes seconds; one that takes minutes is
-    # skipped, and the source decoded in software from then on.
+    # stopped, and everything decoded in software from then on. A window that
+    # fails or hangs on hardware is measured again in software.
     software = threading.Event()
 
     def one(number: int, window: Window) -> tuple[int, list[list[float]]]:
+        if software.is_set():
+            return attempt(number, window)
+        return verify.with_fallback(chain, [(source, True), (base, False), (grainy, True)],
+                                    lambda: attempt(number, window), children.stopping)
+
+    def attempt(number: int, window: Window) -> tuple[int, list[list[float]]]:
         stats = [folder / f"{number:05d}-{name}.log" for name in ("src", "base", "grain")]
-        decode = (verify.software_decode_args(chain, "") if software.is_set() else None)
         argv = window_command(chain, window, source, source_times, source_origin, base,
-                              grainy, stream, stream_origin, prefilter, stats, decode)
+                              grainy, stream, stream_origin, prefilter, stats,
+                              software.is_set())
         if children.stopping.is_set():
             raise CommandError(argv, -1, "stopped")
         log.debug("exec: %s", shlex.join(argv))
@@ -250,8 +263,8 @@ def measure(chain: Toolchain, windows: Sequence[Window], source: Path, base: Pat
                 child.communicate()
                 if not software.is_set():
                     software.set()
-                    log.warning("  a calibration window hung; decoding the source in "
-                                "software from now on")
+                    log.warning("  a calibration window hung; decoding in software "
+                                "from now on")
                 raise CommandError(argv, -1, f"timed out after {WINDOW_TIMEOUT}s") from None
             finally:
                 children.discard(child)
