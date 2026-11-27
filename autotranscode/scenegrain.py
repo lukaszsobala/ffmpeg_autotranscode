@@ -171,20 +171,21 @@ def window_command(chain: Toolchain, window: Window, source: Path, source_times:
     inputs: list[str] = []
     graph: list[str] = []
 
-    def decoder(path: Path, codec: str, grain: bool) -> list[str]:
-        if software:
-            return verify.software_decode_args(chain, codec)
-        return verify.decode_args(chain, path, grain=grain)
+    def decoder(path: Path, grain: bool) -> list[str]:
+        # Through decode_args even in software, which keeps with_fallback's -xerror
+        # in its retry: without it a retry after a hang would go past errors the
+        # first attempt stopped at, and blame the hardware for them.
+        return verify.decode_args(chain, path, grain=grain, software=software)
 
     # One thread each for dav1d and the graph: several windows run at once, one
     # per core, and ffmpeg's default of a thread per core in each made ~25 wait.
     single = ["-threads", "1"]
-    plan = [(source, source_times, source_origin, decoder(source, "", True), prefilter,
+    plan = [(source, source_times, source_origin, decoder(source, True), prefilter,
              SOURCE_SEEK),
             (base, stream.times, stream_origin,
-             [*decoder(base, "av1", False), *single, *verify.GRAIN_OFF], "", 0.0),
+             [*decoder(base, False), *single, *verify.GRAIN_OFF], "", 0.0),
             (grainy, stream.times, stream_origin,
-             [*decoder(grainy, "av1", True), *single], "", 0.0)]
+             [*decoder(grainy, True), *single], "", 0.0)]
     for number, (path, times, origin, decode, pre, margin) in enumerate(plan):
         seek_to = times[window.keyframe] if margin == 0.0 else times[first] - margin
         seek = max(0.0, seek_to - origin + (0.0005 if margin == 0.0 else 0.0))

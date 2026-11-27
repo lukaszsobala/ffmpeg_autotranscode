@@ -5126,6 +5126,27 @@ class TestSceneCalibration(unittest.TestCase):
         for before, at in itertools.pairwise(inputs):
             self.assertIn("-threads", argv[before:at])
 
+    def test_a_retry_after_a_hang_still_stops_at_decoding_errors(self):
+        # After a hang every window decodes in software; with_fallback's retry
+        # must keep its -xerror, or a source with errors of its own would pass in
+        # software and the hardware decoders take the blame.
+        stream = scenegrain.Stream([i * 10_000 for i in range(0, 4000, 40)],
+                                   [i / 1000 for i in range(0, 4000, 40)], [0, 50])
+        chain = make_chain(hardware_decode=("vaapi",))
+
+        def command() -> list[str]:
+            return scenegrain.window_command(
+                chain, scenegrain.Window(0, 50, 51, 4), Path("/src.mkv"), stream.times, 0.0,
+                Path("/base.mkv"), Path("/grain.mkv"), stream, 0.0, "",
+                [Path(f"/w/{n}.log") for n in range(3)], software=True)
+
+        video = verify._Video("h264", "yuv420p", 600.0, 1920)
+        with unittest.mock.patch.object(verify, "_video", return_value=video), \
+                unittest.mock.patch.object(verify, "hardware_decoder",
+                                           side_effect=AssertionError("asked for hardware")):
+            self.assertNotIn("-xerror", command())
+            self.assertEqual(verify._in_software(["-xerror"], command).count("-xerror"), 3)
+
 
 class TestStoppingWorkers(unittest.TestCase):
     """A stop cancels what a pool has queued and kills what it has running."""

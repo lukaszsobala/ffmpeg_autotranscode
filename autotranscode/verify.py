@@ -477,18 +477,22 @@ def hardware_decoder(chain: Toolchain, path: Path, *, grain: bool = True) -> str
         return _decoders[key]
 
 
-def decode_args(chain: Toolchain, path: Path, *, grain: bool) -> list[str]:
+def decode_args(chain: Toolchain, path: Path, *, grain: bool,
+                software: bool = False) -> list[str]:
     """Input options that decode `path` on a hardware decoder where that gives
     software's frames exactly (hardware_decoder), or else as fast as the software
     decoder goes (DAV1D_FRAME_DELAY).
 
     `grain` is whether AV1 film grain is to be applied. With it false the caller
-    adds GRAIN_OFF as well.
+    adds GRAIN_OFF as well. `software` decodes in software whatever hardware
+    matched; during with_fallback's retry everything does, with its options.
     """
     codec = _video(chain.ffprobe, path).codec
     retry = getattr(_retry, "options", None)
     if retry is not None:
         return [*retry, *software_decode_args(chain, codec)]
+    if software:
+        return software_decode_args(chain, codec)
     method = hardware_decoder(chain, path, grain=grain)
     return hardware_args(method, codec) if method else software_decode_args(chain, codec)
 
